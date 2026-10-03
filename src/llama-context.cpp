@@ -1245,6 +1245,16 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_layer_range(int32_t il_start, int32_t il_end) {
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    if (il_end < 0) {
+        il_end = n_layer;
+    }
+    GGML_ASSERT(il_start >= 0 && il_start < il_end && il_end <= n_layer);
+    cparams.layer_start = il_start;
+    cparams.layer_end   = il_start == 0 && il_end == n_layer ? -1 : il_end;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -4037,6 +4047,14 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_layer_range(llama_context * ctx, int32_t il_start, int32_t il_end) {
+    ctx->set_layer_range(il_start, il_end);
+}
+
+bool llama_model_supports_layer_range(const llama_model * model) {
+    return model->arch == LLM_ARCH_LFM2;
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

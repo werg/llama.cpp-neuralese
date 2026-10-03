@@ -874,6 +874,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.layer_start != other.cparams.layer_start || cparams.layer_end != other.cparams.layer_end) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

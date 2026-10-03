@@ -119,6 +119,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_layer_range(int32_t il_start, int32_t il_end);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
