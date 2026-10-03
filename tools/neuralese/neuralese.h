@@ -29,7 +29,8 @@
 struct nz_heads;
 
 struct nz_heads_params {
-    int n_threads = 4;
+    int  n_threads = 4;     // CPU threads when the heads run on the CPU
+    bool use_gpu   = false; // run the heads on the first GPU backend, if there is one
 };
 
 // load a Neuralese projector GGUF; returns nullptr on failure

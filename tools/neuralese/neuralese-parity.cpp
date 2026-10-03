@@ -114,6 +114,7 @@ static std::vector<int32_t> greedy(llama_context * ctx, llama_pos pos, int32_t s
 int main(int argc, char ** argv) {
     std::string model_path, heads_path, case_path, out_path;
     int n_threads = 8;
+    int n_gpu_layers = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "-m") model_path = argv[i + 1];
@@ -121,9 +122,11 @@ int main(int argc, char ** argv) {
         else if (a == "--case") case_path = argv[i + 1];
         else if (a == "--out") out_path = argv[i + 1];
         else if (a == "-t") n_threads = std::stoi(argv[i + 1]);
+        else if (a == "-ngl") n_gpu_layers = std::stoi(argv[i + 1]);
     }
     if (model_path.empty() || heads_path.empty() || case_path.empty() || out_path.empty()) {
-        fprintf(stderr, "usage: %s -m model.gguf --nz heads.gguf --case case.bin --out result.bin [-t threads]\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf --nz heads.gguf --case case.bin --out result.bin [-t threads] [-ngl layers]\n"
+                        "  -ngl > 0 offloads model layers and runs the Neuralese heads on the GPU\n", argv[0]);
         return 1;
     }
     std::map<std::string, array> c;
@@ -134,13 +137,14 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = n_gpu_layers;
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) {
         return 1;
     }
     nz_heads_params hp;
     hp.n_threads = n_threads;
+    hp.use_gpu = n_gpu_layers > 0;
     nz_heads * heads = nz_heads_load(heads_path.c_str(), hp);
     if (!heads) {
         return 1;

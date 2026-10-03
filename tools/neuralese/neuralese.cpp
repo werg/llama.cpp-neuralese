@@ -1,6 +1,8 @@
 #include "neuralese.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "llama-ext.h"
@@ -11,11 +13,18 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct nz_heads {
     ggml_context * wctx = nullptr;
     gguf_context * gctx = nullptr;
     int n_threads = 4;
+
+    // the heads run on one ggml backend: the GPU when requested and available, else the CPU
+    ggml_backend_t         backend = nullptr;
+    ggml_backend_buffer_t  wbuf    = nullptr;
+    mutable ggml_gallocr_t galloc  = nullptr;
 
     int32_t n_embd     = 0;
     int32_t n_vocab    = 0;
@@ -85,7 +94,7 @@ static bool get_f32(const gguf_context * g, const char * key, float & out) {
 nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
     auto * h = new nz_heads();
     h->n_threads = params.n_threads;
-    gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &h->wctx };
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &h->wctx };
     h->gctx = gguf_init_from_file(path, gp);
     if (!h->gctx) {
         fprintf(stderr, "%s: failed to read %s\n", __func__, path);
@@ -140,7 +149,43 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
         nz_heads_free(h);
         return nullptr;
     }
-    h->gate    = ((const float *) gate->data)[0];
+
+    // weights on the chosen backend
+    if (params.use_gpu) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (dev) {
+            h->backend = ggml_backend_dev_init(dev, nullptr);
+        }
+    }
+    if (!h->backend) {
+        h->backend = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(h->backend, h->n_threads);
+    }
+    h->wbuf = ggml_backend_alloc_ctx_tensors(h->wctx, h->backend);
+    FILE * fp = h->wbuf ? fopen(path, "rb") : nullptr;
+    if (!fp) {
+        fprintf(stderr, "%s: failed to allocate or read the projector weights\n", __func__);
+        nz_heads_free(h);
+        return nullptr;
+    }
+    std::vector<uint8_t> buf;
+    const size_t data_offset = gguf_get_data_offset(h->gctx);
+    for (int64_t i = 0; i < gguf_get_n_tensors(h->gctx); ++i) {
+        ggml_tensor * t = ggml_get_tensor(h->wctx, gguf_get_tensor_name(h->gctx, i));
+        const size_t n = ggml_nbytes(t);
+        buf.resize(n);
+        if (fseek(fp, (long) (data_offset + gguf_get_tensor_offset(h->gctx, i)), SEEK_SET) != 0 ||
+            fread(buf.data(), 1, n, fp) != n) {
+            fprintf(stderr, "%s: short read for %s\n", __func__, ggml_get_name(t));
+            fclose(fp);
+            nz_heads_free(h);
+            return nullptr;
+        }
+        ggml_backend_tensor_set(t, buf.data(), 0, n);
+    }
+    fclose(fp);
+    h->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(h->backend));
+    ggml_backend_tensor_get(gate, &h->gate, 0, sizeof(float));
     h->n_vocab = (int32_t) h->fb_readout->ne[1];
     h->pos_dim = (int32_t) h->stop_position->ne[0];
     return h;
@@ -149,6 +194,15 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
 void nz_heads_free(nz_heads * heads) {
     if (!heads) {
         return;
+    }
+    if (heads->galloc) {
+        ggml_gallocr_free(heads->galloc);
+    }
+    if (heads->wbuf) {
+        ggml_backend_buffer_free(heads->wbuf);
+    }
+    if (heads->backend) {
+        ggml_backend_free(heads->backend);
     }
     if (heads->gctx) {
         gguf_free(heads->gctx);
@@ -167,18 +221,44 @@ llama_token  nz_heads_close_token(const nz_heads * h) { return h->close_token; }
 const char * nz_heads_dialect    (const nz_heads * h) { return h->dialect.c_str(); }
 
 //
-// head computation: small CPU graphs over the projector weights
+// head computation: small graphs over the projector weights, on the heads' backend
 //
 
 namespace {
 
-struct scratch {
+// one graph: inputs are copied in after allocation, outputs are read back after compute
+struct graph_run {
     ggml_context * ctx = nullptr;
-    explicit scratch(size_t bytes) {
-        ggml_init_params p = { bytes, nullptr, false };
+    std::vector<std::pair<ggml_tensor *, const float *>> inputs;
+
+    graph_run() {
+        ggml_init_params p = { ggml_tensor_overhead() * 256 + ggml_graph_overhead(), nullptr, /*no_alloc =*/ true };
         ctx = ggml_init(p);
     }
-    ~scratch() { ggml_free(ctx); }
+    ~graph_run() { ggml_free(ctx); }
+
+    ggml_tensor * input(const float * data, int64_t n_embd, int64_t n) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+        ggml_set_input(t);
+        inputs.emplace_back(t, data);
+        return t;
+    }
+
+    bool compute(const nz_heads * h, std::initializer_list<ggml_tensor *> outputs) {
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        for (ggml_tensor * out : outputs) {
+            ggml_set_output(out);
+            ggml_build_forward_expand(gf, out);
+        }
+        if (!ggml_gallocr_alloc_graph(h->galloc, gf)) {
+            fprintf(stderr, "nz: failed to allocate a head graph\n");
+            return false;
+        }
+        for (auto & [t, data] : inputs) {
+            ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
+        }
+        return ggml_backend_graph_compute(h->backend, gf) == GGML_STATUS_SUCCESS;
+    }
 };
 
 ggml_tensor * rms(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, float eps) {
@@ -190,20 +270,8 @@ ggml_tensor * linear(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_
     return b ? ggml_add(ctx, y, b) : y;
 }
 
-ggml_tensor * input(ggml_context * ctx, const float * data, int64_t n_embd, int64_t n) {
-    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
-    memcpy(t->data, data, ggml_nbytes(t));
-    return t;
-}
-
-void compute(ggml_context * ctx, ggml_tensor * out, int n_threads) {
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
-}
-
-size_t scratch_bytes(const nz_heads * h, int64_t n) {
-    return (size_t) 64 * 1024 * 1024 + (size_t) n * (h->n_vocab + 16 * h->n_embd) * sizeof(float) * 4;
+void get(ggml_tensor * t, float * out) {
+    ggml_backend_tensor_get(t, out, 0, ggml_nbytes(t));
 }
 
 } // namespace
@@ -212,16 +280,17 @@ void nz_interface(const nz_heads * h, const float * in, float * out, int32_t n) 
     if (n <= 0) {
         return;
     }
-    scratch s(scratch_bytes(h, n));
-    ggml_tensor * y = rms(s.ctx, input(s.ctx, in, h->n_embd, n), h->interface_w, h->eps);
-    compute(s.ctx, y, h->n_threads);
-    memcpy(out, y->data, ggml_nbytes(y));
+    graph_run g;
+    ggml_tensor * y = rms(g.ctx, g.input(in, h->n_embd, n), h->interface_w, h->eps);
+    if (g.compute(h, { y })) {
+        get(y, out);
+    }
 }
 
 void nz_feedback(const nz_heads * h, const float * h_cut, float * sketch) {
-    scratch s(scratch_bytes(h, 1));
-    ggml_context * ctx = s.ctx;
-    ggml_tensor * x = input(ctx, h_cut, h->n_embd, 1);
+    graph_run g;
+    ggml_context * ctx = g.ctx;
+    ggml_tensor * x = g.input(h_cut, h->n_embd, 1);
     // vocabulary mixture: E^T softmax(R(norm(h)) / tau)
     ggml_tensor * logits  = linear(ctx, rms(ctx, x, h->fb_readout_norm, h->eps), h->fb_readout, nullptr);
     ggml_tensor * weights = ggml_soft_max_ext(ctx, logits, nullptr, 1.0f / h->tau, 0.0f);
@@ -232,22 +301,26 @@ void nz_feedback(const nz_heads * h, const float * h_cut, float * sketch) {
     m = linear(ctx, m, h->fb_mlp_out_w, h->fb_mlp_out_b);
     ggml_tensor * y = ggml_add(ctx, mixture, ggml_scale(ctx, m, h->gate));
     y = rms(ctx, y, h->interface_w, h->eps);
-    compute(ctx, y, h->n_threads);
-    memcpy(sketch, y->data, ggml_nbytes(y));
+    if (g.compute(h, { y })) {
+        get(y, sketch);
+    }
 }
 
 float nz_stop_logit(const nz_heads * h, const float * h_cut, int32_t count) {
-    scratch s(scratch_bytes(h, 1));
-    ggml_context * ctx = s.ctx;
+    graph_run g;
+    ggml_context * ctx = g.ctx;
     const int32_t row = std::min(count, h->max_length);
-    ggml_tensor * x = rms(ctx, input(ctx, h_cut, h->n_embd, 1), h->stop_norm, h->eps);
+    ggml_tensor * x = rms(ctx, g.input(h_cut, h->n_embd, 1), h->stop_norm, h->eps);
     ggml_tensor * p = ggml_view_2d(ctx, h->stop_position, h->pos_dim, 1, h->stop_position->nb[1],
                                    (size_t) row * h->stop_position->nb[1]);
     ggml_tensor * f = ggml_concat(ctx, x, p, 0);
     f = ggml_gelu_erf(ctx, linear(ctx, f, h->stop_in_w, h->stop_in_b));
     f = linear(ctx, f, h->stop_out_w, h->stop_out_b);
-    compute(ctx, f, h->n_threads);
-    return ((const float *) f->data)[0];
+    float logit = 0.0f;
+    if (g.compute(h, { f })) {
+        get(f, &logit);
+    }
+    return logit;
 }
 
 void nz_content(const nz_heads * h, const float * sketches, const float * h_final, int32_t n,
@@ -255,17 +328,15 @@ void nz_content(const nz_heads * h, const float * sketches, const float * h_fina
     if (n <= 0) {
         return;
     }
-    scratch s(scratch_bytes(h, n));
-    ggml_context * ctx = s.ctx;
-    ggml_tensor * hf = rms(ctx, input(ctx, h_final, h->n_embd, n), h->ct_norm, h->eps);
-    ggml_tensor * mu = ggml_add(ctx, input(ctx, sketches, h->n_embd, n), linear(ctx, hf, h->ct_proj_w, h->ct_proj_b));
+    graph_run g;
+    ggml_context * ctx = g.ctx;
+    ggml_tensor * hf = rms(ctx, g.input(h_final, h->n_embd, n), h->ct_norm, h->eps);
+    ggml_tensor * mu = ggml_add(ctx, g.input(sketches, h->n_embd, n), linear(ctx, hf, h->ct_proj_w, h->ct_proj_b));
     ggml_tensor * ls = ggml_clamp(ctx, linear(ctx, hf, h->ct_sigma_w, h->ct_sigma_b), -9.0f, 2.0f);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, mu);
-    ggml_build_forward_expand(gf, ls);
-    ggml_graph_compute_with_ctx(ctx, gf, h->n_threads);
-    memcpy(mean, mu->data, ggml_nbytes(mu));
-    memcpy(log_sigma, ls->data, ggml_nbytes(ls));
+    if (g.compute(h, { mu, ls })) {
+        get(mu, mean);
+        get(ls, log_sigma);
+    }
 }
 
 //
