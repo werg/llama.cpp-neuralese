@@ -44,6 +44,7 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -120,12 +121,15 @@ struct block {
     int64_t length = 0;
     int64_t width  = 0;
     std::vector<float> payload; // [length * width], f32
+    // Preserve uploaded representation for content-addressed GETs. Inference always uses payload above.
+    std::string wire_dtype = "f32";
+    std::vector<uint8_t> wire_payload;
     std::string type;
     json producer = json::object();
     bool truncated = false;
 
     json meta() const {
-        json m = { { "id", id }, { "dialect", dialect }, { "length", length }, { "width", width }, { "dtype", "f32" } };
+        json m = { { "id", id }, { "dialect", dialect }, { "length", length }, { "width", width }, { "dtype", wire_dtype } };
         if (!type.empty()) {
             m["type"] = type;
         }
@@ -153,11 +157,14 @@ block make_block(const float * rows, int64_t length, int64_t width, const std::s
 }
 
 std::string encode_block(const block & b) {
-    const size_t nbytes = b.payload.size() * sizeof(float);
+    const bool canonical = b.wire_dtype == "f32" && b.wire_payload.empty();
+    const size_t nbytes = canonical ? b.payload.size() * sizeof(float) : b.wire_payload.size();
+    const char * data = canonical ? (const char *) b.payload.data() : (const char *) b.wire_payload.data();
+    const char * st_dtype = b.wire_dtype == "f16" ? "F16" : b.wire_dtype == "bf16" ? "BF16" : "F32";
     // the metadata string has sorted keys, like the reference server's
     json header = {
         { "__metadata__", { { "natlang.block", nlohmann::json::parse(b.meta().dump()).dump() } } },
-        { "payload", { { "dtype", "F32" }, { "shape", { b.length, b.width } }, { "data_offsets", { 0, nbytes } } } },
+        { "payload", { { "dtype", st_dtype }, { "shape", { b.length, b.width } }, { "data_offsets", { 0, nbytes } } } },
     };
     std::string raw = header.dump();
     raw.append((8 - raw.size() % 8) % 8, ' ');
@@ -165,33 +172,35 @@ std::string encode_block(const block & b) {
     const uint64_t size = raw.size();
     memcpy(out.data(), &size, 8);
     out += raw;
-    out.append((const char *) b.payload.data(), nbytes);
+    if (nbytes) out.append(data, nbytes);
     return out;
 }
 
 block decode_block(const std::string & body) {
-    if (body.size() < 8) {
-        throw request_error("neuralese-bad-block", "not a safetensors body");
-    }
+    try {
+    if (body.size() < 8) throw request_error("neuralese-bad-block", "not a safetensors body");
     uint64_t size = 0;
     memcpy(&size, body.data(), 8);
-    if (8 + size > body.size()) {
-        throw request_error("neuralese-bad-block", "header exceeds the body");
-    }
-    json header;
-    try {
-        header = json::parse(body.substr(8, size));
-    } catch (const std::exception & e) {
-        throw request_error("neuralese-bad-block", e.what());
-    }
+    if (size > body.size() - 8) throw request_error("neuralese-bad-block", "header exceeds the body");
+    json header = json::parse(body.data() + 8, body.data() + 8 + (size_t) size);
+    if (!header.is_object()) throw request_error("neuralese-bad-block", "header must be an object");
     json meta = json::object();
-    if (header.contains("__metadata__") && header["__metadata__"].contains("natlang.block")) {
-        meta = json::parse(header["__metadata__"]["natlang.block"].get<std::string>());
+    if (header.contains("__metadata__")) {
+        const json & metadata = header["__metadata__"];
+        if (!metadata.is_object()) throw request_error("neuralese-bad-block", "metadata must be an object");
+        if (metadata.contains("natlang.block")) {
+            if (!metadata["natlang.block"].is_string()) throw request_error("neuralese-bad-block", "natlang.block metadata must be a JSON string");
+            meta = json::parse(metadata["natlang.block"].get<std::string>());
+            if (!meta.is_object()) throw request_error("neuralese-bad-block", "natlang.block metadata must decode to an object");
+        }
     }
-    if (!header.contains("payload")) {
-        throw request_error("neuralese-bad-block", "a block body needs a `payload` tensor");
-    }
+    if (!header.contains("payload") || !header["payload"].is_object())
+        throw request_error("neuralese-bad-block", "a block body needs a payload tensor object");
     const json & entry = header["payload"];
+    if (!entry.contains("dtype") || !entry["dtype"].is_string() || !entry.contains("shape") ||
+        !entry["shape"].is_array() || entry["shape"].size() != 2 || !entry.contains("data_offsets") ||
+        !entry["data_offsets"].is_array() || entry["data_offsets"].size() != 2)
+        throw request_error("neuralese-bad-block", "payload needs a dtype, rank-2 shape, and two data offsets");
     const std::string st_dtype = entry["dtype"].get<std::string>();
     std::string dtype;
     size_t itemsize = 0;
@@ -201,14 +210,27 @@ block decode_block(const std::string & body) {
     else {
         throw request_error("neuralese-bad-block", "unsupported block dtype " + st_dtype);
     }
+    if (!entry["shape"][0].is_number_integer() || !entry["shape"][1].is_number_integer() ||
+        !entry["data_offsets"][0].is_number_integer() || !entry["data_offsets"][1].is_number_integer())
+        throw request_error("neuralese-bad-block", "shape and data offsets must be integers");
     const int64_t length = entry["shape"][0].get<int64_t>();
     const int64_t width  = entry["shape"][1].get<int64_t>();
+    if (length < 0 || width <= 0 || length > std::numeric_limits<int32_t>::max() ||
+        width > std::numeric_limits<int32_t>::max() ||
+        (length != 0 && (uint64_t) width > std::numeric_limits<uint64_t>::max() / (uint64_t) length))
+        throw request_error("neuralese-bad-block", "shape dimensions are out of range");
+    const uint64_t elements = (uint64_t) length * (uint64_t) width;
+    if (elements > std::numeric_limits<size_t>::max() / itemsize)
+        throw request_error("neuralese-bad-block", "payload size overflows this host");
+    const size_t expected_bytes = (size_t) elements * itemsize;
+    const size_t header_bytes = (size_t) size;
+    const size_t data_body_size = body.size() - 8 - header_bytes;
     const size_t start = entry["data_offsets"][0].get<size_t>();
     const size_t end   = entry["data_offsets"][1].get<size_t>();
-    if (8 + size + end > body.size() || end < start || end - start != (size_t) (length * width) * itemsize) {
+    if (end < start || end > data_body_size || end - start != expected_bytes) {
         throw request_error("neuralese-bad-block", "block byte count does not match its shape");
     }
-    const uint8_t * data = (const uint8_t *) body.data() + 8 + size + start;
+    const uint8_t * data = (const uint8_t *) body.data() + 8 + header_bytes + start;
     if (!meta.contains("dialect") || !meta["dialect"].is_string() || meta["dialect"].get<std::string>().empty()) {
         throw request_error("neuralese-bad-block", "block metadata needs a dialect");
     }
@@ -216,12 +238,14 @@ block decode_block(const std::string & body) {
     b.dialect = meta["dialect"].get<std::string>();
     b.length = length;
     b.width = width;
+    b.wire_dtype = dtype;
+    if (dtype != "f32") b.wire_payload.assign(data, data + expected_bytes);
     b.id = content_id(b.dialect, length, width, dtype, data, end - start);
     if (meta.contains("id") && meta["id"].is_string() && meta["id"].get<std::string>() != b.id) {
         throw request_error("neuralese-bad-block", "block ID " + meta["id"].get<std::string>() +
                             " does not match its content (" + b.id + ")");
     }
-    b.payload.resize((size_t) (length * width));
+    b.payload.resize((size_t) elements);
     for (size_t i = 0; i < b.payload.size(); ++i) {
         if (dtype == "f32") {
             memcpy(&b.payload[i], data + 4 * i, 4);
@@ -244,6 +268,11 @@ block decode_block(const std::string & body) {
     }
     b.truncated = meta.value("truncated", false);
     return b;
+    } catch (const request_error &) {
+        throw;
+    } catch (const nlohmann::json::exception & e) {
+        throw request_error("neuralese-bad-block", e.what());
+    }
 }
 
 class tensor_store {
@@ -344,7 +373,12 @@ struct rendered {
 
 class renderer {
 public:
-    renderer(const std::vector<std::string> & escaped) : escaped_(escaped) {}
+    renderer(const std::vector<std::string> & escaped) : escaped_(escaped) {
+        escaped_.insert(escaped_.end(), { PH_OPEN, PH_CLOSE, ES_OPEN, ES_CLOSE });
+        std::stable_sort(escaped_.begin(), escaped_.end(), [](const std::string & a, const std::string & b) {
+            return a.size() > b.size();
+        });
+    }
 
     std::string flatten(const json & parts, std::vector<std::string> & blocks) {
         std::string out;
@@ -364,15 +398,21 @@ public:
 
     // control-token text inside content becomes an escape placeholder
     std::string escape(const std::string & text) {
-        std::string out = text;
-        for (size_t i = 0; i < escaped_.size(); ++i) {
-            const std::string & needle = escaped_[i];
-            const std::string repl = ES_OPEN + std::to_string(i) + ES_CLOSE;
-            size_t pos = 0;
-            while ((pos = out.find(needle, pos)) != std::string::npos) {
-                out.replace(pos, needle.size(), repl);
-                pos += repl.size();
+        // Scan original bytes once: never escape placeholders inserted by this scan.
+        std::string out;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            bool matched = false;
+            for (size_t i = 0; i < escaped_.size(); ++i) {
+                const std::string & needle = escaped_[i];
+                if (!needle.empty() && text.compare(pos, needle.size(), needle) == 0) {
+                    out += ES_OPEN + std::to_string(i) + ES_CLOSE;
+                    pos += needle.size();
+                    matched = true;
+                    break;
+                }
             }
+            if (!matched) out.push_back(text[pos++]);
         }
         return out;
     }
@@ -382,13 +422,16 @@ public:
         std::function<json(const json &)> walk = [&](const json & x) -> json {
             if (x.is_string()) return escape(x.get<std::string>());
             if (x.is_array()) { json a = json::array(); for (const auto & e : x) a.push_back(walk(e)); return a; }
-            if (x.is_object()) { json o = json::object(); for (auto it = x.begin(); it != x.end(); ++it) o[it.key()] = walk(it.value()); return o; }
+            if (x.is_object()) { json o = json::object(); for (auto it = x.begin(); it != x.end(); ++it) o[escape(it.key())] = walk(it.value()); return o; }
             return x;
         };
         return walk(v).dump();
     }
 
-    std::string unescape_index(size_t i) const { return escaped_[i]; }
+    std::string unescape_index(size_t i) const {
+        if (i >= escaped_.size()) throw request_error("neuralese-render", "invalid escaped-text placeholder");
+        return escaped_[i];
+    }
 
 private:
     std::vector<std::string> escaped_;
@@ -413,7 +456,14 @@ rendered split_rendered(const std::string & text, const std::vector<std::string>
             const size_t start = pos + PH_OPEN.size();
             const size_t end = text.find(close, start);
             if (end != std::string::npos) {
-                const size_t index = (size_t) std::stoul(text.substr(start, end - start));
+                const std::string number = text.substr(start, end - start);
+                if (number.empty() || number.find_first_not_of("0123456789") != std::string::npos)
+                    throw request_error("neuralese-render", "invalid placeholder index");
+                size_t index;
+                try { index = (size_t) std::stoull(number); }
+                catch (const std::exception &) { throw request_error("neuralese-render", "placeholder index out of range"); }
+                if (is_block && index >= blocks.size())
+                    throw request_error("neuralese-render", "invalid block placeholder");
                 flush();
                 if (is_block) {
                     out.segments.push_back({ rendered::segment::BLOCK, "", index });
@@ -433,6 +483,8 @@ rendered split_rendered(const std::string & text, const std::vector<std::string>
             seen.push_back(s.index);
         }
     }
+    if (seen.size() != blocks.size())
+        throw request_error("neuralese-render", "the chat template dropped or duplicated a block");
     std::sort(seen.begin(), seen.end());
     for (size_t i = 0; i < seen.size(); ++i) {
         if (seen[i] != i) {
@@ -916,11 +968,14 @@ struct engine {
             }
             if (llama_vocab_is_eog(vocab, token)) break;
             if (token == open_id) {
+                const int32_t remaining = max_tokens - generated;
+                // Do not emit a partial opening marker. A complete soft block needs open + >=1 payload + close.
+                if (remaining < 3) { finish = "length"; break; }
                 std::vector<float> h_cut(width);
                 if (nz_open(ctx, heads, pos, 0, h_cut.data()) != 0) throw request_error("decode-failed", "open", 500);
                 const llama_pos first = pos + 1;
                 nz_write_params wp;
-                wp.max_length = nz_max;
+                wp.max_length = std::min(nz_max, remaining - 2);
                 wp.temperature = nz_temperature;
                 const size_t index = written.size();
                 wp.seed = derive_seed("neuralese\x1f" + seed_key + "\x1f" + std::to_string(index));
