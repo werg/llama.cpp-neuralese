@@ -4,8 +4,10 @@
 // training/neuralese/natlang_neuralese/serve/guidance.py (the reference; this file follows it).
 //
 // Envelope: with require_call the reply is forced to open a tool call; call names must be allowed (checked at `(`).
-// Eval code: inside an `eval(code=...)` string, every completed line is checked for repetition and for TypeScript
-// syntax (tree-sitter: an error or missing token inside the completed text that does not reach its end). A rejection
+// Eval code: inside an `eval(code=...)` string, every completed line is checked for repetition, redeclaration (a
+// const/let/var name declared again at the same indentation within one block) and TypeScript syntax; the unfinished
+// last line for a run (one chunk repeated `run` times at its end). Syntax uses tree-sitter: an error or missing token
+// inside the completed text that does not reach its end. A rejection
 // names the reply offset where the offending line (or name) starts; the server rolls back there, bans the token it
 // chose first and samples again, at most `retries` times per point, then accepts what is there.
 
@@ -21,12 +23,13 @@ struct nz_guide_settings {
     bool require_call = false;
     std::vector<std::string> tools; // allowed call names; empty: any
     int32_t repeat  = 3;            // occurrences of one line that reject it (0: off)
+    int32_t run     = 4;            // repetitions of one chunk ending the unfinished line that reject it (0: off)
     bool    syntax  = true;
     int32_t retries = 4;
 };
 
 struct nz_guide_verdict {
-    std::string reason; // "unknown-tool", "repetition", "syntax"
+    std::string reason; // "unknown-tool", "repetition", "redeclaration", "syntax"
     size_t at = 0;      // reply offset to roll back to
 };
 

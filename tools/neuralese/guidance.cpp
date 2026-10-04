@@ -11,6 +11,29 @@ namespace {
 
 const char * CALL_START = "<|tool_call_start|>";
 const size_t MIN_REPEAT_CHARS = 8;
+const size_t RUN_MIN = 3, RUN_MAX = 60;
+
+// `line` ends with one chunk of RUN_MIN..RUN_MAX characters repeated `times` times in a row
+bool ends_in_run(const std::string & line, int32_t times) {
+    for (size_t size = RUN_MIN; size <= std::min(RUN_MAX, line.size() / (size_t) times); ++size) {
+        const std::string unit = line.substr(line.size() - size);
+        if (unit.find_first_not_of(" \t\r\n\f\v") == std::string::npos) continue;
+        bool run = true;
+        for (int32_t k = 1; k < times && run; ++k) run = line.compare(line.size() - size * (k + 1), size, unit) == 0;
+        if (run) return true;
+    }
+    return false;
+}
+
+// const/let/var declaration: (indentation, name), or nothing
+bool declaration(const std::string & line, std::string & indent, std::string & name) {
+    static const std::regex pattern(R"(^(\s*)(?:const|let|var)\s+([A-Za-z_$][\w$]*))");
+    std::smatch m;
+    if (!std::regex_search(line, m, pattern)) return false;
+    indent = m[1].str();
+    name = m[2].str();
+    return true;
+}
 
 struct code_string {
     size_t raw_start;
@@ -136,6 +159,9 @@ std::optional<nz_guide_verdict> nz_guide::check(const std::string & reply) {
     for (const auto & code : code_strings(reply)) {
         const std::vector<std::string> lines = split_lines(code.text);
         const size_t complete = code.closed ? lines.size() : lines.size() - 1;
+        if (!code.closed && settings.run > 0 && !accepted(code.raw_lines.back()) && ends_in_run(lines.back(), settings.run)) {
+            return nz_guide_verdict { "repetition", code.raw_lines.back() };
+        }
         for (size_t index = 0; index < complete; ++index) {
             const bool final = code.closed && index == complete - 1;
             const auto key = std::make_tuple(std::string("line"), code.raw_lines[index], final);
@@ -148,6 +174,18 @@ std::optional<nz_guide_verdict> nz_guide::check(const std::string & reply) {
                 int32_t count = 0;
                 for (size_t j = 0; j <= index; ++j) count += strip(lines[j]) == line;
                 if (count >= settings.repeat) return nz_guide_verdict { "repetition", at };
+            }
+            std::string indent, name;
+            if (declaration(lines[index], indent, name)) {
+                for (size_t j = index; j-- > 0;) {
+                    const std::string & earlier = lines[j];
+                    const size_t lead = earlier.find_first_not_of(" \t");
+                    if (lead != std::string::npos && strip(earlier).size() && lead < indent.size()) break;
+                    std::string other_indent, other_name;
+                    if (declaration(earlier, other_indent, other_name) && other_indent == indent && other_name == name) {
+                        return nz_guide_verdict { "redeclaration", at };
+                    }
+                }
             }
             if (settings.syntax) {
                 std::string prefix, before;

@@ -684,6 +684,10 @@ private:
         if (s_.compare(i_, 4, "True") == 0) { i_ += 4; return true; }
         if (s_.compare(i_, 5, "False") == 0) { i_ += 5; return false; }
         if (s_.compare(i_, 4, "None") == 0) { i_ += 4; return nullptr; }
+        // JSON's literals too: the template renders nested values as JSON (value={"a": false}), and models write them
+        if (s_.compare(i_, 4, "true") == 0) { i_ += 4; return true; }
+        if (s_.compare(i_, 5, "false") == 0) { i_ += 5; return false; }
+        if (s_.compare(i_, 4, "null") == 0) { i_ += 4; return nullptr; }
         size_t start = i_;
         if (c == '-' || c == '+') ++i_;
         bool is_float = false;
@@ -1143,6 +1147,7 @@ struct engine {
             settings.repeat = g.value("repeat", 3);
             settings.syntax = g.value("syntax", true);
             settings.retries = g.value("retries", 4);
+            settings.run = g.value("run", 4);
             guide = nz_guide { settings, {}, {} };
             const std::string prefix = guide->forced_prefix();
             if (!prefix.empty() && !forced) {
@@ -1663,6 +1668,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             for (const auto & n : g.value("tools", json::array())) guide.settings.tools.push_back(n.get<std::string>());
             guide.settings.repeat = g.value("repeat", 3);
             guide.settings.syntax = g.value("syntax", true);
+            guide.settings.run = g.value("run", 4);
             const std::string reply = body.value("reply", "");
             for (size_t end = 1; end <= reply.size(); ++end) {
                 const auto verdict = guide.check(reply.substr(0, end));
