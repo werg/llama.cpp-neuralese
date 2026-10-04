@@ -817,7 +817,7 @@ struct engine {
         return b;
     }
 
-    rendered render(const json & messages, const json & tools) {
+    rendered render(const json & messages, const json & tools, bool add_generation_prompt = true) {
         renderer r(escaped);
         std::vector<std::string> blocks;
         json plain = json::array();
@@ -860,38 +860,19 @@ struct engine {
         if (tools.is_array() && !tools.empty()) {
             inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(tools.dump()));
         }
-        inputs.add_generation_prompt = true;
+        inputs.add_generation_prompt = add_generation_prompt;
         inputs.use_jinja = true;
         const common_chat_params params = common_chat_templates_apply(templates.get(), inputs);
         return split_rendered(params.prompt, blocks, r);
     }
 
-    json generate(const json & body) {
-        std::lock_guard<std::mutex> lock(mutex);
-        const std::string request_id = "chatcmpl-" + std::to_string(next_id++);
-        const json messages = body.value("messages", json::array());
-        const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
-        const int32_t max_tokens = body.contains("max_tokens") && body["max_tokens"].is_number()
-            ? body["max_tokens"].get<int32_t>()
-            : (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()
-                   ? body["max_completion_tokens"].get<int32_t>() : 512);
-        const float temperature = body.contains("temperature") && body["temperature"].is_number()
-            ? body["temperature"].get<float>() : 0.0f;
-        const float nz_temperature = body.contains("neuralese_temperature") && body["neuralese_temperature"].is_number()
-            ? body["neuralese_temperature"].get<float>() : 0.0f;
-        int32_t nz_max = max_block;
-        if (body.contains("neuralese_max_length") && body["neuralese_max_length"].is_number()) {
-            nz_max = std::min(max_block, body["neuralese_max_length"].get<int32_t>());
-        }
-        const std::string seed_key = body.contains("seed") && !body["seed"].is_null() ? body["seed"].dump() : request_id;
-
-        const rendered prompt = render(messages, tools);
+    // Prefill a rendered prompt (text, literal text and read blocks) on sequence 0 from position 0, with logits at
+    // its last position. Returns the next position.
+    llama_pos prefill(const rendered & prompt) {
         std::vector<block> inputs;
         for (const auto & id : prompt.blocks) {
             inputs.push_back(lookup(id));
         }
-
-        // prefill
         llama_memory_clear(llama_get_memory(ctx), true);
         llama_pos pos = 0;
         const llama_token open_id = nz_heads_open_token(heads), close_id = nz_heads_close_token(heads);
@@ -930,6 +911,122 @@ struct engine {
             throw request_error("empty-prompt", "the prompt rendered to nothing");
         }
         flush(true);
+        return pos;
+    }
+
+    // log softmax of logits at token: logit[token] - logsumexp(logits)
+    float token_logprob(const float * logits, llama_token token) const {
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        float top = logits[0];
+        for (int32_t i = 1; i < n_vocab; ++i) top = std::max(top, logits[i]);
+        double sum = 0.0;
+        for (int32_t i = 0; i < n_vocab; ++i) sum += std::exp((double) logits[i] - top);
+        return logits[token] - top - (float) std::log(sum);
+    }
+
+    // Decision readout (POST /v1/neuralese/decide): each option's log-probability as the whole assistant reply
+    // after the messages. The prompt is prefilled once; tokens every option shares at the start of the reply run
+    // once; each option's own tokens run on a copy of the sequence. Matches the reference's
+    // GradSession.decision_logprobs: the reply is cut from the full rendering after the prompt, through its last
+    // end-of-message marker.
+    json decide(const json & body) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const json messages = body.value("messages", json::array());
+        const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
+        const json options = body.value("options", json::array());
+        if (!options.is_array() || options.empty()) throw request_error("neuralese-decision", "a decision needs at least one option");
+        const rendered prompt = render(messages, tools);
+        std::string prompt_text;
+        for (const auto & seg : prompt.segments) prompt_text += seg.text;
+        std::vector<std::vector<llama_token>> rests;
+        for (const auto & option : options) {
+            if (!option.is_string()) throw request_error("neuralese-decision", "options are reply texts");
+            json full_messages = messages;
+            full_messages.push_back({ { "role", "assistant" }, { "content", option } });
+            const rendered full = render(full_messages, tools, false);
+            if (full.blocks != prompt.blocks) throw request_error("neuralese-decision", "options rendered different prompts");
+            std::string full_text;
+            for (const auto & seg : full.segments) full_text += seg.text;
+            if (full_text.compare(0, prompt_text.size(), prompt_text) != 0) {
+                throw request_error("neuralese-decision", "the template renders the reply's prompt differently");
+            }
+            std::string rest = full_text.substr(prompt_text.size());
+            const size_t end = rest.rfind("<|im_end|>");
+            if (end != std::string::npos) rest = rest.substr(0, end + std::string("<|im_end|>").size());
+            rests.push_back(common_tokenize(vocab, rest, false, true));
+        }
+        size_t shared = 0;
+        if (rests.size() > 1) {
+            while (true) {
+                bool same = true;
+                for (const auto & r : rests) same = same && r.size() > shared && r[shared] == rests[0][shared];
+                if (!same) break;
+                ++shared;
+            }
+        }
+        llama_pos pos = prefill(prompt);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<float> last(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
+        if (shared) {
+            std::vector<llama_token> head(rests[0].begin(), rests[0].begin() + (long) shared);
+            if (decode_tokens(head, pos, true) != 0) throw request_error("decode-failed", "decision prefix", 500);
+            pos += (llama_pos) shared;
+            last.assign(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
+        }
+        llama_memory_t mem = llama_get_memory(ctx);
+        json log_probs = json::array(), counts = json::array();
+        for (const auto & r : rests) {
+            const std::vector<llama_token> own(r.begin() + (long) shared, r.end());
+            double total = 0.0;
+            if (!own.empty()) {
+                total += token_logprob(last.data(), own[0]);
+                if (own.size() > 1) {
+                    llama_memory_seq_rm(mem, 1, -1, -1);
+                    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                    llama_batch batch = llama_batch_init((int32_t) own.size(), 0, 1);
+                    batch.n_tokens = (int32_t) own.size() - 1;
+                    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                        batch.token[i] = own[i];
+                        batch.pos[i] = pos + i;
+                        batch.n_seq_id[i] = 1;
+                        batch.seq_id[i][0] = 1;
+                        batch.logits[i] = 1;
+                    }
+                    const int status = llama_decode(ctx, batch);
+                    llama_batch_free(batch);
+                    if (status != 0) throw request_error("decode-failed", "decision option", 500);
+                    for (size_t i = 1; i < own.size(); ++i) total += token_logprob(llama_get_logits_ith(ctx, (int32_t) i - 1), own[i]);
+                    llama_memory_seq_rm(mem, 1, -1, -1);
+                }
+            }
+            log_probs.push_back(total);
+            counts.push_back(own.size());
+        }
+        return { { "log_probs", log_probs }, { "tokens", counts } };
+    }
+
+    json generate(const json & body) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const std::string request_id = "chatcmpl-" + std::to_string(next_id++);
+        const json messages = body.value("messages", json::array());
+        const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
+        const int32_t max_tokens = body.contains("max_tokens") && body["max_tokens"].is_number()
+            ? body["max_tokens"].get<int32_t>()
+            : (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()
+                   ? body["max_completion_tokens"].get<int32_t>() : 512);
+        const float temperature = body.contains("temperature") && body["temperature"].is_number()
+            ? body["temperature"].get<float>() : 0.0f;
+        const float nz_temperature = body.contains("neuralese_temperature") && body["neuralese_temperature"].is_number()
+            ? body["neuralese_temperature"].get<float>() : 0.0f;
+        int32_t nz_max = max_block;
+        if (body.contains("neuralese_max_length") && body["neuralese_max_length"].is_number()) {
+            nz_max = std::min(max_block, body["neuralese_max_length"].get<int32_t>());
+        }
+        const std::string seed_key = body.contains("seed") && !body["seed"].is_null() ? body["seed"].dump() : request_id;
+
+        const rendered prompt = render(messages, tools);
+        llama_pos pos = prefill(prompt);
+        const llama_token open_id = nz_heads_open_token(heads), close_id = nz_heads_close_token(heads);
         const int32_t prompt_positions = pos;
 
         // forced plan (test hook)
@@ -1159,6 +1256,17 @@ int main(int argc, char ** argv) {
         std::set<std::string> referenced;
         if (body.is_object() && body.contains("referenced")) for (const auto & id : body["referenced"]) referenced.insert(id.get<std::string>());
         send_json(res, 200, { { "removed", e.store.collect(referenced) } });
+    });
+    server.Post("/v1/neuralese/decide", [&](const httplib::Request & req, httplib::Response & res) {
+        json body = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
+        if (body.is_discarded()) return send_error(res, 400, "bad-json", "request body is not JSON");
+        try {
+            send_json(res, 200, e.decide(body));
+        } catch (const request_error & err) {
+            send_error(res, err.status, err.code, err.what());
+        } catch (const std::exception & err) {
+            send_error(res, 500, "internal", err.what());
+        }
     });
     server.Post("/v1/neuralese/grad", [](const httplib::Request &, httplib::Response & res) {
         send_error(res, 501, "neuralese-grad-unavailable", "gradient sessions are served by the reference server");
