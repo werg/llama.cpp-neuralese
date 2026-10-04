@@ -37,6 +37,10 @@ struct nz_heads {
     llama_token open_token  = -1;
     llama_token close_token = -1;
     std::string dialect;
+    // stop source: false = the sketch's shallow residual h_k decides during the recurrence; true ("final") = the
+    // completed residual h_D at each written position decides (the reference's StopHead on final states)
+    bool stop_final    = false;
+    bool stop_counts   = true;  // false: the count is not an input; position row 0 stands in for it
 
     ggml_tensor * interface_w     = nullptr;
     ggml_tensor * fb_readout_norm = nullptr;
@@ -111,6 +115,16 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
               get_f32(h->gctx, "neuralese.feedback.tau", h->tau);
     const int64_t did = gguf_find_key(h->gctx, "neuralese.dialect");
     h->dialect = did >= 0 ? gguf_get_val_str(h->gctx, did) : "";
+    // Optional (projectors exported before stop sources existed use the shallow source with the count).
+    const int64_t sid = gguf_find_key(h->gctx, "neuralese.stop_source");
+    const std::string stop_source = sid >= 0 ? gguf_get_val_str(h->gctx, sid) : "shallow";
+    if (stop_source != "shallow" && stop_source != "final") {
+        fprintf(stderr, "%s: unknown stop source %s\n", __func__, stop_source.c_str());
+        ok = false;
+    }
+    h->stop_final = stop_source == "final";
+    const int64_t pid = gguf_find_key(h->gctx, "neuralese.stop_position");
+    h->stop_counts = pid < 0 || gguf_get_val_u32(h->gctx, pid) != 0;
     h->n_embd = (int32_t) n_embd;
     h->cutoff = (int32_t) cutoff;
     h->max_length = (int32_t) max_length;
@@ -309,7 +323,7 @@ void nz_feedback(const nz_heads * h, const float * h_cut, float * sketch) {
 float nz_stop_logit(const nz_heads * h, const float * h_cut, int32_t count) {
     graph_run g;
     ggml_context * ctx = g.ctx;
-    const int32_t row = std::min(count, h->max_length);
+    const int32_t row = h->stop_counts ? std::min(count, h->max_length) : 0;
     ggml_tensor * x = rms(ctx, g.input(h_cut, h->n_embd, 1), h->stop_norm, h->eps);
     ggml_tensor * p = ggml_view_2d(ctx, h->stop_position, h->pos_dim, 1, h->stop_position->nb[1],
                                    (size_t) row * h->stop_position->nb[1]);
@@ -411,7 +425,54 @@ int32_t nz_write(llama_context * ctx, const nz_heads * h, llama_seq_id seq, llam
     llama_set_embeddings_layer_inp(ctx, (uint32_t) k, true);
     int32_t status = 0;
     int32_t count  = 0;
-    while (true) {
+    if (h->stop_final) {
+        // Final stop source: after each sketch step, the new shallow residual is completed through layers [k, n)
+        // on its own scratch sequence, and the stop head reads the completed residual h_D with the count. By
+        // causality h_D at a position depends only on positions up to it, so deciding here equals the reference's
+        // lookahead chunks. The hard maximum truncates without a decision; an empty block is not possible.
+        if (params.allow_empty) {
+            llama_memory_seq_rm(mem, params.seq_sketch, -1, -1);
+            return -1;
+        }
+        llama_memory_seq_rm(mem, params.seq_complete, -1, -1);
+        llama_memory_seq_cp(mem, seq, params.seq_complete, -1, -1);
+        while (count < max_len) {
+            nz_feedback(h, state.data(), sketch.data());
+            llama_set_layer_range(ctx, 0, k);
+            status = decode_embd(ctx, sketch.data(), 1, d, pos_first + count, params.seq_sketch, false);
+            llama_set_layer_range(ctx, 0, -1);
+            if (status != 0) {
+                break;
+            }
+            const float * h_k = llama_get_embeddings_layer_inp(ctx, (uint32_t) k);
+            r.sketches.insert(r.sketches.end(), sketch.begin(), sketch.end());
+            r.shallow.insert(r.shallow.end(), h_k, h_k + d);
+            state.assign(h_k, h_k + d);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, true);
+            llama_set_layer_range(ctx, k, -1);
+            status = decode_embd(ctx, state.data(), 1, d, pos_first + count, params.seq_complete, false);
+            llama_set_layer_range(ctx, 0, -1);
+            if (status != 0) {
+                break;
+            }
+            std::vector<float> h_final(llama_get_embeddings_layer_inp(ctx, (uint32_t) n_layer),
+                                       llama_get_embeddings_layer_inp(ctx, (uint32_t) n_layer) + d);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, false);
+            count++;
+            if (count == max_len) {
+                r.truncated = true;
+                break;
+            }
+            const float logit = nz_stop_logit(h, h_final.data(), count);
+            r.stop_logits.push_back(logit);
+            if (logit > 0.0f) {
+                break;
+            }
+        }
+        llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, false);
+        llama_memory_seq_rm(mem, params.seq_complete, -1, -1);
+    }
+    while (!h->stop_final) {
         if (count > 0 || params.allow_empty) {
             const float logit = nz_stop_logit(h, state.data(), count);
             if (count > 0) {
