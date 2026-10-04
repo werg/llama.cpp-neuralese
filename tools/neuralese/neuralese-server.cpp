@@ -11,12 +11,14 @@
 //   GET  /v1/neuralese/blocks/{id}     fetch a block; .../meta for its metadata
 //   POST /v1/neuralese/blocks/{id}/pin, .../unpin
 //   POST /v1/neuralese/collect         drop unpinned blocks not in {"referenced": [...]}
+//   POST /v1/neuralese/render          the rendered prompt of {"messages", "tools"?} (blocks as "<block>"), for conformance
 //   POST /v1/neuralese/encode          text into a block in one forward pass through the port: {"text", "type"?, "context"?}
 //   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
 //   POST /v1/neuralese/digest          the digest operator: {"name", "type", "value", "instructions", "system"?, "window"?}
 //   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
+// guidance (guidance.h: envelope and eval-code line checks with rollback; x_natlang_guidance.rejections in the reply),
 // neuralese_max_length (capped by --max-block), neuralese_length (an optional size hint: exactly that many vectors, no
 // stop decision) and neuralese_passes (with a hint, block-wise in that many parallel passes), neuralese_template (template readout: the reply forced to a call cut at
 // its value, {"call", "arguments"?, "argument"?, "value": "write" | "decode"}), and the test hook x_natlang_forced (a plan of text
@@ -31,6 +33,7 @@
 // left to an integration into llama-server.
 
 #include "neuralese.h"
+#include "guidance.h"
 #include "llama-ext.h"
 
 #include "chat.h"
@@ -1118,6 +1121,32 @@ struct engine {
             forced = true;
             free_after = mode == "decode";
         }
+        // Guidance (guidance.h): envelope and line checks with rollback. Snapshots of sequence 0 live on the spare
+        // sequences 3..6, at most four, as in the reference.
+        std::optional<nz_guide> guide;
+        if (body.contains("guidance") && ((body["guidance"].is_boolean() && body["guidance"].get<bool>()) || body["guidance"].is_object())) {
+            const json g = body["guidance"].is_object() ? body["guidance"] : json::object();
+            nz_guide_settings settings;
+            settings.require_call = g.value("require_call", body.value("tool_choice", json("auto")) == json("required"));
+            if (g.contains("tools") && g["tools"].is_array() && !g["tools"].empty()) {
+                for (const auto & n : g["tools"]) settings.tools.push_back(n.get<std::string>());
+            } else if (tools.is_array()) {
+                for (const auto & t : tools) {
+                    const json & fn = t.contains("function") ? t["function"] : t;
+                    if (fn.contains("name") && fn["name"].is_string()) settings.tools.push_back(fn["name"].get<std::string>());
+                }
+            }
+            settings.repeat = g.value("repeat", 3);
+            settings.syntax = g.value("syntax", true);
+            settings.retries = g.value("retries", 4);
+            guide = nz_guide { settings, {}, {} };
+            const std::string prefix = guide->forced_prefix();
+            if (!prefix.empty() && !forced) {
+                for (llama_token tok : common_tokenize(vocab, prefix, false, true)) plan.push_back({ false, tok });
+                forced = true;
+                free_after = true;
+            }
+        }
         size_t plan_at = 0;
 
         llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -1133,6 +1162,85 @@ struct engine {
         std::vector<block> written;
         int32_t generated = 0;
         std::string finish = "stop";
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        llama_memory_t mem = llama_get_memory(ctx);
+        struct snapshot { size_t count; llama_seq_id seq; std::vector<float> logits; llama_pos pos; int32_t generated; };
+        std::vector<snapshot> snapshots;
+        std::vector<llama_seq_id> spare { 3, 4, 5, 6 };
+        std::map<size_t, std::set<llama_token>> bans;
+        std::map<size_t, int32_t> retries;
+        std::vector<std::string> pieces;
+        json rejections = json::array();
+        std::vector<float> cur;
+        auto current_logits = [&]() { const float * l = llama_get_logits_ith(ctx, -1); cur.assign(l, l + n_vocab); };
+        auto take_snapshot = [&]() {
+            if (spare.empty()) {
+                spare.push_back(snapshots.front().seq);
+                snapshots.erase(snapshots.begin());
+            }
+            const llama_seq_id s = spare.back();
+            spare.pop_back();
+            llama_memory_seq_rm(mem, s, -1, -1);
+            llama_memory_seq_cp(mem, 0, s, -1, -1);
+            snapshots.push_back({ items.size(), s, cur, pos, generated });
+        };
+        if (guide) {
+            current_logits();
+            take_snapshot();
+        }
+        // After a token: the reply checks; on a rejection roll back to the offending line and ban its first token.
+        auto guide_step = [&]() {
+            std::string reply;
+            std::vector<size_t> starts;
+            for (const auto & piece : pieces) {
+                starts.push_back(reply.size());
+                reply += piece;
+            }
+            const auto verdict = guide->check(reply);
+            if (!verdict) {
+                const auto ends = [&](const std::string & tail) {
+                    return reply.size() >= tail.size() && reply.compare(reply.size() - tail.size(), tail.size(), tail) == 0;
+                };
+                if (ends("\\n") || ends("\n") || ends("[")) take_snapshot();
+                return;
+            }
+            const size_t at = verdict->at;
+            size_t target = 0;
+            for (size_t i = 0; i < starts.size(); ++i) if (starts[i] <= at) target = i;
+            const int32_t tries = retries.count(at) ? retries[at] : 0;
+            const snapshot * usable = nullptr;
+            for (const auto & snap : snapshots) if (snap.count <= target) usable = &snap;
+            bool blocked = !usable;
+            if (usable) for (size_t i = usable->count; i < target; ++i) blocked = blocked || items[i].is_block;
+            if (tries >= guide->settings.retries || blocked) {
+                guide->accept(at);
+                rejections.push_back({ { "reason", verdict->reason }, { "offset", at }, { "accepted", true } });
+                return;
+            }
+            retries[at] = tries + 1;
+            rejections.push_back({ { "reason", verdict->reason }, { "offset", at } });
+            bans[target].insert(items[target].token);
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            llama_memory_seq_cp(mem, usable->seq, 0, -1, -1);
+            cur = usable->logits;
+            pos = usable->pos;
+            generated = usable->generated;
+            std::vector<llama_token> between;
+            for (size_t i = usable->count; i < target; ++i) between.push_back(items[i].token);
+            if (!between.empty()) {
+                if (decode_tokens(between, pos, true) != 0) throw request_error("decode-failed", "guidance rollback", 500);
+                current_logits();
+                pos += (llama_pos) between.size();
+                generated += (int32_t) between.size();
+            }
+            guide->rewind(starts[target]);
+            items.resize(target);
+            pieces.resize(target);
+            for (auto it = snapshots.begin(); it != snapshots.end();) {
+                if (it->count > target) { spare.push_back(it->seq); it = snapshots.erase(it); } else ++it;
+            }
+            for (auto it = bans.begin(); it != bans.end();) it = it->first > target ? bans.erase(it) : std::next(it);
+        };
         while (true) {
             if (generated >= max_tokens) { finish = "length"; break; }
             llama_token token;
@@ -1140,6 +1248,15 @@ struct engine {
             if (forced) {
                 if (plan_at >= plan.size()) break;
                 token = plan[plan_at++].token;
+            } else if (guide) {
+                std::vector<llama_token_data> candidates((size_t) n_vocab);
+                const auto & banned = bans[items.size()];
+                for (int32_t i = 0; i < n_vocab; ++i) {
+                    candidates[i] = { i, banned.count(i) ? -INFINITY : cur[i], 0.0f };
+                }
+                llama_token_data_array array { candidates.data(), candidates.size(), -1, false };
+                llama_sampler_apply(sampler, &array);
+                token = array.data[array.selected].id;
             } else {
                 token = llama_sampler_sample(sampler, ctx, -1);
             }
@@ -1181,6 +1298,10 @@ struct engine {
                 for (const auto & part : parts) store.put(part);
                 written.push_back(b);
                 items.push_back({ true, 0, index });
+                if (guide) {
+                    pieces.push_back("__nz");
+                    current_logits();
+                }
                 pos = first + r.n + 1;
                 generated += r.n + 2;
                 // a forced plan's own close marker is written by the procedure instead
@@ -1192,8 +1313,14 @@ struct engine {
             pos += 1;
             generated += 1;
             items.push_back({ false, token, 0 });
+            if (guide) {
+                current_logits();
+                pieces.push_back(common_token_to_piece(vocab, token, true));
+                guide_step();
+            }
         }
         llama_sampler_free(sampler);
+        for (const auto & snap : snapshots) llama_memory_seq_rm(mem, snap.seq, -1, -1);
 
         // output text with block placeholders
         std::string text;
@@ -1210,7 +1337,7 @@ struct engine {
         if (finish == "stop" && message.contains("tool_calls")) finish = "tool_calls";
         json metas = json::array();
         for (const auto & b : written) metas.push_back(b.meta());
-        return {
+        json response = {
             { "id", request_id }, { "object", "chat.completion" }, { "created", (int64_t) time(nullptr) },
             { "model", model_name },
             { "choices", json::array({ { { "index", 0 }, { "message", message }, { "finish_reason", finish } } }) },
@@ -1218,6 +1345,8 @@ struct engine {
                          { "total_tokens", prompt_positions + generated } } },
             { "neuralese", { { "dialect", dialect }, { "blocks", metas } } },
         };
+        if (guide) response["x_natlang_guidance"] = { { "rejections", rejections } };
+        return response;
     }
 
     // Decode embedding rows on seq from pos through the current layer range, in batches, collecting the residual
@@ -1444,7 +1573,7 @@ int main(int argc, char ** argv) {
     cp.n_ctx = n_ctx;
     cp.n_batch = e.n_batch;
     cp.n_ubatch = e.n_batch;
-    cp.n_seq_max = 3;
+    cp.n_seq_max = 7; // 0 main, 1-2 the writer's scratch, 3-6 guidance snapshots
     cp.kv_unified = true;
     cp.n_threads = n_threads;
     cp.n_threads_batch = n_threads;
@@ -1537,6 +1666,29 @@ int main(int argc, char ** argv) {
             }
         });
     };
+    post("/v1/neuralese/render", [&](const json & body) {
+        const rendered r = e.render(body.value("messages", json::array()), body.contains("tools") ? body["tools"] : json(nullptr));
+        std::string prompt;
+        for (const auto & seg : r.segments) prompt += seg.kind == rendered::segment::BLOCK ? "<block>" : seg.text;
+        // as prefill feeds it: the model's BOS once at the start
+        const std::string bos = common_token_to_piece(e.vocab, llama_vocab_bos(e.vocab), true);
+        if (llama_vocab_get_add_bos(e.vocab) && prompt.compare(0, bos.size(), bos) != 0) prompt = bos + prompt;
+        return json { { "prompt", prompt } };
+    });
+    post("/v1/neuralese/guidance/check", [&](const json & body) {
+        // The first rejection of `reply` checked prefix by prefix, as during generation (for conformance).
+        nz_guide guide;
+        const json g = body.value("guidance", json::object());
+        for (const auto & n : g.value("tools", json::array())) guide.settings.tools.push_back(n.get<std::string>());
+        guide.settings.repeat = g.value("repeat", 3);
+        guide.settings.syntax = g.value("syntax", true);
+        const std::string reply = body.value("reply", "");
+        for (size_t end = 1; end <= reply.size(); ++end) {
+            const auto verdict = guide.check(reply.substr(0, end));
+            if (verdict) return json { { "reason", verdict->reason }, { "offset", verdict->at }, { "end", end } };
+        }
+        return json { { "reason", nullptr } };
+    });
     post("/v1/neuralese/encode", [&](const json & body) { return e.encode(body); });
     post("/v1/neuralese/write", [&](const json & body) { return e.write(body); });
     post("/v1/neuralese/digest", [&](const json & body) { return e.digest(body); });
