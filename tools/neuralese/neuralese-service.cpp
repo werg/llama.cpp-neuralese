@@ -1539,6 +1539,7 @@ json error_body(const std::string & code, const std::string & detail) {
 
 struct nz_service {
     engine e;
+    int n_gpu_layers = 0;
 };
 
 nz_service * nz_service_load(const nz_service_options & o, std::string & error) {
@@ -1554,6 +1555,7 @@ nz_service * nz_service_load(const nz_service_options & o, std::string & error) 
     engine & e = s->e;
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = o.n_gpu_layers;
+    s->n_gpu_layers = o.n_gpu_layers;
     if (!o.use_mmap) mp.load_mode = LLAMA_LOAD_MODE_NONE;
     e.model = llama_model_load_from_file(o.model_path.c_str(), mp);
     if (!e.model) { error = "could not load the model " + o.model_path; delete s; return nullptr; }
@@ -1593,7 +1595,14 @@ void nz_service_free(nz_service * s) {
 }
 
 std::string nz_service_hello(const nz_service * s) {
-    return json({ { "dialect", s->e.dialect }, { "cutoff", nz_heads_cutoff(s->e.heads) } }).dump();
+    json devices = json::array();
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        devices.push_back({ { "name", ggml_backend_dev_name(dev) }, { "description", ggml_backend_dev_description(dev) },
+                            { "gpu", ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU } });
+    }
+    return json({ { "dialect", s->e.dialect }, { "cutoff", nz_heads_cutoff(s->e.heads) }, { "devices", devices },
+                  { "gpu_layers", s->n_gpu_layers } }).dump();
 }
 
 nz_response nz_service_handle(nz_service * s, const std::string & method, const std::string & path, const std::string & body_text) {

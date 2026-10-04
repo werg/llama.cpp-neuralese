@@ -35,6 +35,7 @@ int nzw_load(const char * options_json) {
     options.n_ctx = o.value("n_ctx", 8192);
     options.max_block = o.value("max_block", 64);
     options.use_mmap = o.value("mmap", false); // WORKERFS cannot map; reading copies once into the heap
+    options.n_gpu_layers = o.value("gpu_layers", 0); // WebGPU builds: layers (and the heads, if > 0) on the GPU
     if (service) nz_service_free(service);
     service = nz_service_load(options, error);
     return service ? 0 : 1;
