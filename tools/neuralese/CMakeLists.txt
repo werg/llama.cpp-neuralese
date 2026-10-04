@@ -23,6 +23,21 @@ target_include_directories(nz-tree-sitter PUBLIC vendor/tree-sitter/include PRIV
 set_target_properties(nz-tree-sitter PROPERTIES C_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
 target_compile_options(nz-tree-sitter PRIVATE -w) # vendored code
 
+# The service as a WebAssembly module for natlang's browser runtime (Emscripten builds only; see wasm/build.sh)
+if (EMSCRIPTEN AND TARGET llama-common)
+    set(TARGET neuralese-wasm)
+    add_executable(${TARGET} wasm/neuralese-wasm.cpp neuralese-service.cpp guidance.cpp)
+    set_target_properties(${TARGET} PROPERTIES SUFFIX ".mjs") # an ES module (llama.cpp defaults Emscripten to .html)
+    target_link_libraries(${TARGET} PRIVATE neuralese nz-tree-sitter llama-common vendor::hash vendor::nlohmann)
+    target_include_directories(${TARGET} PRIVATE ../../src)
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+    target_link_options(${TARGET} PRIVATE
+        -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createNeuraleseModule -sENVIRONMENT=web,worker,node
+        -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=5MB -sFORCE_FILESYSTEM=1 -lnodefs.js -lworkerfs.js
+        "-sEXPORTED_FUNCTIONS=['_nzw_load','_nzw_error','_nzw_hello','_nzw_handle','_nzw_body','_nzw_body_length','_nzw_content_type','_nzw_unload','_malloc','_free']"
+        "-sEXPORTED_RUNTIME_METHODS=['FS','NODEFS','WORKERFS','HEAPU8','UTF8ToString','stringToUTF8','lengthBytesUTF8']")
+endif()
+
 # OpenAI-style chat server with Neuralese blocks (same protocol as the PyTorch reference server)
 if (TARGET llama-common AND TARGET cpp-httplib)
     set(TARGET llama-neuralese-server)

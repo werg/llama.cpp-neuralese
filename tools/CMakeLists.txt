@@ -13,6 +13,7 @@ llama_add_compile_flags()
 # tools
 
 if (EMSCRIPTEN)
+    add_subdirectory(neuralese) # the Neuralese service as WebAssembly (natlang's browser runtime)
 else()
     add_subdirectory(batched-bench)
     add_subdirectory(gguf-split)
