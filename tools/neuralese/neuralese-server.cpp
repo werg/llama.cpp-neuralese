@@ -68,6 +68,13 @@ struct request_error : std::runtime_error {
         : std::runtime_error(code + ": " + detail), code(std::move(code)), status(status) {}
 };
 
+// Weight adapters (natlang model/tiny_adapters.py) are served by the reference server only; a request that binds
+// them must fail rather than answer with the base model.
+static void refuse_adapters(const json & body, const char * key) {
+    if (body.contains(key) && body[key].is_array() && !body[key].empty())
+        throw request_error("neuralese-adapters-unavailable", "weight adapters are served by the reference server", 501);
+}
+
 //
 // content addressing: nz1_ + base32(sha256("natlang.neuralese-block/1\0{dialect}\0{L}x{W}\0{dtype}\0" + bytes))
 //
@@ -930,6 +937,7 @@ struct engine {
     // GradSession.decision_logprobs: the reply is cut from the full rendering after the prompt, through its last
     // end-of-message marker.
     json decide(const json & body) {
+        refuse_adapters(body, "adapters");
         std::lock_guard<std::mutex> lock(mutex);
         const json messages = body.value("messages", json::array());
         const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
@@ -1006,6 +1014,7 @@ struct engine {
     }
 
     json generate(const json & body) {
+        refuse_adapters(body, "x_natlang_adapters");
         std::lock_guard<std::mutex> lock(mutex);
         const std::string request_id = "chatcmpl-" + std::to_string(next_id++);
         const json messages = body.value("messages", json::array());
