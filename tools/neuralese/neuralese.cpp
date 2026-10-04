@@ -64,12 +64,23 @@ struct nz_heads {
     ggml_tensor * ct_sigma_b      = nullptr;
 };
 
+// Matrices that only enter ggml_mul_mat may be stored as F16 or Q8_0 (smaller projector files, e.g. for the browser);
+// every other tensor is read as F32.
+static bool matmul_weight(const std::string & name) {
+    static const char * names[] = { "nz.feedback.readout.weight", "nz.feedback.table_t", "nz.feedback.mlp_in.weight",
+        "nz.feedback.mlp_out.weight", "nz.stop.mlp_in.weight", "nz.stop.mlp_out.weight", "nz.content.proj.weight",
+        "nz.content.log_sigma.weight" };
+    for (const char * n : names) if (name == n) return true;
+    return false;
+}
+
 static ggml_tensor * get_tensor(nz_heads * h, const char * name) {
     ggml_tensor * t = ggml_get_tensor(h->wctx, name);
     if (!t) {
         fprintf(stderr, "%s: missing tensor %s\n", __func__, name);
-    } else if (t->type != GGML_TYPE_F32) {
-        fprintf(stderr, "%s: tensor %s must be F32\n", __func__, name);
+    } else if (t->type != GGML_TYPE_F32 &&
+               !(matmul_weight(name) && (t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_Q8_0))) {
+        fprintf(stderr, "%s: tensor %s must be F32%s\n", __func__, name, matmul_weight(name) ? ", F16 or Q8_0" : "");
         return nullptr;
     }
     return t;
