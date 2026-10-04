@@ -898,6 +898,11 @@ struct engine {
         std::vector<llama_token> pending;
         auto flush = [&](bool logits) {
             if (pending.empty()) return;
+            // Add the model's BOS once, including prompts that begin with a soft block.
+            const llama_token bos = llama_vocab_bos(vocab);
+            if (pos == 0 && llama_vocab_get_add_bos(vocab) && pending.front() != bos) {
+                pending.insert(pending.begin(), bos);
+            }
             if (decode_tokens(pending, pos, logits) != 0) throw request_error("decode-failed", "prefill", 500);
             pos += (llama_pos) pending.size();
             pending.clear();
