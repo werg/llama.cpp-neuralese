@@ -26,7 +26,7 @@ target_compile_options(nz-tree-sitter PRIVATE -w) # vendored code
 # OpenAI-style chat server with Neuralese blocks (same protocol as the PyTorch reference server)
 if (TARGET llama-common AND TARGET cpp-httplib)
     set(TARGET llama-neuralese-server)
-    add_executable(${TARGET} neuralese-server.cpp guidance.cpp)
+    add_executable(${TARGET} neuralese-server.cpp neuralese-service.cpp guidance.cpp)
     target_link_libraries(${TARGET} PRIVATE neuralese nz-tree-sitter llama-common cpp-httplib vendor::hash vendor::nlohmann
                           ${CMAKE_THREAD_LIBS_INIT})
     target_include_directories(${TARGET} PRIVATE ../../src) # llama-ext.h: layer ranges, the token embedding matrix

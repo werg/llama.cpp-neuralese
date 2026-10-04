@@ -1,0 +1,1678 @@
+// The Neuralese service: the engine behind llama-neuralese-server, without a transport. `nz_service_handle` answers one
+// request of the server protocol (method, path, body) and is shared by the HTTP server (neuralese-server.cpp) and the
+// WebAssembly build for the browser runtime (neuralese-wasm.cpp).
+//
+// llama-neuralese-server: an OpenAI-style chat server with Neuralese soft-token blocks.
+//
+// It speaks the same wire protocol as the PyTorch reference server (natlang, training/neuralese,
+// `python -m natlang_neuralese.serve`), so clients written against one work against the other:
+//
+//   POST /v1/chat/completions          chat completion; message content and tool-call arguments may be
+//                                      arrays of {"type":"text","text":...} and {"type":"neuralese","id":...}
+//   GET  /health, /v1/health, /v1/models
+//   GET  /v1/neuralese/info            dialect, width, maximum block length, cutoff
+//   PUT  /v1/neuralese/blocks/{id}     store a block (one-tensor safetensors body); the ID is checked
+//   GET  /v1/neuralese/blocks/{id}     fetch a block; .../meta for its metadata
+//   POST /v1/neuralese/blocks/{id}/pin, .../unpin
+//   POST /v1/neuralese/collect         drop unpinned blocks not in {"referenced": [...]}
+//   POST /v1/neuralese/render          the rendered prompt of {"messages", "tools"?} (blocks as "<block>"), for conformance
+//   POST /v1/neuralese/encode          text into a block in one forward pass through the port: {"text", "type"?, "context"?}
+//   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
+//   POST /v1/neuralese/digest          the digest operator: {"name", "type", "value", "instructions", "system"?, "window"?}
+//   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
+//
+// Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
+// guidance (guidance.h: envelope and eval-code line checks with rollback; x_natlang_guidance.rejections in the reply),
+// neuralese_max_length (capped by --max-block), neuralese_length (an optional size hint: exactly that many vectors, no
+// stop decision) and neuralese_passes (with a hint, block-wise in that many parallel passes), neuralese_template (template readout: the reply forced to a call cut at
+// its value, {"call", "arguments"?, "argument"?, "value": "write" | "decode"}), and the test hook x_natlang_forced (a plan of text
+// strings and {"neuralese": "write"} items that replaces sampling).
+//
+// Blocks are rendered as <open> + one embedding position per vector + <close>. Literal occurrences of
+// the control tokens' text inside message content or tool arguments are tokenized as text, never as the
+// control tokens. When the model samples the open token, the write procedure in neuralese.h runs:
+// shallow sketch with the stop head, upper-layer completion, content projection, read-back.
+//
+// Requests are served one at a time (a mutex around the model); continuous batching across requests is
+// left to an integration into llama-server.
+
+#include "neuralese-service.h"
+#include "neuralese.h"
+#include "guidance.h"
+#include "llama-ext.h"
+
+#include "chat.h"
+#include "common.h"
+#include "llama.h"
+
+#include "ggml.h"
+
+#include <nlohmann/json.hpp>
+#include "hash/hash.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <functional>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <regex>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using json = nlohmann::ordered_json;
+
+namespace {
+
+//
+// errors
+//
+
+// The digest operator's write site (natlang training/neuralese digest.py; pinned by tests/fixtures/digest-site.json).
+const char * DIGEST_INSTRUCTIONS = "Write a digest of the value below for the listing of the call that receives it: what the value is, how it is organised, and what in it bears on the call's instructions, so that the call knows what to look up. The full value stays in the call's variable for exact reading, so do not copy exact details; keep the digest short.";
+const char * DIGEST_PREFIX = "const digest: Neuralese<Digest> = ";
+const int32_t DIGEST_SITE_MARGIN = 512;
+
+struct request_error : std::runtime_error {
+    std::string code;
+    int status;
+    request_error(std::string code, const std::string & detail, int status = 400)
+        : std::runtime_error(code + ": " + detail), code(std::move(code)), status(status) {}
+};
+
+// Weight adapters (natlang model/tiny_adapters.py) are served by the reference server only; a request that binds
+// them must fail rather than answer with the base model.
+static void refuse_adapters(const json & body, const char * key) {
+    if (body.contains(key) && body[key].is_array() && !body[key].empty())
+        throw request_error("neuralese-adapters-unavailable", "weight adapters are served by the reference server", 501);
+}
+
+//
+// content addressing: nz1_ + base32(sha256("natlang.neuralese-block/1\0{dialect}\0{L}x{W}\0{dtype}\0" + bytes))
+//
+
+std::string base32_lower(const std::vector<uint8_t> & data) {
+    static const char * alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+    std::string out;
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (uint8_t byte : data) {
+        buffer = (buffer << 8) | byte;
+        bits += 8;
+        while (bits >= 5) {
+            out.push_back(alphabet[(buffer >> (bits - 5)) & 31]);
+            bits -= 5;
+        }
+    }
+    if (bits > 0) {
+        out.push_back(alphabet[(buffer << (5 - bits)) & 31]);
+    }
+    return out;
+}
+
+std::string content_id(const std::string & dialect, int64_t length, int64_t width, const std::string & dtype,
+                       const uint8_t * data, size_t n) {
+    std::string head = "natlang.neuralese-block/1";
+    head.push_back('\0');
+    head += dialect;
+    head.push_back('\0');
+    head += std::to_string(length) + "x" + std::to_string(width);
+    head.push_back('\0');
+    head += dtype;
+    head.push_back('\0');
+    std::string buf = head;
+    buf.append((const char *) data, n);
+    const std::string hex = hash_sha256_hex(buf.data(), buf.size());
+    std::vector<uint8_t> digest(hex.size() / 2);
+    for (size_t i = 0; i < digest.size(); ++i) {
+        digest[i] = (uint8_t) std::stoi(hex.substr(2 * i, 2), nullptr, 16);
+    }
+    return "nz1_" + base32_lower(digest);
+}
+
+//
+// tensor store
+//
+
+struct block {
+    std::string id;
+    std::string dialect;
+    int64_t length = 0;
+    int64_t width  = 0;
+    std::vector<float> payload; // [length * width], f32
+    // Preserve uploaded representation for content-addressed GETs. Inference always uses payload above.
+    std::string wire_dtype = "f32";
+    std::vector<uint8_t> wire_payload;
+    std::string type;
+    json producer = json::object();
+    bool truncated = false;
+
+    json meta() const {
+        json m = { { "id", id }, { "dialect", dialect }, { "length", length }, { "width", width }, { "dtype", wire_dtype } };
+        if (!type.empty()) {
+            m["type"] = type;
+        }
+        if (!producer.empty()) {
+            m["producer"] = producer;
+        }
+        if (truncated) {
+            m["truncated"] = true;
+        }
+        return m;
+    }
+};
+
+block make_block(const float * rows, int64_t length, int64_t width, const std::string & dialect,
+                 json producer = json::object(), bool truncated = false) {
+    block b;
+    b.dialect = dialect;
+    b.length = length;
+    b.width = width;
+    b.payload.assign(rows, rows + length * width);
+    b.producer = std::move(producer);
+    b.truncated = truncated;
+    b.id = content_id(dialect, length, width, "f32", (const uint8_t *) b.payload.data(), b.payload.size() * sizeof(float));
+    return b;
+}
+
+std::string encode_block(const block & b) {
+    const bool canonical = b.wire_dtype == "f32" && b.wire_payload.empty();
+    const size_t nbytes = canonical ? b.payload.size() * sizeof(float) : b.wire_payload.size();
+    const char * data = canonical ? (const char *) b.payload.data() : (const char *) b.wire_payload.data();
+    const char * st_dtype = b.wire_dtype == "f16" ? "F16" : b.wire_dtype == "bf16" ? "BF16" : "F32";
+    // the metadata string has sorted keys, like the reference server's
+    json header = {
+        { "__metadata__", { { "natlang.block", nlohmann::json::parse(b.meta().dump()).dump() } } },
+        { "payload", { { "dtype", st_dtype }, { "shape", { b.length, b.width } }, { "data_offsets", { 0, nbytes } } } },
+    };
+    std::string raw = header.dump();
+    raw.append((8 - raw.size() % 8) % 8, ' ');
+    std::string out(8, '\0');
+    const uint64_t size = raw.size();
+    memcpy(out.data(), &size, 8);
+    out += raw;
+    if (nbytes) out.append(data, nbytes);
+    return out;
+}
+
+block decode_block(const std::string & body) {
+    try {
+    if (body.size() < 8) throw request_error("neuralese-bad-block", "not a safetensors body");
+    uint64_t size = 0;
+    memcpy(&size, body.data(), 8);
+    if (size > body.size() - 8) throw request_error("neuralese-bad-block", "header exceeds the body");
+    json header = json::parse(body.data() + 8, body.data() + 8 + (size_t) size);
+    if (!header.is_object()) throw request_error("neuralese-bad-block", "header must be an object");
+    json meta = json::object();
+    if (header.contains("__metadata__")) {
+        const json & metadata = header["__metadata__"];
+        if (!metadata.is_object()) throw request_error("neuralese-bad-block", "metadata must be an object");
+        if (metadata.contains("natlang.block")) {
+            if (!metadata["natlang.block"].is_string()) throw request_error("neuralese-bad-block", "natlang.block metadata must be a JSON string");
+            meta = json::parse(metadata["natlang.block"].get<std::string>());
+            if (!meta.is_object()) throw request_error("neuralese-bad-block", "natlang.block metadata must decode to an object");
+        }
+    }
+    if (!header.contains("payload") || !header["payload"].is_object())
+        throw request_error("neuralese-bad-block", "a block body needs a payload tensor object");
+    const json & entry = header["payload"];
+    if (!entry.contains("dtype") || !entry["dtype"].is_string() || !entry.contains("shape") ||
+        !entry["shape"].is_array() || entry["shape"].size() != 2 || !entry.contains("data_offsets") ||
+        !entry["data_offsets"].is_array() || entry["data_offsets"].size() != 2)
+        throw request_error("neuralese-bad-block", "payload needs a dtype, rank-2 shape, and two data offsets");
+    const std::string st_dtype = entry["dtype"].get<std::string>();
+    std::string dtype;
+    size_t itemsize = 0;
+    if (st_dtype == "F32") { dtype = "f32"; itemsize = 4; }
+    else if (st_dtype == "F16") { dtype = "f16"; itemsize = 2; }
+    else if (st_dtype == "BF16") { dtype = "bf16"; itemsize = 2; }
+    else {
+        throw request_error("neuralese-bad-block", "unsupported block dtype " + st_dtype);
+    }
+    if (!entry["shape"][0].is_number_integer() || !entry["shape"][1].is_number_integer() ||
+        !entry["data_offsets"][0].is_number_integer() || !entry["data_offsets"][1].is_number_integer())
+        throw request_error("neuralese-bad-block", "shape and data offsets must be integers");
+    const int64_t length = entry["shape"][0].get<int64_t>();
+    const int64_t width  = entry["shape"][1].get<int64_t>();
+    if (length < 0 || width <= 0 || length > std::numeric_limits<int32_t>::max() ||
+        width > std::numeric_limits<int32_t>::max() ||
+        (length != 0 && (uint64_t) width > std::numeric_limits<uint64_t>::max() / (uint64_t) length))
+        throw request_error("neuralese-bad-block", "shape dimensions are out of range");
+    const uint64_t elements = (uint64_t) length * (uint64_t) width;
+    if (elements > std::numeric_limits<size_t>::max() / itemsize)
+        throw request_error("neuralese-bad-block", "payload size overflows this host");
+    const size_t expected_bytes = (size_t) elements * itemsize;
+    const size_t header_bytes = (size_t) size;
+    const size_t data_body_size = body.size() - 8 - header_bytes;
+    const size_t start = entry["data_offsets"][0].get<size_t>();
+    const size_t end   = entry["data_offsets"][1].get<size_t>();
+    if (end < start || end > data_body_size || end - start != expected_bytes) {
+        throw request_error("neuralese-bad-block", "block byte count does not match its shape");
+    }
+    const uint8_t * data = (const uint8_t *) body.data() + 8 + header_bytes + start;
+    if (!meta.contains("dialect") || !meta["dialect"].is_string() || meta["dialect"].get<std::string>().empty()) {
+        throw request_error("neuralese-bad-block", "block metadata needs a dialect");
+    }
+    block b;
+    b.dialect = meta["dialect"].get<std::string>();
+    b.length = length;
+    b.width = width;
+    b.wire_dtype = dtype;
+    if (dtype != "f32") b.wire_payload.assign(data, data + expected_bytes);
+    b.id = content_id(b.dialect, length, width, dtype, data, end - start);
+    if (meta.contains("id") && meta["id"].is_string() && meta["id"].get<std::string>() != b.id) {
+        throw request_error("neuralese-bad-block", "block ID " + meta["id"].get<std::string>() +
+                            " does not match its content (" + b.id + ")");
+    }
+    b.payload.resize((size_t) elements);
+    for (size_t i = 0; i < b.payload.size(); ++i) {
+        if (dtype == "f32") {
+            memcpy(&b.payload[i], data + 4 * i, 4);
+        } else if (dtype == "f16") {
+            ggml_fp16_t h;
+            memcpy(&h, data + 2 * i, 2);
+            b.payload[i] = ggml_fp16_to_fp32(h);
+        } else {
+            uint16_t bits;
+            memcpy(&bits, data + 2 * i, 2);
+            const uint32_t f = (uint32_t) bits << 16;
+            memcpy(&b.payload[i], &f, 4);
+        }
+    }
+    if (meta.contains("type") && meta["type"].is_string()) {
+        b.type = meta["type"].get<std::string>();
+    }
+    if (meta.contains("producer") && meta["producer"].is_object()) {
+        b.producer = meta["producer"];
+    }
+    b.truncated = meta.value("truncated", false);
+    return b;
+    } catch (const request_error &) {
+        throw;
+    } catch (const nlohmann::json::exception & e) {
+        throw request_error("neuralese-bad-block", e.what());
+    }
+}
+
+class tensor_store {
+public:
+    block put(block b) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = blocks_.find(b.id);
+        if (it != blocks_.end()) {
+            if (it->second.type.empty() && !b.type.empty()) {
+                it->second.type = b.type;
+            }
+            return it->second;
+        }
+        blocks_[b.id] = b;
+        return b;
+    }
+    bool get(const std::string & id, block & out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = blocks_.find(id);
+        if (it == blocks_.end()) {
+            return false;
+        }
+        out = it->second;
+        return true;
+    }
+    void pin(const std::string & id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!blocks_.count(id)) {
+            throw request_error("neuralese-unknown-block", id, 404);
+        }
+        pins_[id]++;
+    }
+    void unpin(const std::string & id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = pins_.find(id);
+        if (it != pins_.end() && --it->second <= 0) {
+            pins_.erase(it);
+        }
+    }
+    std::vector<std::string> collect(const std::set<std::string> & referenced) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> removed;
+        for (auto it = blocks_.begin(); it != blocks_.end();) {
+            if (!referenced.count(it->first) && !pins_.count(it->first)) {
+                removed.push_back(it->first);
+                it = blocks_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return removed;
+    }
+
+private:
+    std::mutex mutex_;
+    std::map<std::string, block> blocks_;
+    std::map<std::string, int> pins_;
+};
+
+//
+// placeholders: private-use characters stand in for blocks (U+E010 n U+E011) and for escaped control-token
+// text (U+E012 n U+E013) while the chat template runs
+//
+
+const std::string PH_OPEN  = "\xEE\x80\x90"; // U+E010
+const std::string PH_CLOSE = "\xEE\x80\x91"; // U+E011
+const std::string ES_OPEN  = "\xEE\x80\x92"; // U+E012
+const std::string ES_CLOSE = "\xEE\x80\x93"; // U+E013
+
+std::string placeholder(size_t i) { return PH_OPEN + std::to_string(i) + PH_CLOSE; }
+
+bool is_parts(const json & v) {
+    if (!v.is_array() || v.empty()) {
+        return false;
+    }
+    for (const auto & p : v) {
+        if (!p.is_object() || !p.contains("type")) {
+            return false;
+        }
+        const std::string t = p["type"].get<std::string>();
+        if (t != "text" && t != "neuralese") {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct rendered {
+    // a segment is template text, an escaped literal (text that must not become control tokens), or a block
+    struct segment {
+        enum kind_t { TEXT, LITERAL, BLOCK } kind;
+        std::string text;
+        size_t index = 0;
+    };
+    std::vector<segment> segments;
+    std::vector<std::string> blocks;
+};
+
+class renderer {
+public:
+    renderer(const std::vector<std::string> & escaped) : escaped_(escaped) {
+        escaped_.insert(escaped_.end(), { PH_OPEN, PH_CLOSE, ES_OPEN, ES_CLOSE });
+        std::stable_sort(escaped_.begin(), escaped_.end(), [](const std::string & a, const std::string & b) {
+            return a.size() > b.size();
+        });
+    }
+
+    std::string flatten(const json & parts, std::vector<std::string> & blocks) {
+        std::string out;
+        for (const auto & part : parts) {
+            if (part["type"] == "text") {
+                out += escape(part.value("text", ""));
+            } else {
+                if (!part.contains("id") || !part["id"].is_string() || part["id"].get<std::string>().rfind("nz1_", 0) != 0) {
+                    throw request_error("neuralese-bad-part", "invalid block part " + part.dump());
+                }
+                out += placeholder(blocks.size());
+                blocks.push_back(part["id"].get<std::string>());
+            }
+        }
+        return out;
+    }
+
+    // control-token text inside content becomes an escape placeholder
+    std::string escape(const std::string & text) {
+        // Scan original bytes once: never escape placeholders inserted by this scan.
+        std::string out;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            bool matched = false;
+            for (size_t i = 0; i < escaped_.size(); ++i) {
+                const std::string & needle = escaped_[i];
+                if (!needle.empty() && text.compare(pos, needle.size(), needle) == 0) {
+                    out += ES_OPEN + std::to_string(i) + ES_CLOSE;
+                    pos += needle.size();
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) out.push_back(text[pos++]);
+        }
+        return out;
+    }
+
+    std::string escape_json_strings(const json & v) {
+        // escape every string inside a JSON value (tool arguments as an object), returned as JSON text
+        std::function<json(const json &)> walk = [&](const json & x) -> json {
+            if (x.is_string()) return escape(x.get<std::string>());
+            if (x.is_array()) { json a = json::array(); for (const auto & e : x) a.push_back(walk(e)); return a; }
+            if (x.is_object()) { json o = json::object(); for (auto it = x.begin(); it != x.end(); ++it) o[escape(it.key())] = walk(it.value()); return o; }
+            return x;
+        };
+        return walk(v).dump();
+    }
+
+    std::string unescape_index(size_t i) const {
+        if (i >= escaped_.size()) throw request_error("neuralese-render", "invalid escaped-text placeholder");
+        return escaped_[i];
+    }
+
+private:
+    std::vector<std::string> escaped_;
+};
+
+// split rendered template text at placeholders
+rendered split_rendered(const std::string & text, const std::vector<std::string> & blocks, const renderer & r) {
+    rendered out;
+    out.blocks = blocks;
+    size_t pos = 0;
+    std::string run;
+    auto flush = [&]() {
+        if (!run.empty()) {
+            out.segments.push_back({ rendered::segment::TEXT, run, 0 });
+            run.clear();
+        }
+    };
+    while (pos < text.size()) {
+        if (text.compare(pos, PH_OPEN.size(), PH_OPEN) == 0 || text.compare(pos, ES_OPEN.size(), ES_OPEN) == 0) {
+            const bool is_block = text.compare(pos, PH_OPEN.size(), PH_OPEN) == 0;
+            const std::string & close = is_block ? PH_CLOSE : ES_CLOSE;
+            const size_t start = pos + PH_OPEN.size();
+            const size_t end = text.find(close, start);
+            if (end != std::string::npos) {
+                const std::string number = text.substr(start, end - start);
+                if (number.empty() || number.find_first_not_of("0123456789") != std::string::npos)
+                    throw request_error("neuralese-render", "invalid placeholder index");
+                size_t index;
+                try { index = (size_t) std::stoull(number); }
+                catch (const std::exception &) { throw request_error("neuralese-render", "placeholder index out of range"); }
+                if (is_block && index >= blocks.size())
+                    throw request_error("neuralese-render", "invalid block placeholder");
+                flush();
+                if (is_block) {
+                    out.segments.push_back({ rendered::segment::BLOCK, "", index });
+                } else {
+                    out.segments.push_back({ rendered::segment::LITERAL, r.unescape_index(index), 0 });
+                }
+                pos = end + close.size();
+                continue;
+            }
+        }
+        run.push_back(text[pos++]);
+    }
+    flush();
+    std::vector<size_t> seen;
+    for (const auto & s : out.segments) {
+        if (s.kind == rendered::segment::BLOCK) {
+            seen.push_back(s.index);
+        }
+    }
+    if (seen.size() != blocks.size())
+        throw request_error("neuralese-render", "the chat template dropped or duplicated a block");
+    std::sort(seen.begin(), seen.end());
+    for (size_t i = 0; i < seen.size(); ++i) {
+        if (seen[i] != i) {
+            throw request_error("neuralese-render", "the chat template dropped or duplicated a block");
+        }
+    }
+    if (seen.size() != blocks.size()) {
+        throw request_error("neuralese-render", "the chat template dropped or duplicated a block");
+    }
+    return out;
+}
+
+//
+// Pythonic tool calls: [name(arg=literal, ...), ...]
+//
+
+class pythonic_parser {
+public:
+    explicit pythonic_parser(const std::string & s) : s_(s) {}
+
+    std::vector<std::pair<std::string, json>> calls() {
+        std::vector<std::pair<std::string, json>> out;
+        skip();
+        bool bracketed = peek() == '[';
+        if (bracketed) {
+            ++i_;
+        }
+        while (true) {
+            skip();
+            if (bracketed && peek() == ']') {
+                ++i_;
+                break;
+            }
+            out.push_back(call());
+            skip();
+            if (peek() == ',') {
+                ++i_;
+                continue;
+            }
+            if (bracketed) {
+                expect(']');
+            }
+            break;
+        }
+        skip();
+        if (i_ != s_.size()) {
+            fail("trailing text");
+        }
+        return out;
+    }
+
+private:
+    const std::string & s_;
+    size_t i_ = 0;
+
+    [[noreturn]] void fail(const std::string & what) { throw std::runtime_error("pythonic: " + what); }
+    char peek() const { return i_ < s_.size() ? s_[i_] : '\0'; }
+    void skip() { while (i_ < s_.size() && isspace((unsigned char) s_[i_])) ++i_; }
+    void expect(char c) { skip(); if (peek() != c) fail(std::string("expected ") + c); ++i_; }
+
+    std::string ident() {
+        skip();
+        size_t start = i_;
+        while (i_ < s_.size() && (isalnum((unsigned char) s_[i_]) || s_[i_] == '_' || s_[i_] == '.')) ++i_;
+        if (start == i_) fail("expected a name");
+        return s_.substr(start, i_ - start);
+    }
+
+    std::pair<std::string, json> call() {
+        std::string name = ident();
+        expect('(');
+        json args = json::object();
+        skip();
+        if (peek() == ')') {
+            ++i_;
+            return { name, args };
+        }
+        while (true) {
+            std::string key = ident();
+            expect('=');
+            args[key] = value();
+            skip();
+            if (peek() == ',') {
+                ++i_;
+                skip();
+                if (peek() == ')') { ++i_; break; }
+                continue;
+            }
+            expect(')');
+            break;
+        }
+        return { name, args };
+    }
+
+    static void utf8(std::string & out, uint32_t cp) {
+        if (cp < 0x80) out.push_back((char) cp);
+        else if (cp < 0x800) { out.push_back((char) (0xC0 | (cp >> 6))); out.push_back((char) (0x80 | (cp & 0x3F))); }
+        else if (cp < 0x10000) { out.push_back((char) (0xE0 | (cp >> 12))); out.push_back((char) (0x80 | ((cp >> 6) & 0x3F))); out.push_back((char) (0x80 | (cp & 0x3F))); }
+        else { out.push_back((char) (0xF0 | (cp >> 18))); out.push_back((char) (0x80 | ((cp >> 12) & 0x3F))); out.push_back((char) (0x80 | ((cp >> 6) & 0x3F))); out.push_back((char) (0x80 | (cp & 0x3F))); }
+    }
+
+    json string() {
+        const char q = s_[i_];
+        bool triple = s_.compare(i_, 3, std::string(3, q)) == 0;
+        i_ += triple ? 3 : 1;
+        std::string out;
+        while (true) {
+            if (i_ >= s_.size()) fail("unterminated string");
+            char c = s_[i_];
+            if (triple ? s_.compare(i_, 3, std::string(3, q)) == 0 : c == q) {
+                i_ += triple ? 3 : 1;
+                break;
+            }
+            if (c == '\\') {
+                char e = i_ + 1 < s_.size() ? s_[i_ + 1] : '\0';
+                i_ += 2;
+                switch (e) {
+                    case 'n': out.push_back('\n'); break;
+                    case 't': out.push_back('\t'); break;
+                    case 'r': out.push_back('\r'); break;
+                    case '0': out.push_back('\0'); break;
+                    case '\\': out.push_back('\\'); break;
+                    case '\'': out.push_back('\''); break;
+                    case '"': out.push_back('"'); break;
+                    case '\n': break;
+                    case 'x': utf8(out, (uint32_t) std::stoul(s_.substr(i_, 2), nullptr, 16)); i_ += 2; break;
+                    case 'u': utf8(out, (uint32_t) std::stoul(s_.substr(i_, 4), nullptr, 16)); i_ += 4; break;
+                    case 'U': utf8(out, (uint32_t) std::stoul(s_.substr(i_, 8), nullptr, 16)); i_ += 8; break;
+                    default: out.push_back('\\'); out.push_back(e); break;
+                }
+                continue;
+            }
+            out.push_back(c);
+            ++i_;
+        }
+        return out;
+    }
+
+    json value() {
+        skip();
+        char c = peek();
+        if (c == '\'' || c == '"') return string();
+        if (c == '[' || c == '(') {
+            const char close = c == '[' ? ']' : ')';
+            ++i_;
+            json a = json::array();
+            skip();
+            while (peek() != close) {
+                a.push_back(value());
+                skip();
+                if (peek() == ',') { ++i_; skip(); }
+                else if (peek() != close) fail("expected , in sequence");
+            }
+            ++i_;
+            return a;
+        }
+        if (c == '{') {
+            ++i_;
+            json o = json::object();
+            skip();
+            while (peek() != '}') {
+                json k = value();
+                expect(':');
+                o[k.is_string() ? k.get<std::string>() : k.dump()] = value();
+                skip();
+                if (peek() == ',') { ++i_; skip(); }
+                else if (peek() != '}') fail("expected , in dict");
+            }
+            ++i_;
+            return o;
+        }
+        if (s_.compare(i_, 4, "True") == 0) { i_ += 4; return true; }
+        if (s_.compare(i_, 5, "False") == 0) { i_ += 5; return false; }
+        if (s_.compare(i_, 4, "None") == 0) { i_ += 4; return nullptr; }
+        size_t start = i_;
+        if (c == '-' || c == '+') ++i_;
+        bool is_float = false;
+        while (i_ < s_.size() && (isdigit((unsigned char) s_[i_]) || s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E' ||
+                                  ((s_[i_] == '-' || s_[i_] == '+') && (s_[i_ - 1] == 'e' || s_[i_ - 1] == 'E')))) {
+            if (s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E') is_float = true;
+            ++i_;
+        }
+        if (start == i_) fail("unsupported value");
+        const std::string num = s_.substr(start, i_ - start);
+        if (is_float) return std::stod(num);
+        return std::stoll(num);
+    }
+};
+
+json to_parts(const std::string & text, const std::vector<std::string> & ids) {
+    if (text.find(PH_OPEN) == std::string::npos) {
+        return text;
+    }
+    json parts = json::array();
+    size_t pos = 0, last = 0;
+    while ((pos = text.find(PH_OPEN, last)) != std::string::npos) {
+        const size_t end = text.find(PH_CLOSE, pos);
+        if (end == std::string::npos) break;
+        if (pos > last) parts.push_back({ { "type", "text" }, { "text", text.substr(last, pos - last) } });
+        const size_t index = std::stoul(text.substr(pos + PH_OPEN.size(), end - pos - PH_OPEN.size()));
+        parts.push_back({ { "type", "neuralese" }, { "id", ids.at(index) } });
+        last = end + PH_CLOSE.size();
+    }
+    if (last < text.size()) parts.push_back({ { "type", "text" }, { "text", text.substr(last) } });
+    return parts;
+}
+
+json restore(const json & v, const std::vector<std::string> & ids) {
+    if (v.is_string()) return to_parts(v.get<std::string>(), ids);
+    if (v.is_array()) { json a = json::array(); for (const auto & e : v) a.push_back(restore(e, ids)); return a; }
+    if (v.is_object()) { json o = json::object(); for (auto it = v.begin(); it != v.end(); ++it) o[it.key()] = restore(it.value(), ids); return o; }
+    return v;
+}
+
+std::string strip(const std::string & s) {
+    size_t a = 0, b = s.size();
+    while (a < b && isspace((unsigned char) s[a])) ++a;
+    while (b > a && isspace((unsigned char) s[b - 1])) --b;
+    return s.substr(a, b - a);
+}
+
+json build_message(std::string text, const std::vector<std::string> & ids, const std::string & prefix) {
+    for (const char * marker : { "<|im_end|>", "<|endoftext|>" }) {
+        size_t p;
+        while ((p = text.find(marker)) != std::string::npos) text.erase(p, strlen(marker));
+    }
+    std::string reasoning;
+    const size_t t0 = text.find("<think>");
+    const size_t t1 = t0 == std::string::npos ? std::string::npos : text.find("</think>", t0);
+    if (t1 != std::string::npos) {
+        reasoning = strip(text.substr(t0 + 7, t1 - t0 - 7));
+        text = text.substr(0, t0) + text.substr(t1 + 8);
+    }
+    json tool_calls = json::array();
+    std::string content;
+    const std::string open = "<|tool_call_start|>", close = "<|tool_call_end|>";
+    size_t last = 0;
+    while (true) {
+        const size_t a = text.find(open, last);
+        const size_t b = a == std::string::npos ? std::string::npos : text.find(close, a + open.size());
+        if (b == std::string::npos) break;
+        content += text.substr(last, a - last);
+        const std::string body = text.substr(a + open.size(), b - a - open.size());
+        bool parsed = true;
+        std::vector<std::pair<std::string, json>> calls;
+        try {
+            calls = pythonic_parser(body).calls();
+        } catch (const std::exception &) {
+            parsed = false;
+        }
+        if (parsed) {
+            for (auto & [name, args] : calls) {
+                tool_calls.push_back({ { "id", prefix + "_" + std::to_string(tool_calls.size()) }, { "type", "function" },
+                                       { "function", { { "name", name }, { "arguments", restore(args, ids).dump() } } } });
+            }
+        } else {
+            content += text.substr(a, b + close.size() - a); // leaked markup stays visible
+        }
+        last = b + close.size();
+    }
+    content += text.substr(last);
+    content = strip(content);
+    json message = { { "role", "assistant" }, { "content", content.empty() ? json(nullptr) : to_parts(content, ids) } };
+    if (!reasoning.empty()) message["reasoning_content"] = reasoning;
+    if (!tool_calls.empty()) message["tool_calls"] = tool_calls;
+    return message;
+}
+
+uint32_t derive_seed(const std::string & what) {
+    const std::string hex = hash_sha256_hex(what.data(), what.size());
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= (uint64_t) std::stoul(hex.substr(2 * i, 2), nullptr, 16) << (8 * i);
+    }
+    return (uint32_t) (v % (1ull << 31));
+}
+
+//
+// the engine: one model, one request at a time
+//
+
+struct engine {
+    llama_model * model = nullptr;
+    llama_context * ctx = nullptr;
+    const llama_vocab * vocab = nullptr;
+    nz_heads * heads = nullptr;
+    common_chat_templates_ptr templates;
+    tensor_store store;
+    std::string dialect;
+    std::string model_name = "natlang-neuralese";
+    int32_t max_block = 64;
+    int32_t n_batch = 512;
+    int32_t width = 0;
+    std::mutex mutex;
+    std::atomic<uint64_t> next_id { 0 };
+    std::vector<std::string> escaped; // control-token text that must stay text inside content
+
+    int decode_tokens(const std::vector<llama_token> & tokens, llama_pos pos, bool logits_last) {
+        for (size_t off = 0; off < tokens.size(); off += (size_t) n_batch) {
+            const int32_t n = (int32_t) std::min<size_t>(n_batch, tokens.size() - off);
+            llama_batch batch = llama_batch_init(n, 0, 1);
+            batch.n_tokens = n;
+            for (int32_t i = 0; i < n; ++i) {
+                batch.token[i] = tokens[off + i];
+                batch.pos[i] = pos + (llama_pos) (off + i);
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = logits_last && off + i + 1 == tokens.size();
+            }
+            const int status = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            if (status != 0) {
+                return status;
+            }
+        }
+        return 0;
+    }
+
+    block lookup(const std::string & id) {
+        block b;
+        if (!store.get(id, b)) {
+            throw request_error("neuralese-unknown-block", id + " is not in this server's store; PUT it first");
+        }
+        if (b.dialect != dialect) {
+            throw request_error("neuralese-dialect-mismatch", id + " is in " + b.dialect + ", this server speaks " + dialect);
+        }
+        if (b.width != width) {
+            throw request_error("neuralese-bad-block", id + " has width " + std::to_string(b.width));
+        }
+        return b;
+    }
+
+    rendered render(const json & messages, const json & tools, bool add_generation_prompt = true) {
+        renderer r(escaped);
+        std::vector<std::string> blocks;
+        json plain = json::array();
+        for (const auto & m : messages) {
+            json message = m;
+            if (message.contains("content")) {
+                if (is_parts(message["content"])) {
+                    message["content"] = r.flatten(message["content"], blocks);
+                } else if (message["content"].is_string()) {
+                    message["content"] = r.escape(message["content"].get<std::string>());
+                }
+            }
+            if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
+                for (auto & call : message["tool_calls"]) {
+                    json & fn = call.contains("function") ? call["function"] : call;
+                    json & arguments = fn["arguments"];
+                    std::string text;
+                    if (is_parts(arguments)) {
+                        text = r.flatten(arguments, blocks);
+                    } else if (arguments.is_string()) {
+                        text = arguments.get<std::string>();
+                        json parsed = text.empty() ? json::object() : json::parse(text, nullptr, false);
+                        if (parsed.is_discarded()) {
+                            throw request_error("tool-arguments", "tool-call arguments are not JSON");
+                        }
+                        text = r.escape_json_strings(parsed);
+                    } else {
+                        text = r.escape_json_strings(arguments);
+                    }
+                    if (json::parse(text, nullptr, false).is_discarded()) {
+                        throw request_error("tool-arguments", "tool-call arguments are not JSON");
+                    }
+                    arguments = text;
+                }
+            }
+            plain.push_back(message);
+        }
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(common_json::parse(plain.dump()));
+        if (tools.is_array() && !tools.empty()) {
+            inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(tools.dump()));
+        }
+        inputs.add_generation_prompt = add_generation_prompt;
+        inputs.use_jinja = true;
+        const common_chat_params params = common_chat_templates_apply(templates.get(), inputs);
+        return split_rendered(params.prompt, blocks, r);
+    }
+
+    // Prefill a rendered prompt (text, literal text and read blocks) on sequence 0 from position 0, with logits at
+    // its last position. Returns the next position.
+    llama_pos prefill(const rendered & prompt) {
+        std::vector<block> inputs;
+        for (const auto & id : prompt.blocks) {
+            inputs.push_back(lookup(id));
+        }
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_pos pos = 0;
+        const llama_token open_id = nz_heads_open_token(heads), close_id = nz_heads_close_token(heads);
+        std::vector<llama_token> pending;
+        auto flush = [&](bool logits) {
+            if (pending.empty()) return;
+            // Add the model's BOS once, including prompts that begin with a soft block.
+            const llama_token bos = llama_vocab_bos(vocab);
+            if (pos == 0 && llama_vocab_get_add_bos(vocab) && pending.front() != bos) {
+                pending.insert(pending.begin(), bos);
+            }
+            if (decode_tokens(pending, pos, logits) != 0) throw request_error("decode-failed", "prefill", 500);
+            pos += (llama_pos) pending.size();
+            pending.clear();
+        };
+        for (size_t s = 0; s < prompt.segments.size(); ++s) {
+            const auto & seg = prompt.segments[s];
+            if (seg.kind == rendered::segment::TEXT) {
+                auto ids = common_tokenize(vocab, seg.text, false, true);
+                pending.insert(pending.end(), ids.begin(), ids.end());
+            } else if (seg.kind == rendered::segment::LITERAL) {
+                auto ids = common_tokenize(vocab, seg.text, false, false);
+                pending.insert(pending.end(), ids.begin(), ids.end());
+            } else {
+                pending.push_back(open_id);
+                flush(false);
+                const block & b = inputs[seg.index];
+                if (nz_read(ctx, heads, b.payload.data(), (int32_t) b.length, pos, 0) != 0) {
+                    throw request_error("decode-failed", "read port", 500);
+                }
+                pos += (llama_pos) b.length;
+                pending.push_back(close_id);
+            }
+        }
+        if (pending.empty()) {
+            throw request_error("empty-prompt", "the prompt rendered to nothing");
+        }
+        flush(true);
+        return pos;
+    }
+
+    // The model's own rendering of an assistant reply that calls `name` with `arguments` and then `argument`, cut at that
+    // argument's value (the reference's chat.call_reply): with `quoted` the prefix ends with the opening quote and the
+    // suffix runs from the closing quote through the end of the turn; without, the prefix ends where the value starts.
+    std::pair<std::string, std::string> call_reply(const std::string & name, const json & arguments, const std::string & argument,
+                                                   bool quoted) {
+        static const std::string VALUE = "natlangValue7f3a9c";
+        json args = arguments.is_object() ? arguments : json::object();
+        args[argument] = VALUE;
+        const json user = { { "role", "user" }, { "content", "x" } };
+        const json call = { { "role", "assistant" }, { "content", "" }, { "tool_calls", json::array({ { { "type", "function" },
+            { "function", { { "name", name }, { "arguments", args.dump() } } } } }) } };
+        auto apply = [&](const json & messages, bool generation) {
+            common_chat_templates_inputs inputs;
+            inputs.messages = common_chat_msgs_parse_oaicompat(common_json::parse(messages.dump()));
+            inputs.add_generation_prompt = generation;
+            inputs.use_jinja = true;
+            return common_chat_templates_apply(templates.get(), inputs).prompt;
+        };
+        const std::string prompt = apply(json::array({ user }), true), full = apply(json::array({ user, call }), false);
+        const size_t at = full.compare(0, prompt.size(), prompt) == 0 ? full.find(VALUE, prompt.size()) : std::string::npos;
+        if (at == std::string::npos) throw request_error("neuralese-template", "the chat template renders the call's reply differently");
+        std::string prefix = full.substr(prompt.size(), at - prompt.size()), suffix = full.substr(at + VALUE.size());
+        if (quoted) return { prefix, suffix };
+        if (prefix.empty() || (prefix.back() != '\'' && prefix.back() != '"')) {
+            throw request_error("neuralese-template", "the chat template does not quote string arguments");
+        }
+        prefix.pop_back();
+        return { prefix, "" };
+    }
+
+    // log softmax of logits at token: logit[token] - logsumexp(logits)
+    float token_logprob(const float * logits, llama_token token) const {
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        float top = logits[0];
+        for (int32_t i = 1; i < n_vocab; ++i) top = std::max(top, logits[i]);
+        double sum = 0.0;
+        for (int32_t i = 0; i < n_vocab; ++i) sum += std::exp((double) logits[i] - top);
+        return logits[token] - top - (float) std::log(sum);
+    }
+
+    // Decision readout (POST /v1/neuralese/decide): each option's log-probability as the whole assistant reply
+    // after the messages. The prompt is prefilled once; tokens every option shares at the start of the reply run
+    // once; each option's own tokens run on a copy of the sequence. Matches the reference's
+    // GradSession.decision_logprobs: the reply is cut from the full rendering after the prompt, through its last
+    // end-of-message marker.
+    json decide(const json & body) {
+        refuse_adapters(body, "adapters");
+        std::lock_guard<std::mutex> lock(mutex);
+        const json messages = body.value("messages", json::array());
+        const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
+        const json options = body.value("options", json::array());
+        if (!options.is_array() || options.empty()) throw request_error("neuralese-decision", "a decision needs at least one option");
+        const rendered prompt = render(messages, tools);
+        std::string prompt_text;
+        for (const auto & seg : prompt.segments) prompt_text += seg.text;
+        std::vector<std::vector<llama_token>> rests;
+        for (const auto & option : options) {
+            if (!option.is_string()) throw request_error("neuralese-decision", "options are reply texts");
+            json full_messages = messages;
+            full_messages.push_back({ { "role", "assistant" }, { "content", option } });
+            const rendered full = render(full_messages, tools, false);
+            if (full.blocks != prompt.blocks) throw request_error("neuralese-decision", "options rendered different prompts");
+            std::string full_text;
+            for (const auto & seg : full.segments) full_text += seg.text;
+            if (full_text.compare(0, prompt_text.size(), prompt_text) != 0) {
+                throw request_error("neuralese-decision", "the template renders the reply's prompt differently");
+            }
+            std::string rest = full_text.substr(prompt_text.size());
+            const size_t end = rest.rfind("<|im_end|>");
+            if (end != std::string::npos) rest = rest.substr(0, end + std::string("<|im_end|>").size());
+            rests.push_back(common_tokenize(vocab, rest, false, true));
+        }
+        size_t shared = 0;
+        if (rests.size() > 1) {
+            while (true) {
+                bool same = true;
+                for (const auto & r : rests) same = same && r.size() > shared && r[shared] == rests[0][shared];
+                if (!same) break;
+                ++shared;
+            }
+        }
+        llama_pos pos = prefill(prompt);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<float> last(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
+        if (shared) {
+            std::vector<llama_token> head(rests[0].begin(), rests[0].begin() + (long) shared);
+            if (decode_tokens(head, pos, true) != 0) throw request_error("decode-failed", "decision prefix", 500);
+            pos += (llama_pos) shared;
+            last.assign(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
+        }
+        llama_memory_t mem = llama_get_memory(ctx);
+        json log_probs = json::array(), counts = json::array();
+        for (const auto & r : rests) {
+            const std::vector<llama_token> own(r.begin() + (long) shared, r.end());
+            double total = 0.0;
+            if (!own.empty()) {
+                total += token_logprob(last.data(), own[0]);
+                if (own.size() > 1) {
+                    llama_memory_seq_rm(mem, 1, -1, -1);
+                    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                    llama_batch batch = llama_batch_init((int32_t) own.size(), 0, 1);
+                    batch.n_tokens = (int32_t) own.size() - 1;
+                    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                        batch.token[i] = own[i];
+                        batch.pos[i] = pos + i;
+                        batch.n_seq_id[i] = 1;
+                        batch.seq_id[i][0] = 1;
+                        batch.logits[i] = 1;
+                    }
+                    const int status = llama_decode(ctx, batch);
+                    llama_batch_free(batch);
+                    if (status != 0) throw request_error("decode-failed", "decision option", 500);
+                    for (size_t i = 1; i < own.size(); ++i) total += token_logprob(llama_get_logits_ith(ctx, (int32_t) i - 1), own[i]);
+                    llama_memory_seq_rm(mem, 1, -1, -1);
+                }
+            }
+            log_probs.push_back(total);
+            counts.push_back(own.size());
+        }
+        return { { "log_probs", log_probs }, { "tokens", counts } };
+    }
+
+    json generate(const json & body) {
+        refuse_adapters(body, "x_natlang_adapters");
+        std::lock_guard<std::mutex> lock(mutex);
+        const std::string request_id = "chatcmpl-" + std::to_string(next_id++);
+        const json messages = body.value("messages", json::array());
+        const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
+        const int32_t max_tokens = body.contains("max_tokens") && body["max_tokens"].is_number()
+            ? body["max_tokens"].get<int32_t>()
+            : (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()
+                   ? body["max_completion_tokens"].get<int32_t>() : 512);
+        const float temperature = body.contains("temperature") && body["temperature"].is_number()
+            ? body["temperature"].get<float>() : 0.0f;
+        const float nz_temperature = body.contains("neuralese_temperature") && body["neuralese_temperature"].is_number()
+            ? body["neuralese_temperature"].get<float>() : 0.0f;
+        int32_t nz_max = max_block;
+        if (body.contains("neuralese_max_length") && body["neuralese_max_length"].is_number()) {
+            nz_max = std::min(max_block, body["neuralese_max_length"].get<int32_t>());
+        }
+        const int32_t nz_length = body.contains("neuralese_length") && body["neuralese_length"].is_number_integer()
+            ? body["neuralese_length"].get<int32_t>() : 0;
+        const int32_t nz_passes = body.contains("neuralese_passes") && body["neuralese_passes"].is_number_integer()
+            ? body["neuralese_passes"].get<int32_t>() : 0;
+        const std::string seed_key = body.contains("seed") && !body["seed"].is_null() ? body["seed"].dump() : request_id;
+
+        const rendered prompt = render(messages, tools);
+        llama_pos pos = prefill(prompt);
+        const llama_token open_id = nz_heads_open_token(heads), close_id = nz_heads_close_token(heads);
+        const int32_t prompt_positions = pos;
+
+        // forced plan (test hook)
+        struct plan_item { bool write; llama_token token; };
+        bool forced = body.contains("x_natlang_forced") && body["x_natlang_forced"].is_array();
+        std::vector<plan_item> plan;
+        if (forced) {
+            for (const auto & item : body["x_natlang_forced"]) {
+                if (item.is_string()) {
+                    for (llama_token t : common_tokenize(vocab, item.get<std::string>(), false, true)) plan.push_back({ false, t });
+                } else if (item.is_object() && item.value("neuralese", "") == "write") {
+                    plan.push_back({ true, open_id });
+                } else {
+                    throw request_error("forced-plan", "unsupported forced item " + item.dump());
+                }
+            }
+        }
+        // Template readout: the reply is forced to a call cut at its value argument (call_reply); "write" writes the
+        // value as a block and closes the call, "decode" decodes from the value on. The test hook's plan replaces it.
+        bool free_after = false;
+        if (!forced && body.contains("neuralese_template") && body["neuralese_template"].is_object()) {
+            const json & t = body["neuralese_template"];
+            const std::string mode = t.value("value", "");
+            if (!t.contains("call") || !t["call"].is_string() || (mode != "write" && mode != "decode")) {
+                throw request_error("neuralese-template", "a template needs a call name and value 'write' or 'decode'");
+            }
+            const std::string argument = t.contains("argument") && t["argument"].is_string() ? t["argument"].get<std::string>() : "value";
+            const auto [prefix, suffix] = call_reply(t["call"].get<std::string>(), t.contains("arguments") ? t["arguments"] : json::object(),
+                                                     argument, mode == "write");
+            for (llama_token tok : common_tokenize(vocab, prefix, false, true)) plan.push_back({ false, tok });
+            if (mode == "write") {
+                plan.push_back({ true, open_id });
+                for (llama_token tok : common_tokenize(vocab, suffix, false, true)) plan.push_back({ false, tok });
+            }
+            forced = true;
+            free_after = mode == "decode";
+        }
+        // Guidance (guidance.h): envelope and line checks with rollback. Snapshots of sequence 0 live on the spare
+        // sequences 3..6, at most four, as in the reference.
+        std::optional<nz_guide> guide;
+        if (body.contains("guidance") && ((body["guidance"].is_boolean() && body["guidance"].get<bool>()) || body["guidance"].is_object())) {
+            const json g = body["guidance"].is_object() ? body["guidance"] : json::object();
+            nz_guide_settings settings;
+            settings.require_call = g.value("require_call", body.value("tool_choice", json("auto")) == json("required"));
+            if (g.contains("tools") && g["tools"].is_array() && !g["tools"].empty()) {
+                for (const auto & n : g["tools"]) settings.tools.push_back(n.get<std::string>());
+            } else if (tools.is_array()) {
+                for (const auto & t : tools) {
+                    const json & fn = t.contains("function") ? t["function"] : t;
+                    if (fn.contains("name") && fn["name"].is_string()) settings.tools.push_back(fn["name"].get<std::string>());
+                }
+            }
+            settings.repeat = g.value("repeat", 3);
+            settings.syntax = g.value("syntax", true);
+            settings.retries = g.value("retries", 4);
+            guide = nz_guide { settings, {}, {} };
+            const std::string prefix = guide->forced_prefix();
+            if (!prefix.empty() && !forced) {
+                for (llama_token tok : common_tokenize(vocab, prefix, false, true)) plan.push_back({ false, tok });
+                forced = true;
+                free_after = true;
+            }
+        }
+        size_t plan_at = 0;
+
+        llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        if (temperature > 0.0f) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(sampler, llama_sampler_init_dist(derive_seed("text\x1f" + seed_key)));
+        } else {
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+        }
+
+        struct item { bool is_block; llama_token token; size_t block_index; };
+        std::vector<item> items;
+        std::vector<block> written;
+        int32_t generated = 0;
+        std::string finish = "stop";
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        llama_memory_t mem = llama_get_memory(ctx);
+        struct snapshot { size_t count; llama_seq_id seq; std::vector<float> logits; llama_pos pos; int32_t generated; };
+        std::vector<snapshot> snapshots;
+        std::vector<llama_seq_id> spare { 3, 4, 5, 6 };
+        std::map<size_t, std::set<llama_token>> bans;
+        std::map<size_t, int32_t> retries;
+        std::vector<std::string> pieces;
+        json rejections = json::array();
+        std::vector<float> cur;
+        auto current_logits = [&]() { const float * l = llama_get_logits_ith(ctx, -1); cur.assign(l, l + n_vocab); };
+        auto take_snapshot = [&]() {
+            if (spare.empty()) {
+                spare.push_back(snapshots.front().seq);
+                snapshots.erase(snapshots.begin());
+            }
+            const llama_seq_id s = spare.back();
+            spare.pop_back();
+            llama_memory_seq_rm(mem, s, -1, -1);
+            llama_memory_seq_cp(mem, 0, s, -1, -1);
+            snapshots.push_back({ items.size(), s, cur, pos, generated });
+        };
+        if (guide) {
+            current_logits();
+            take_snapshot();
+        }
+        // After a token: the reply checks; on a rejection roll back to the offending line and ban its first token.
+        auto guide_step = [&]() {
+            std::string reply;
+            std::vector<size_t> starts;
+            for (const auto & piece : pieces) {
+                starts.push_back(reply.size());
+                reply += piece;
+            }
+            const auto verdict = guide->check(reply);
+            if (!verdict) {
+                const auto ends = [&](const std::string & tail) {
+                    return reply.size() >= tail.size() && reply.compare(reply.size() - tail.size(), tail.size(), tail) == 0;
+                };
+                if (ends("\\n") || ends("\n") || ends("[")) take_snapshot();
+                return;
+            }
+            const size_t at = verdict->at;
+            size_t target = 0;
+            for (size_t i = 0; i < starts.size(); ++i) if (starts[i] <= at) target = i;
+            const int32_t tries = retries.count(at) ? retries[at] : 0;
+            const snapshot * usable = nullptr;
+            for (const auto & snap : snapshots) if (snap.count <= target) usable = &snap;
+            bool blocked = !usable;
+            if (usable) for (size_t i = usable->count; i < target; ++i) blocked = blocked || items[i].is_block;
+            if (tries >= guide->settings.retries || blocked) {
+                guide->accept(at);
+                rejections.push_back({ { "reason", verdict->reason }, { "offset", at }, { "accepted", true } });
+                return;
+            }
+            retries[at] = tries + 1;
+            rejections.push_back({ { "reason", verdict->reason }, { "offset", at } });
+            bans[target].insert(items[target].token);
+            llama_memory_seq_rm(mem, 0, -1, -1);
+            llama_memory_seq_cp(mem, usable->seq, 0, -1, -1);
+            cur = usable->logits;
+            pos = usable->pos;
+            generated = usable->generated;
+            std::vector<llama_token> between;
+            for (size_t i = usable->count; i < target; ++i) between.push_back(items[i].token);
+            if (!between.empty()) {
+                if (decode_tokens(between, pos, true) != 0) throw request_error("decode-failed", "guidance rollback", 500);
+                current_logits();
+                pos += (llama_pos) between.size();
+                generated += (int32_t) between.size();
+            }
+            guide->rewind(starts[target]);
+            items.resize(target);
+            pieces.resize(target);
+            for (auto it = snapshots.begin(); it != snapshots.end();) {
+                if (it->count > target) { spare.push_back(it->seq); it = snapshots.erase(it); } else ++it;
+            }
+            for (auto it = bans.begin(); it != bans.end();) it = it->first > target ? bans.erase(it) : std::next(it);
+        };
+        while (true) {
+            if (generated >= max_tokens) { finish = "length"; break; }
+            llama_token token;
+            if (forced && free_after && plan_at >= plan.size()) forced = false;
+            if (forced) {
+                if (plan_at >= plan.size()) break;
+                token = plan[plan_at++].token;
+            } else if (guide) {
+                std::vector<llama_token_data> candidates((size_t) n_vocab);
+                const auto & banned = bans[items.size()];
+                for (int32_t i = 0; i < n_vocab; ++i) {
+                    candidates[i] = { i, banned.count(i) ? -INFINITY : cur[i], 0.0f };
+                }
+                llama_token_data_array array { candidates.data(), candidates.size(), -1, false };
+                llama_sampler_apply(sampler, &array);
+                token = array.data[array.selected].id;
+            } else {
+                token = llama_sampler_sample(sampler, ctx, -1);
+            }
+            if (llama_vocab_is_eog(vocab, token)) break;
+            if (token == open_id) {
+                const int32_t remaining = max_tokens - generated;
+                // Do not emit a partial opening marker. A complete soft block needs open + >=1 payload + close.
+                if (remaining < 3) { finish = "length"; break; }
+                std::vector<float> h_cut(width);
+                if (nz_open(ctx, heads, pos, 0, h_cut.data()) != 0) throw request_error("decode-failed", "open", 500);
+                const llama_pos first = pos + 1;
+                nz_write_params wp;
+                wp.max_length = std::min(nz_max, remaining - 2);
+                wp.temperature = nz_temperature;
+                wp.length = nz_length > 0 ? std::min(nz_length, wp.max_length) : 0;
+                wp.passes = wp.length > 0 ? nz_passes : 0;
+                const size_t index = written.size();
+                wp.seed = derive_seed("neuralese\x1f" + seed_key + "\x1f" + std::to_string(index));
+                nz_write_result r;
+                if (nz_write(ctx, heads, 0, first, h_cut.data(), wp, r) != 0) throw request_error("decode-failed", "write", 500);
+                if (nz_read_back(ctx, heads, 0, first, r) != 0) throw request_error("decode-failed", "read back", 500);
+                json record = { { "kind", "write" }, { "request", request_id }, { "index", index },
+                                { "cutoff", nz_heads_cutoff(heads) }, { "temperature", nz_temperature },
+                                { "seed", wp.seed }, { "rng", "mt19937-normal" }, { "stop_logits", r.stop_logits } };
+                if (wp.length > 0) {
+                    record["length_hint"] = wp.length;
+                    record["passes"] = r.passes;
+                }
+                std::vector<block> parts;
+                if (r.n > 0) {
+                    parts.push_back(make_block(r.mean.data(), r.n, width, dialect, { { "kind", "payload-mean" } }));
+                    parts.push_back(make_block(r.log_sigma.data(), r.n, width, dialect, { { "kind", "payload-log-sigma" } }));
+                    record["mean"] = parts[0].id;
+                    record["log_sigma"] = parts[1].id;
+                }
+                // The payload first: at temperature 0 it is its mean, and the store keeps the first block of an ID, which
+                // must be the one carrying the write record.
+                block b = store.put(make_block(r.payload.data(), r.n, width, dialect, record, r.truncated));
+                for (const auto & part : parts) store.put(part);
+                written.push_back(b);
+                items.push_back({ true, 0, index });
+                if (guide) {
+                    pieces.push_back("__nz");
+                    current_logits();
+                }
+                pos = first + r.n + 1;
+                generated += r.n + 2;
+                // a forced plan's own close marker is written by the procedure instead
+                if (forced && plan_at < plan.size() && !plan[plan_at].write && plan[plan_at].token == close_id) ++plan_at;
+                continue;
+            }
+            if (decode_tokens({ token }, pos, true) != 0) throw request_error("decode-failed", "decode", 500);
+            llama_sampler_accept(sampler, token);
+            pos += 1;
+            generated += 1;
+            items.push_back({ false, token, 0 });
+            if (guide) {
+                current_logits();
+                pieces.push_back(common_token_to_piece(vocab, token, true));
+                guide_step();
+            }
+        }
+        llama_sampler_free(sampler);
+        for (const auto & snap : snapshots) llama_memory_seq_rm(mem, snap.seq, -1, -1);
+
+        // output text with block placeholders
+        std::string text;
+        std::vector<std::string> ids;
+        for (const auto & it : items) {
+            if (it.is_block) {
+                text += placeholder(ids.size());
+                ids.push_back(written[it.block_index].id);
+            } else {
+                text += common_token_to_piece(vocab, it.token, true);
+            }
+        }
+        json message = build_message(text, ids, request_id);
+        if (finish == "stop" && message.contains("tool_calls")) finish = "tool_calls";
+        json metas = json::array();
+        for (const auto & b : written) metas.push_back(b.meta());
+        json response = {
+            { "id", request_id }, { "object", "chat.completion" }, { "created", (int64_t) time(nullptr) },
+            { "model", model_name },
+            { "choices", json::array({ { { "index", 0 }, { "message", message }, { "finish_reason", finish } } }) },
+            { "usage", { { "prompt_tokens", prompt_positions }, { "completion_tokens", generated },
+                         { "total_tokens", prompt_positions + generated } } },
+            { "neuralese", { { "dialect", dialect }, { "blocks", metas } } },
+        };
+        if (guide) response["x_natlang_guidance"] = { { "rejections", rejections } };
+        return response;
+    }
+
+    // Decode embedding rows on seq from pos through the current layer range, in batches, collecting the residual
+    // entering layer `lid` at every row (the caller enables its extraction).
+    std::vector<float> run_rows(const std::vector<float> & rows, llama_pos pos, llama_seq_id seq, uint32_t lid) {
+        const int32_t n = (int32_t) (rows.size() / (size_t) width);
+        std::vector<float> out;
+        out.reserve(rows.size());
+        for (int32_t off = 0; off < n; off += n_batch) {
+            const int32_t m = std::min(n_batch, n - off);
+            llama_batch batch = llama_batch_init(m, width, 1);
+            batch.n_tokens = m;
+            memcpy(batch.embd, rows.data() + (size_t) off * width, (size_t) m * width * sizeof(float));
+            for (int32_t i = 0; i < m; ++i) {
+                batch.pos[i] = pos + off + i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = seq;
+                batch.logits[i] = 0;
+            }
+            const int status = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            if (status != 0) throw request_error("decode-failed", "encode", 500);
+            const float * h = llama_get_embeddings_layer_inp(ctx, lid);
+            out.insert(out.end(), h, h + (size_t) m * width);
+        }
+        return out;
+    }
+
+    std::vector<float> tok_embd; // the token embedding matrix [n_vocab * width], loaded on the first encode
+
+    // Encode (POST /v1/neuralese/encode): text into a block in one forward pass through the port, as the reference's
+    // grad.encode_text. The write site is the rendered `context` (or BOS), then the open marker; the text's token
+    // embeddings, interface-normed, are supplied at the sketch positions (S3 phase A), layers [0, k) and then [k, n)
+    // run over them, and the content projection gives one payload vector per token (the mean). No stop decision.
+    json encode(const json & body) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const std::string text = body.value("text", "");
+        const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
+        if (ids.empty()) throw request_error("neuralese-encode", "empty text");
+        if (tok_embd.empty()) {
+            tok_embd.resize(llama_model_get_tok_embd(model, nullptr));
+            if (tok_embd.empty() || llama_model_get_tok_embd(model, tok_embd.data()) != tok_embd.size()) {
+                tok_embd.clear();
+                throw request_error("neuralese-encode", "the token embedding matrix is unavailable", 500);
+            }
+        }
+        llama_pos pos = 0;
+        const json context = body.contains("context") ? body["context"] : json(nullptr);
+        if (context.is_array() && !context.empty()) {
+            const rendered prompt = render(context, json(nullptr));
+            if (!prompt.blocks.empty()) throw request_error("neuralese-encode", "the encoding context may not hold blocks");
+            pos = prefill(prompt);
+        } else {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            const llama_token bos = llama_vocab_bos(vocab);
+            if (bos != LLAMA_TOKEN_NULL) {
+                if (decode_tokens({ bos }, 0, false) != 0) throw request_error("decode-failed", "encode prefix", 500);
+                pos = 1;
+            }
+        }
+        std::vector<float> h_cut(width);
+        if (nz_open(ctx, heads, pos, 0, h_cut.data()) != 0) throw request_error("decode-failed", "open", 500);
+        const llama_pos first = pos + 1;
+        const int32_t n = (int32_t) ids.size();
+        std::vector<float> embedded((size_t) n * width), inputs((size_t) n * width);
+        for (int32_t i = 0; i < n; ++i) {
+            std::copy_n(tok_embd.data() + (size_t) ids[i] * width, width, embedded.data() + (size_t) i * width);
+        }
+        nz_interface(heads, embedded.data(), inputs.data(), n);
+        const int32_t k = nz_heads_cutoff(heads), n_layer = llama_model_n_layer(model);
+        llama_memory_t mem = llama_get_memory(ctx);
+        for (llama_seq_id s : { 1, 2 }) {
+            llama_memory_seq_rm(mem, s, -1, -1);
+            llama_memory_seq_cp(mem, 0, s, -1, -1);
+        }
+        std::vector<float> shallow, final_h;
+        try {
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) k, true);
+            llama_set_layer_range(ctx, 0, k);
+            shallow = run_rows(inputs, first, 1, (uint32_t) k);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) k, false);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, true);
+            llama_set_layer_range(ctx, k, -1);
+            final_h = run_rows(shallow, first, 2, (uint32_t) n_layer);
+        } catch (...) {
+            llama_set_layer_range(ctx, 0, -1);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, false);
+            for (llama_seq_id s : { 1, 2 }) llama_memory_seq_rm(mem, s, -1, -1);
+            throw;
+        }
+        llama_set_layer_range(ctx, 0, -1);
+        llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, false);
+        for (llama_seq_id s : { 1, 2 }) llama_memory_seq_rm(mem, s, -1, -1);
+        std::vector<float> mean((size_t) n * width), log_sigma((size_t) n * width);
+        nz_content(heads, inputs.data(), final_h.data(), n, mean.data(), log_sigma.data());
+        block b = make_block(mean.data(), n, width, dialect, { { "kind", "text-encode" }, { "text", text } });
+        if (body.contains("type") && body["type"].is_string()) b.type = body["type"].get<std::string>();
+        return store.put(b).meta();
+    }
+
+    // Write (POST /v1/neuralese/write): the write procedure at a write site. The reply is forced to `prefix` and then
+    // the open marker; the stop head decides the length.
+    json write(const json & body) {
+        const std::string prefix = body.value("prefix", "");
+        json forced = json::array();
+        if (!prefix.empty()) forced.push_back(prefix);
+        forced.push_back({ { "neuralese", "write" } });
+        json request = { { "messages", body.value("messages", json::array()) }, { "x_natlang_forced", forced },
+                         { "max_tokens", max_block + (int32_t) common_tokenize(vocab, prefix, false, true).size() + 8 } };
+        if (body.contains("tools")) request["tools"] = body["tools"];
+        if (body.contains("neuralese_temperature")) request["neuralese_temperature"] = body["neuralese_temperature"];
+        if (body.contains("length")) request["neuralese_length"] = body["length"];
+        if (body.contains("passes")) request["neuralese_passes"] = body["passes"];
+        const json blocks = generate(request)["neuralese"]["blocks"];
+        if (blocks.empty()) throw request_error("neuralese-write", "the write produced no block", 500);
+        return blocks[0];
+    }
+
+    // Digest (POST /v1/neuralese/digest): the digest operator's plan, as the reference's digest.py (DECISIONS.md 43).
+    // A value that fits one write site's window is digested there; a longer one is split into token chunks, each
+    // digested at a part site, and a combine site reads the part digests and writes the final one.
+    json digest(const json & body) {
+        const std::string name = body.value("name", "").empty() ? "value" : body.value("name", "");
+        const std::string type = body.value("type", "").empty() ? "unknown" : body.value("type", "");
+        const std::string value = body.value("value", ""), instructions = body.value("instructions", "");
+        const json system = body.contains("system") && !body["system"].is_null()
+            && !(body["system"].is_string() && body["system"].get<std::string>().empty()) ? body["system"] : json(DIGEST_INSTRUCTIONS);
+        // window: the model's context (as served: the smaller of its training context and this server's -c) less the
+        // site's own text, the block and a margin
+        const int32_t context = std::min<int32_t>(llama_model_n_ctx_train(model), (int32_t) llama_n_ctx(ctx));
+        const int32_t overhead = (int32_t) common_tokenize(vocab, instructions, false, true).size() + max_block + DIGEST_SITE_MARGIN;
+        int32_t window = std::max(256, context - overhead);
+        if (body.contains("window") && body["window"].is_number_integer() && body["window"].get<int32_t>() > 0) {
+            window = std::min(window, body["window"].get<int32_t>());
+        }
+        const std::string about = "The call that receives the value has these instructions:\n" + instructions + "\n\n";
+        auto site = [&](const json & content) {
+            return json::array({ { { "role", "system" }, { "content", system } }, { { "role", "user" }, { "content", content } } });
+        };
+        auto write_at = [&](const json & messages) {
+            return write({ { "messages", messages }, { "prefix", DIGEST_PREFIX } })["id"].get<std::string>();
+        };
+        const std::vector<llama_token> ids = common_tokenize(vocab, value, false, true);
+        std::string id;
+        size_t parts = 1;
+        if ((int32_t) ids.size() <= window) {
+            id = write_at(site(about + "The value of " + name + " (" + type + "):\n" + value));
+        } else {
+            std::vector<std::string> blocks;
+            const size_t count = (ids.size() + (size_t) window - 1) / (size_t) window;
+            for (size_t i = 0; i < count; ++i) {
+                const std::vector<llama_token> chunk(ids.begin() + (long) (i * window),
+                                                     ids.begin() + (long) std::min(ids.size(), (i + 1) * (size_t) window));
+                blocks.push_back(write_at(site(about + "Part " + std::to_string(i + 1) + " of " + std::to_string(count)
+                                               + " of the value of " + name + " (" + type + "):\n"
+                                               + common_detokenize(vocab, chunk, true))));
+            }
+            json content = json::array({ { { "type", "text" }, { "text", about + "Digests of the " + std::to_string(count)
+                                                                    + " parts of the value of " + name + " (" + type + "), in order:\n" } } });
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                content.push_back({ { "type", "text" }, { "text", "Part " + std::to_string(i + 1) + ": " } });
+                content.push_back({ { "type", "neuralese" }, { "id", blocks[i] } });
+                content.push_back({ { "type", "text" }, { "text", "\n" } });
+            }
+            id = write_at(site(content));
+            parts = blocks.size();
+        }
+        json meta = lookup(id).meta();
+        meta["parts"] = parts;
+        meta["window"] = window;
+        return meta;
+    }
+};
+
+
+json error_body(const std::string & code, const std::string & detail) {
+    return { { "error", { { "code", code }, { "message", detail } } } };
+}
+
+} // namespace
+
+struct nz_service {
+    engine e;
+};
+
+nz_service * nz_service_load(const nz_service_options & o, std::string & error) {
+    static bool initialised = false;
+    if (!initialised) {
+        llama_backend_init();
+        llama_log_set([](ggml_log_level level, const char * text, void *) {
+            if (level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
+        }, nullptr);
+        initialised = true;
+    }
+    auto * s = new nz_service();
+    engine & e = s->e;
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = o.n_gpu_layers;
+    e.model = llama_model_load_from_file(o.model_path.c_str(), mp);
+    if (!e.model) { error = "could not load the model " + o.model_path; delete s; return nullptr; }
+    e.vocab = llama_model_get_vocab(e.model);
+    nz_heads_params hp;
+    hp.n_threads = o.n_threads;
+    hp.use_gpu = o.n_gpu_layers > 0;
+    e.heads = nz_heads_load(o.heads_path.c_str(), hp);
+    if (!e.heads) { error = "could not load the Neuralese heads " + o.heads_path; llama_model_free(e.model); delete s; return nullptr; }
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = o.n_ctx;
+    cp.n_batch = e.n_batch;
+    cp.n_ubatch = e.n_batch;
+    cp.n_seq_max = 7; // 0 main, 1-2 the writer's scratch, 3-6 guidance snapshots
+    cp.kv_unified = true;
+    cp.n_threads = o.n_threads;
+    cp.n_threads_batch = o.n_threads;
+    e.ctx = llama_init_from_model(e.model, cp);
+    if (!e.ctx) { error = "could not create the context"; nz_heads_free(e.heads); llama_model_free(e.model); delete s; return nullptr; }
+    e.templates = common_chat_templates_init(e.model, "");
+    e.dialect = o.dialect.empty() ? nz_heads_dialect(e.heads) : o.dialect;
+    e.max_block = std::min(o.max_block, nz_heads_max_length(e.heads));
+    e.width = nz_heads_n_embd(e.heads);
+    e.model_name = o.alias;
+    for (llama_token t : { nz_heads_open_token(e.heads), nz_heads_close_token(e.heads) }) {
+        e.escaped.push_back(common_token_to_piece(e.vocab, t, true));
+    }
+    return s;
+}
+
+void nz_service_free(nz_service * s) {
+    if (!s) return;
+    llama_free(s->e.ctx);
+    nz_heads_free(s->e.heads);
+    llama_model_free(s->e.model);
+    delete s;
+}
+
+std::string nz_service_hello(const nz_service * s) {
+    return json({ { "dialect", s->e.dialect }, { "cutoff", nz_heads_cutoff(s->e.heads) } }).dump();
+}
+
+nz_response nz_service_handle(nz_service * s, const std::string & method, const std::string & path, const std::string & body_text) {
+    engine & e = s->e;
+    static const std::regex block_path(R"(^/v1/neuralese/blocks/(nz1_[a-z2-7]+)(/meta|/pin|/unpin)?$)");
+    auto ok = [](int status, const json & v) { return nz_response { status, v.dump(), "application/json" }; };
+    auto fail = [&](int status, const std::string & code, const std::string & detail) { return ok(status, error_body(code, detail)); };
+    try {
+        if (method == "GET") {
+            if (path == "/health" || path == "/v1/health") return ok(200, { { "status", "ok" } });
+            if (path == "/v1/models") {
+                return ok(200, { { "object", "list" }, { "data", json::array({ { { "id", e.model_name }, { "object", "model" } } }) } });
+            }
+            if (path == "/v1/neuralese/info") {
+                return ok(200, { { "dialects", json::array({ e.dialect }) }, { "width", e.width }, { "dtype", "f32" },
+                                 { "max_block_length", e.max_block }, { "grad", false }, { "cutoff", nz_heads_cutoff(e.heads) },
+                                 { "server", "llama.cpp" } });
+            }
+            std::smatch m;
+            if (path.rfind("/v1/neuralese/blocks/", 0) == 0) {
+                if (!std::regex_match(path, m, block_path) || (m[2].matched && m[2].str() != "/meta")) return fail(404, "not-found", path);
+                block b;
+                if (!e.store.get(m[1].str(), b)) return fail(404, "neuralese-unknown-block", m[1].str());
+                if (m[2].matched) return ok(200, b.meta());
+                return nz_response { 200, encode_block(b), "application/octet-stream" };
+            }
+            return fail(404, "not-found", path);
+        }
+        if (method == "PUT") {
+            std::smatch m;
+            if (!std::regex_match(path, m, block_path) || m[2].matched) return fail(404, "not-found", path);
+            block b = decode_block(body_text);
+            if (b.id != m[1].str()) return fail(400, "neuralese-id-mismatch", "content hashes to " + b.id);
+            return ok(201, e.store.put(b).meta());
+        }
+        if (method != "POST") return fail(405, "method-not-allowed", method);
+        if (path.rfind("/v1/neuralese/blocks/", 0) == 0) {
+            std::smatch m;
+            if (!std::regex_match(path, m, block_path) || !m[2].matched || m[2].str() == "/meta") return fail(404, "not-found", path);
+            if (m[2].str() == "/pin") e.store.pin(m[1].str()); else e.store.unpin(m[1].str());
+            return ok(200, { { "ok", true } });
+        }
+        if (path == "/v1/neuralese/grad") return fail(501, "neuralese-grad-unavailable", "gradient sessions are served by the reference server");
+        json body = json::parse(body_text.empty() ? "{}" : body_text, nullptr, false);
+        if (path == "/v1/neuralese/collect") {
+            std::set<std::string> referenced;
+            if (body.is_object() && body.contains("referenced")) for (const auto & id : body["referenced"]) referenced.insert(id.get<std::string>());
+            return ok(200, { { "removed", e.store.collect(referenced) } });
+        }
+        if (body.is_discarded() || !body.is_object()) return fail(400, "bad-json", "request body is not a JSON object");
+        if (path == "/v1/chat/completions") {
+            if (body.value("stream", false)) return fail(400, "stream-unsupported", "streaming is not supported");
+            return ok(200, e.generate(body));
+        }
+        if (path == "/v1/neuralese/decide") return ok(200, e.decide(body));
+        if (path == "/v1/neuralese/encode") return ok(201, e.encode(body));
+        if (path == "/v1/neuralese/write") return ok(201, e.write(body));
+        if (path == "/v1/neuralese/digest") return ok(201, e.digest(body));
+        if (path == "/v1/neuralese/render") {
+            const rendered r = e.render(body.value("messages", json::array()), body.contains("tools") ? body["tools"] : json(nullptr));
+            std::string prompt;
+            for (const auto & seg : r.segments) prompt += seg.kind == rendered::segment::BLOCK ? "<block>" : seg.text;
+            // as prefill feeds it: the model's BOS once at the start
+            const std::string bos = common_token_to_piece(e.vocab, llama_vocab_bos(e.vocab), true);
+            if (llama_vocab_get_add_bos(e.vocab) && prompt.compare(0, bos.size(), bos) != 0) prompt = bos + prompt;
+            return ok(201, { { "prompt", prompt } });
+        }
+        if (path == "/v1/neuralese/guidance/check") {
+            // The first rejection of `reply` checked prefix by prefix, as during generation (for conformance).
+            nz_guide guide;
+            const json g = body.value("guidance", json::object());
+            for (const auto & n : g.value("tools", json::array())) guide.settings.tools.push_back(n.get<std::string>());
+            guide.settings.repeat = g.value("repeat", 3);
+            guide.settings.syntax = g.value("syntax", true);
+            const std::string reply = body.value("reply", "");
+            for (size_t end = 1; end <= reply.size(); ++end) {
+                const auto verdict = guide.check(reply.substr(0, end));
+                if (verdict) return ok(201, { { "reason", verdict->reason }, { "offset", verdict->at }, { "end", end } });
+            }
+            return ok(201, { { "reason", nullptr } });
+        }
+        return fail(404, "not-found", path);
+    } catch (const request_error & err) {
+        return fail(err.status, err.code, err.what());
+    } catch (const std::exception & err) {
+        return fail(500, "internal", err.what());
+    }
+}
