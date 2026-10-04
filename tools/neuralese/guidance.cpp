@@ -146,7 +146,27 @@ std::optional<nz_guide_verdict> nz_guide::check(const std::string & reply) {
     auto accepted = [&](size_t at) { return checked.count({ "at", at, false }) > 0; };
     if (!settings.tools.empty()) {
         static const std::regex name(R"((?:\[|,\s*)([A-Za-z_][\w.]*)\()");
-        for (auto it = std::sregex_iterator(reply.begin(), reply.end(), name); it != std::sregex_iterator(); ++it) {
+        // Mask quoted arguments, keeping byte offsets for rollback.
+        std::string visible = reply;
+        char quote = 0;
+        bool escaped = false;
+        for (size_t i = 0; i < reply.size(); ++i) {
+            const char c = reply[i];
+            if (quote) {
+                visible[i] = ' ';
+                if (escaped) {
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == quote) {
+                    quote = 0;
+                }
+            } else if (c == '\'' || c == '"') {
+                quote = c;
+                visible[i] = ' ';
+            }
+        }
+        for (auto it = std::sregex_iterator(visible.begin(), visible.end(), name); it != std::sregex_iterator(); ++it) {
             const size_t start = (size_t) it->position(1);
             if (names_checked.count(start)) continue;
             names_checked.insert(start);
