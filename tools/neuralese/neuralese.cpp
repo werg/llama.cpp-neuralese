@@ -425,7 +425,51 @@ int32_t nz_write(llama_context * ctx, const nz_heads * h, llama_seq_id seq, llam
     llama_set_embeddings_layer_inp(ctx, (uint32_t) k, true);
     int32_t status = 0;
     int32_t count  = 0;
-    if (h->stop_final) {
+    const int32_t hint = params.length > 0 ? std::min(params.length, max_len) : 0;
+    if (hint > 0 && params.passes > 0) {
+        // Block-wise: every position runs through layers [0, k) at once and the sketches are refined by fixed-point
+        // iteration, sketch[j] = feedback(h_k[j - 1]), sketch[0] = feedback(h_cut). The first p positions are exact
+        // after p passes (causality); passes >= length reproduces the sequential write.
+        const int32_t passes = std::min(params.passes, hint);
+        std::vector<float> first(d), inputs((size_t) hint * d), shallow((size_t) hint * d);
+        nz_feedback(h, h_cut, first.data());
+        for (int32_t j = 0; j < hint; ++j) std::copy(first.begin(), first.end(), inputs.begin() + (size_t) j * d);
+        for (int32_t p = 1; p <= passes && status == 0; ++p) {
+            llama_memory_seq_rm(mem, params.seq_sketch, -1, -1);
+            llama_memory_seq_cp(mem, seq, params.seq_sketch, -1, -1);
+            llama_set_layer_range(ctx, 0, k);
+            status = decode_embd(ctx, inputs.data(), hint, d, pos_first, params.seq_sketch, false);
+            llama_set_layer_range(ctx, 0, -1);
+            if (status != 0) break;
+            const float * h_k = llama_get_embeddings_layer_inp(ctx, (uint32_t) k);
+            std::copy(h_k, h_k + (size_t) hint * d, shallow.begin());
+            r.passes = p;
+            if (p == passes) break;
+            std::vector<float> refined(inputs.size());
+            std::copy(first.begin(), first.end(), refined.begin());
+            for (int32_t j = 1; j < hint; ++j) nz_feedback(h, shallow.data() + (size_t) (j - 1) * d, refined.data() + (size_t) j * d);
+            if (refined == inputs) break;
+            inputs.swap(refined);
+        }
+        r.sketches = inputs;
+        r.shallow = shallow;
+        count = hint;
+    } else if (hint > 0) {
+        // A size hint, position by position: no stop decisions.
+        llama_set_embeddings_layer_inp(ctx, (uint32_t) k, true);
+        while (count < hint) {
+            nz_feedback(h, state.data(), sketch.data());
+            llama_set_layer_range(ctx, 0, k);
+            status = decode_embd(ctx, sketch.data(), 1, d, pos_first + count, params.seq_sketch, false);
+            llama_set_layer_range(ctx, 0, -1);
+            if (status != 0) break;
+            const float * h_k = llama_get_embeddings_layer_inp(ctx, (uint32_t) k);
+            r.sketches.insert(r.sketches.end(), sketch.begin(), sketch.end());
+            r.shallow.insert(r.shallow.end(), h_k, h_k + d);
+            state.assign(h_k, h_k + d);
+            count++;
+        }
+    } else if (h->stop_final) {
         // Final stop source: after each sketch step, the new shallow residual is completed through layers [k, n)
         // on its own scratch sequence, and the stop head reads the completed residual h_D with the count. By
         // causality h_D at a position depends only on positions up to it, so deciding here equals the reference's
@@ -472,7 +516,7 @@ int32_t nz_write(llama_context * ctx, const nz_heads * h, llama_seq_id seq, llam
         llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, false);
         llama_memory_seq_rm(mem, params.seq_complete, -1, -1);
     }
-    while (!h->stop_final) {
+    while (hint == 0 && !h->stop_final) {
         if (count > 0 || params.allow_empty) {
             const float logit = nz_stop_logit(h, state.data(), count);
             if (count > 0) {

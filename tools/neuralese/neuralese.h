@@ -64,12 +64,15 @@ struct nz_write_params {
     const float * noise       = nullptr; // optional caller noise eps [max_length * n_embd]; else seeded
     uint32_t     seed         = 0;
     bool         allow_empty  = false;
+    int32_t      length       = 0;     // optional size hint: write exactly this many vectors, no stop decisions (0: none)
+    int32_t      passes       = 0;     // with a hint: write block-wise in this many parallel passes (exact when >= length)
     llama_seq_id seq_sketch   = 1;     // scratch sequence for the sketch recurrence
     llama_seq_id seq_complete = 2;     // scratch sequence for the completion pass
 };
 
 struct nz_write_result {
     int32_t n         = 0;      // vectors written
+    int32_t passes    = 0;      // block-wise passes run (0: written position by position)
     bool    truncated = false;  // the hard maximum closed the block
     std::vector<float> payload;   // [n * n_embd] delivered vectors
     std::vector<float> mean;      // [n * n_embd]

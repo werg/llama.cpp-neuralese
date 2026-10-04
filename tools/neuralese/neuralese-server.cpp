@@ -17,7 +17,8 @@
 //   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
-// neuralese_max_length (capped by --max-block), neuralese_template (template readout: the reply forced to a call cut at
+// neuralese_max_length (capped by --max-block), neuralese_length (an optional size hint: exactly that many vectors, no
+// stop decision) and neuralese_passes (with a hint, block-wise in that many parallel passes), neuralese_template (template readout: the reply forced to a call cut at
 // its value, {"call", "arguments"?, "argument"?, "value": "write" | "decode"}), and the test hook x_natlang_forced (a plan of text
 // strings and {"neuralese": "write"} items that replaces sampling).
 //
@@ -1071,6 +1072,10 @@ struct engine {
         if (body.contains("neuralese_max_length") && body["neuralese_max_length"].is_number()) {
             nz_max = std::min(max_block, body["neuralese_max_length"].get<int32_t>());
         }
+        const int32_t nz_length = body.contains("neuralese_length") && body["neuralese_length"].is_number_integer()
+            ? body["neuralese_length"].get<int32_t>() : 0;
+        const int32_t nz_passes = body.contains("neuralese_passes") && body["neuralese_passes"].is_number_integer()
+            ? body["neuralese_passes"].get<int32_t>() : 0;
         const std::string seed_key = body.contains("seed") && !body["seed"].is_null() ? body["seed"].dump() : request_id;
 
         const rendered prompt = render(messages, tools);
@@ -1149,6 +1154,8 @@ struct engine {
                 nz_write_params wp;
                 wp.max_length = std::min(nz_max, remaining - 2);
                 wp.temperature = nz_temperature;
+                wp.length = nz_length > 0 ? std::min(nz_length, wp.max_length) : 0;
+                wp.passes = wp.length > 0 ? nz_passes : 0;
                 const size_t index = written.size();
                 wp.seed = derive_seed("neuralese\x1f" + seed_key + "\x1f" + std::to_string(index));
                 nz_write_result r;
@@ -1157,13 +1164,21 @@ struct engine {
                 json record = { { "kind", "write" }, { "request", request_id }, { "index", index },
                                 { "cutoff", nz_heads_cutoff(heads) }, { "temperature", nz_temperature },
                                 { "seed", wp.seed }, { "rng", "mt19937-normal" }, { "stop_logits", r.stop_logits } };
-                if (r.n > 0) {
-                    block mean = store.put(make_block(r.mean.data(), r.n, width, dialect, { { "kind", "payload-mean" } }));
-                    block scale = store.put(make_block(r.log_sigma.data(), r.n, width, dialect, { { "kind", "payload-log-sigma" } }));
-                    record["mean"] = mean.id;
-                    record["log_sigma"] = scale.id;
+                if (wp.length > 0) {
+                    record["length_hint"] = wp.length;
+                    record["passes"] = r.passes;
                 }
+                std::vector<block> parts;
+                if (r.n > 0) {
+                    parts.push_back(make_block(r.mean.data(), r.n, width, dialect, { { "kind", "payload-mean" } }));
+                    parts.push_back(make_block(r.log_sigma.data(), r.n, width, dialect, { { "kind", "payload-log-sigma" } }));
+                    record["mean"] = parts[0].id;
+                    record["log_sigma"] = parts[1].id;
+                }
+                // The payload first: at temperature 0 it is its mean, and the store keeps the first block of an ID, which
+                // must be the one carrying the write record.
                 block b = store.put(make_block(r.payload.data(), r.n, width, dialect, record, r.truncated));
+                for (const auto & part : parts) store.put(part);
                 written.push_back(b);
                 items.push_back({ true, 0, index });
                 pos = first + r.n + 1;
@@ -1314,6 +1329,8 @@ struct engine {
                          { "max_tokens", max_block + (int32_t) common_tokenize(vocab, prefix, false, true).size() + 8 } };
         if (body.contains("tools")) request["tools"] = body["tools"];
         if (body.contains("neuralese_temperature")) request["neuralese_temperature"] = body["neuralese_temperature"];
+        if (body.contains("length")) request["neuralese_length"] = body["length"];
+        if (body.contains("passes")) request["neuralese_passes"] = body["passes"];
         const json blocks = generate(request)["neuralese"]["blocks"];
         if (blocks.empty()) throw request_error("neuralese-write", "the write produced no block", 500);
         return blocks[0];
