@@ -20,5 +20,6 @@ if (TARGET llama-common AND TARGET cpp-httplib)
     add_executable(${TARGET} neuralese-server.cpp)
     target_link_libraries(${TARGET} PRIVATE neuralese llama-common cpp-httplib vendor::hash vendor::nlohmann
                           ${CMAKE_THREAD_LIBS_INIT})
+    target_include_directories(${TARGET} PRIVATE ../../src) # llama-ext.h: layer ranges, the token embedding matrix
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 endif()

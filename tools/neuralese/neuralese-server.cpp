@@ -11,6 +11,9 @@
 //   GET  /v1/neuralese/blocks/{id}     fetch a block; .../meta for its metadata
 //   POST /v1/neuralese/blocks/{id}/pin, .../unpin
 //   POST /v1/neuralese/collect         drop unpinned blocks not in {"referenced": [...]}
+//   POST /v1/neuralese/encode          text into a block in one forward pass through the port: {"text", "type"?, "context"?}
+//   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
+//   POST /v1/neuralese/digest          the digest operator: {"name", "type", "value", "instructions", "system"?, "window"?}
 //   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
@@ -26,6 +29,7 @@
 // left to an integration into llama-server.
 
 #include "neuralese.h"
+#include "llama-ext.h"
 
 #include "chat.h"
 #include "common.h"
@@ -60,6 +64,11 @@ namespace {
 //
 // errors
 //
+
+// The digest operator's write site (natlang training/neuralese digest.py; pinned by tests/fixtures/digest-site.json).
+const char * DIGEST_INSTRUCTIONS = "Write a digest of the value below for the listing of the call that receives it: what the value is, how it is organised, and what in it bears on the call's instructions, so that the call knows what to look up. The full value stays in the call's variable for exact reading, so do not copy exact details; keep the digest short.";
+const char * DIGEST_PREFIX = "const digest: Neuralese<Digest> = ";
+const int32_t DIGEST_SITE_MARGIN = 512;
 
 struct request_error : std::runtime_error {
     std::string code;
@@ -1143,6 +1152,175 @@ struct engine {
             { "neuralese", { { "dialect", dialect }, { "blocks", metas } } },
         };
     }
+
+    // Decode embedding rows on seq from pos through the current layer range, in batches, collecting the residual
+    // entering layer `lid` at every row (the caller enables its extraction).
+    std::vector<float> run_rows(const std::vector<float> & rows, llama_pos pos, llama_seq_id seq, uint32_t lid) {
+        const int32_t n = (int32_t) (rows.size() / (size_t) width);
+        std::vector<float> out;
+        out.reserve(rows.size());
+        for (int32_t off = 0; off < n; off += n_batch) {
+            const int32_t m = std::min(n_batch, n - off);
+            llama_batch batch = llama_batch_init(m, width, 1);
+            batch.n_tokens = m;
+            memcpy(batch.embd, rows.data() + (size_t) off * width, (size_t) m * width * sizeof(float));
+            for (int32_t i = 0; i < m; ++i) {
+                batch.pos[i] = pos + off + i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = seq;
+                batch.logits[i] = 0;
+            }
+            const int status = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            if (status != 0) throw request_error("decode-failed", "encode", 500);
+            const float * h = llama_get_embeddings_layer_inp(ctx, lid);
+            out.insert(out.end(), h, h + (size_t) m * width);
+        }
+        return out;
+    }
+
+    std::vector<float> tok_embd; // the token embedding matrix [n_vocab * width], loaded on the first encode
+
+    // Encode (POST /v1/neuralese/encode): text into a block in one forward pass through the port, as the reference's
+    // grad.encode_text. The write site is the rendered `context` (or BOS), then the open marker; the text's token
+    // embeddings, interface-normed, are supplied at the sketch positions (S3 phase A), layers [0, k) and then [k, n)
+    // run over them, and the content projection gives one payload vector per token (the mean). No stop decision.
+    json encode(const json & body) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const std::string text = body.value("text", "");
+        const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
+        if (ids.empty()) throw request_error("neuralese-encode", "empty text");
+        if (tok_embd.empty()) {
+            tok_embd.resize(llama_model_get_tok_embd(model, nullptr));
+            if (tok_embd.empty() || llama_model_get_tok_embd(model, tok_embd.data()) != tok_embd.size()) {
+                tok_embd.clear();
+                throw request_error("neuralese-encode", "the token embedding matrix is unavailable", 500);
+            }
+        }
+        llama_pos pos = 0;
+        const json context = body.contains("context") ? body["context"] : json(nullptr);
+        if (context.is_array() && !context.empty()) {
+            const rendered prompt = render(context, json(nullptr));
+            if (!prompt.blocks.empty()) throw request_error("neuralese-encode", "the encoding context may not hold blocks");
+            pos = prefill(prompt);
+        } else {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            const llama_token bos = llama_vocab_bos(vocab);
+            if (bos != LLAMA_TOKEN_NULL) {
+                if (decode_tokens({ bos }, 0, false) != 0) throw request_error("decode-failed", "encode prefix", 500);
+                pos = 1;
+            }
+        }
+        std::vector<float> h_cut(width);
+        if (nz_open(ctx, heads, pos, 0, h_cut.data()) != 0) throw request_error("decode-failed", "open", 500);
+        const llama_pos first = pos + 1;
+        const int32_t n = (int32_t) ids.size();
+        std::vector<float> embedded((size_t) n * width), inputs((size_t) n * width);
+        for (int32_t i = 0; i < n; ++i) {
+            std::copy_n(tok_embd.data() + (size_t) ids[i] * width, width, embedded.data() + (size_t) i * width);
+        }
+        nz_interface(heads, embedded.data(), inputs.data(), n);
+        const int32_t k = nz_heads_cutoff(heads), n_layer = llama_model_n_layer(model);
+        llama_memory_t mem = llama_get_memory(ctx);
+        for (llama_seq_id s : { 1, 2 }) {
+            llama_memory_seq_rm(mem, s, -1, -1);
+            llama_memory_seq_cp(mem, 0, s, -1, -1);
+        }
+        std::vector<float> shallow, final_h;
+        try {
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) k, true);
+            llama_set_layer_range(ctx, 0, k);
+            shallow = run_rows(inputs, first, 1, (uint32_t) k);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) k, false);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, true);
+            llama_set_layer_range(ctx, k, -1);
+            final_h = run_rows(shallow, first, 2, (uint32_t) n_layer);
+        } catch (...) {
+            llama_set_layer_range(ctx, 0, -1);
+            llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, false);
+            for (llama_seq_id s : { 1, 2 }) llama_memory_seq_rm(mem, s, -1, -1);
+            throw;
+        }
+        llama_set_layer_range(ctx, 0, -1);
+        llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, false);
+        for (llama_seq_id s : { 1, 2 }) llama_memory_seq_rm(mem, s, -1, -1);
+        std::vector<float> mean((size_t) n * width), log_sigma((size_t) n * width);
+        nz_content(heads, inputs.data(), final_h.data(), n, mean.data(), log_sigma.data());
+        block b = make_block(mean.data(), n, width, dialect, { { "kind", "text-encode" }, { "text", text } });
+        if (body.contains("type") && body["type"].is_string()) b.type = body["type"].get<std::string>();
+        return store.put(b).meta();
+    }
+
+    // Write (POST /v1/neuralese/write): the write procedure at a write site. The reply is forced to `prefix` and then
+    // the open marker; the stop head decides the length.
+    json write(const json & body) {
+        const std::string prefix = body.value("prefix", "");
+        json forced = json::array();
+        if (!prefix.empty()) forced.push_back(prefix);
+        forced.push_back({ { "neuralese", "write" } });
+        json request = { { "messages", body.value("messages", json::array()) }, { "x_natlang_forced", forced },
+                         { "max_tokens", max_block + (int32_t) common_tokenize(vocab, prefix, false, true).size() + 8 } };
+        if (body.contains("tools")) request["tools"] = body["tools"];
+        if (body.contains("neuralese_temperature")) request["neuralese_temperature"] = body["neuralese_temperature"];
+        const json blocks = generate(request)["neuralese"]["blocks"];
+        if (blocks.empty()) throw request_error("neuralese-write", "the write produced no block", 500);
+        return blocks[0];
+    }
+
+    // Digest (POST /v1/neuralese/digest): the digest operator's plan, as the reference's digest.py (DECISIONS.md 43).
+    // A value that fits one write site's window is digested there; a longer one is split into token chunks, each
+    // digested at a part site, and a combine site reads the part digests and writes the final one.
+    json digest(const json & body) {
+        const std::string name = body.value("name", "").empty() ? "value" : body.value("name", "");
+        const std::string type = body.value("type", "").empty() ? "unknown" : body.value("type", "");
+        const std::string value = body.value("value", ""), instructions = body.value("instructions", "");
+        const json system = body.contains("system") && !body["system"].is_null()
+            && !(body["system"].is_string() && body["system"].get<std::string>().empty()) ? body["system"] : json(DIGEST_INSTRUCTIONS);
+        // window: the model's context (as served: the smaller of its training context and this server's -c) less the
+        // site's own text, the block and a margin
+        const int32_t context = std::min<int32_t>(llama_model_n_ctx_train(model), (int32_t) llama_n_ctx(ctx));
+        const int32_t overhead = (int32_t) common_tokenize(vocab, instructions, false, true).size() + max_block + DIGEST_SITE_MARGIN;
+        int32_t window = std::max(256, context - overhead);
+        if (body.contains("window") && body["window"].is_number_integer() && body["window"].get<int32_t>() > 0) {
+            window = std::min(window, body["window"].get<int32_t>());
+        }
+        const std::string about = "The call that receives the value has these instructions:\n" + instructions + "\n\n";
+        auto site = [&](const json & content) {
+            return json::array({ { { "role", "system" }, { "content", system } }, { { "role", "user" }, { "content", content } } });
+        };
+        auto write_at = [&](const json & messages) {
+            return write({ { "messages", messages }, { "prefix", DIGEST_PREFIX } })["id"].get<std::string>();
+        };
+        const std::vector<llama_token> ids = common_tokenize(vocab, value, false, true);
+        std::string id;
+        size_t parts = 1;
+        if ((int32_t) ids.size() <= window) {
+            id = write_at(site(about + "The value of " + name + " (" + type + "):\n" + value));
+        } else {
+            std::vector<std::string> blocks;
+            const size_t count = (ids.size() + (size_t) window - 1) / (size_t) window;
+            for (size_t i = 0; i < count; ++i) {
+                const std::vector<llama_token> chunk(ids.begin() + (long) (i * window),
+                                                     ids.begin() + (long) std::min(ids.size(), (i + 1) * (size_t) window));
+                blocks.push_back(write_at(site(about + "Part " + std::to_string(i + 1) + " of " + std::to_string(count)
+                                               + " of the value of " + name + " (" + type + "):\n"
+                                               + common_detokenize(vocab, chunk, true))));
+            }
+            json content = json::array({ { { "type", "text" }, { "text", about + "Digests of the " + std::to_string(count)
+                                                                    + " parts of the value of " + name + " (" + type + "), in order:\n" } } });
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                content.push_back({ { "type", "text" }, { "text", "Part " + std::to_string(i + 1) + ": " } });
+                content.push_back({ { "type", "neuralese" }, { "id", blocks[i] } });
+                content.push_back({ { "type", "text" }, { "text", "\n" } });
+            }
+            id = write_at(site(content));
+            parts = blocks.size();
+        }
+        json meta = lookup(id).meta();
+        meta["parts"] = parts;
+        meta["window"] = window;
+        return meta;
+    }
 };
 
 void send_json(httplib::Response & res, int status, const json & v) {
@@ -1277,6 +1455,22 @@ int main(int argc, char ** argv) {
             send_error(res, 500, "internal", err.what());
         }
     });
+    auto post = [&](const char * path, std::function<json(const json &)> handler) {
+        server.Post(path, [handler](const httplib::Request & req, httplib::Response & res) {
+            json body = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) return send_error(res, 400, "bad-json", "request body is not a JSON object");
+            try {
+                send_json(res, 201, handler(body));
+            } catch (const request_error & err) {
+                send_error(res, err.status, err.code, err.what());
+            } catch (const std::exception & err) {
+                send_error(res, 500, "internal", err.what());
+            }
+        });
+    };
+    post("/v1/neuralese/encode", [&](const json & body) { return e.encode(body); });
+    post("/v1/neuralese/write", [&](const json & body) { return e.write(body); });
+    post("/v1/neuralese/digest", [&](const json & body) { return e.digest(body); });
     server.Post("/v1/neuralese/grad", [](const httplib::Request &, httplib::Response & res) {
         send_error(res, 501, "neuralese-grad-unavailable", "gradient sessions are served by the reference server");
     });
