@@ -17,7 +17,8 @@
 //   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
-// neuralese_max_length (capped by --max-block), and the test hook x_natlang_forced (a plan of text
+// neuralese_max_length (capped by --max-block), neuralese_template (template readout: the reply forced to a call cut at
+// its value, {"call", "arguments"?, "argument"?, "value": "write" | "decode"}), and the test hook x_natlang_forced (a plan of text
 // strings and {"neuralese": "write"} items that replaces sampling).
 //
 // Blocks are rendered as <open> + one embedding position per vector + <close>. Literal occurrences of
@@ -930,6 +931,36 @@ struct engine {
         return pos;
     }
 
+    // The model's own rendering of an assistant reply that calls `name` with `arguments` and then `argument`, cut at that
+    // argument's value (the reference's chat.call_reply): with `quoted` the prefix ends with the opening quote and the
+    // suffix runs from the closing quote through the end of the turn; without, the prefix ends where the value starts.
+    std::pair<std::string, std::string> call_reply(const std::string & name, const json & arguments, const std::string & argument,
+                                                   bool quoted) {
+        static const std::string VALUE = "natlangValue7f3a9c";
+        json args = arguments.is_object() ? arguments : json::object();
+        args[argument] = VALUE;
+        const json user = { { "role", "user" }, { "content", "x" } };
+        const json call = { { "role", "assistant" }, { "content", "" }, { "tool_calls", json::array({ { { "type", "function" },
+            { "function", { { "name", name }, { "arguments", args.dump() } } } } }) } };
+        auto apply = [&](const json & messages, bool generation) {
+            common_chat_templates_inputs inputs;
+            inputs.messages = common_chat_msgs_parse_oaicompat(common_json::parse(messages.dump()));
+            inputs.add_generation_prompt = generation;
+            inputs.use_jinja = true;
+            return common_chat_templates_apply(templates.get(), inputs).prompt;
+        };
+        const std::string prompt = apply(json::array({ user }), true), full = apply(json::array({ user, call }), false);
+        const size_t at = full.compare(0, prompt.size(), prompt) == 0 ? full.find(VALUE, prompt.size()) : std::string::npos;
+        if (at == std::string::npos) throw request_error("neuralese-template", "the chat template renders the call's reply differently");
+        std::string prefix = full.substr(prompt.size(), at - prompt.size()), suffix = full.substr(at + VALUE.size());
+        if (quoted) return { prefix, suffix };
+        if (prefix.empty() || (prefix.back() != '\'' && prefix.back() != '"')) {
+            throw request_error("neuralese-template", "the chat template does not quote string arguments");
+        }
+        prefix.pop_back();
+        return { prefix, "" };
+    }
+
     // log softmax of logits at token: logit[token] - logsumexp(logits)
     float token_logprob(const float * logits, llama_token token) const {
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
@@ -1062,6 +1093,26 @@ struct engine {
                 }
             }
         }
+        // Template readout: the reply is forced to a call cut at its value argument (call_reply); "write" writes the
+        // value as a block and closes the call, "decode" decodes from the value on. The test hook's plan replaces it.
+        bool free_after = false;
+        if (!forced && body.contains("neuralese_template") && body["neuralese_template"].is_object()) {
+            const json & t = body["neuralese_template"];
+            const std::string mode = t.value("value", "");
+            if (!t.contains("call") || !t["call"].is_string() || (mode != "write" && mode != "decode")) {
+                throw request_error("neuralese-template", "a template needs a call name and value 'write' or 'decode'");
+            }
+            const std::string argument = t.contains("argument") && t["argument"].is_string() ? t["argument"].get<std::string>() : "value";
+            const auto [prefix, suffix] = call_reply(t["call"].get<std::string>(), t.contains("arguments") ? t["arguments"] : json::object(),
+                                                     argument, mode == "write");
+            for (llama_token tok : common_tokenize(vocab, prefix, false, true)) plan.push_back({ false, tok });
+            if (mode == "write") {
+                plan.push_back({ true, open_id });
+                for (llama_token tok : common_tokenize(vocab, suffix, false, true)) plan.push_back({ false, tok });
+            }
+            forced = true;
+            free_after = mode == "decode";
+        }
         size_t plan_at = 0;
 
         llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -1080,6 +1131,7 @@ struct engine {
         while (true) {
             if (generated >= max_tokens) { finish = "length"; break; }
             llama_token token;
+            if (forced && free_after && plan_at >= plan.size()) forced = false;
             if (forced) {
                 if (plan_at >= plan.size()) break;
                 token = plan[plan_at++].token;
