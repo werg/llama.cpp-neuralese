@@ -442,9 +442,16 @@ public:
         return out;
     }
 
-    std::string escape_json_strings(const json & v) {
-        // escape every string inside a JSON value (tool arguments as an object), returned as JSON text
+    std::string escape_json_strings(const json & v, std::vector<std::string> & blocks) {
+        // escape every string inside a JSON value (tool arguments as an object), returned as JSON text; a value that
+        // is a part list holding a block (as replies return a written argument: "value": [{"type": "neuralese", …}])
+        // becomes that block inside the value's string
         std::function<json(const json &)> walk = [&](const json & x) -> json {
+            if (is_parts(x)) {
+                for (const auto & part : x) {
+                    if (part["type"] == "neuralese") return flatten(x, blocks);
+                }
+            }
             if (x.is_string()) return escape(x.get<std::string>());
             if (x.is_array()) { json a = json::array(); for (const auto & e : x) a.push_back(walk(e)); return a; }
             if (x.is_object()) { json o = json::object(); for (auto it = x.begin(); it != x.end(); ++it) o[escape(it.key())] = walk(it.value()); return o; }
@@ -872,9 +879,9 @@ struct engine {
                         if (parsed.is_discarded()) {
                             throw request_error("tool-arguments", "tool-call arguments are not JSON");
                         }
-                        text = r.escape_json_strings(parsed);
+                        text = r.escape_json_strings(parsed, blocks);
                     } else {
-                        text = r.escape_json_strings(arguments);
+                        text = r.escape_json_strings(arguments, blocks);
                     }
                     if (json::parse(text, nullptr, false).is_discarded()) {
                         throw request_error("tool-arguments", "tool-call arguments are not JSON");
