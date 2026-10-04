@@ -1549,6 +1549,7 @@ nz_service * nz_service_load(const nz_service_options & o, std::string & error) 
     engine & e = s->e;
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = o.n_gpu_layers;
+    if (!o.use_mmap) mp.load_mode = LLAMA_LOAD_MODE_NONE;
     e.model = llama_model_load_from_file(o.model_path.c_str(), mp);
     if (!e.model) { error = "could not load the model " + o.model_path; delete s; return nullptr; }
     e.vocab = llama_model_get_vocab(e.model);

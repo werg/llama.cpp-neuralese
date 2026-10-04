@@ -14,6 +14,7 @@ struct nz_service_options {
     int n_gpu_layers = 0;
     int n_ctx        = 8192;
     int max_block    = 64;
+    bool use_mmap    = true;                  // false where the file system cannot map files (WORKERFS in a browser)
 };
 
 struct nz_response {
