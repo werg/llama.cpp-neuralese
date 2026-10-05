@@ -1128,7 +1128,23 @@ struct engine {
             const std::string argument = t.contains("argument") && t["argument"].is_string() ? t["argument"].get<std::string>() : "value";
             const auto [prefix, suffix] = call_reply(t["call"].get<std::string>(), t.contains("arguments") ? t["arguments"] : json::object(),
                                                      argument, mode == "write");
-            for (llama_token tok : common_tokenize(vocab, prefix, false, true)) plan.push_back({ false, tok });
+            auto prefix_tokens = common_tokenize(vocab, prefix, false, true);
+            if (mode == "decode") {
+                // A text cut at value= can split the trained =[ or ={ token.
+                // Force only the shared token prefix; decode the boundary normally.
+                const std::vector<std::string> continuations = {
+                    "[]", "{}", "\"x\"", "'x'", "true", "false", "null", "-1",
+                    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+                };
+                for (const auto & continuation : continuations) {
+                    const auto other = common_tokenize(vocab, prefix + continuation, false, true);
+                    size_t n = 0;
+                    while (n < std::min(prefix_tokens.size(), other.size()) && prefix_tokens[n] == other[n]) ++n;
+                    prefix_tokens.resize(n);
+                }
+                if (prefix_tokens.empty()) throw request_error("neuralese-template", "chat template has no stable decode prefix");
+            }
+            for (llama_token tok : prefix_tokens) plan.push_back({ false, tok });
             if (mode == "write") {
                 plan.push_back({ true, open_id });
                 for (llama_token tok : common_tokenize(vocab, suffix, false, true)) plan.push_back({ false, tok });
