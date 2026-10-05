@@ -86,12 +86,6 @@ struct request_error : std::runtime_error {
         : std::runtime_error(code + ": " + detail), code(std::move(code)), status(status) {}
 };
 
-// Weight adapters (natlang model/tiny_adapters.py) are served by the reference server only; a request that binds
-// them must fail rather than answer with the base model.
-static void refuse_adapters(const json & body, const char * key) {
-    if (body.contains(key) && body[key].is_array() && !body[key].empty())
-        throw request_error("neuralese-adapters-unavailable", "weight adapters are served by the reference server", 501);
-}
 
 //
 // content addressing: nz1_ + base32(sha256("natlang.neuralese-block/1\0{dialect}\0{L}x{W}\0{dtype}\0" + bytes))
@@ -815,6 +809,47 @@ struct engine {
     int32_t n_batch = 512;
     int32_t width = 0;
     std::mutex mutex;
+    // Weight adapters (natlang model/tiny_adapters.py) as LoRAs, by adapter block ID: a `tiny`/`xs` adapter is exactly
+    // a rank-r LoRA (natlang export/adapters.py), loaded with PUT /v1/neuralese/adapters/{id}/lora.
+    std::map<std::string, llama_adapter_lora *> loras;
+
+    // The adapters a request binds (`[{"id", "scale"}]`), set on the context for the whole request (every request
+    // sets its own, none by default). An adapter given as a code through a projection is decoded by the reference
+    // server only, and one that was never loaded fails rather than answer with the base model.
+    void bind_adapters(const json & body, const char * key) {
+        std::vector<llama_adapter_lora *> bound;
+        std::vector<float> scales;
+        if (key && body.contains(key) && body[key].is_array()) {
+            for (const auto & entry : body[key]) {
+                if (!entry.is_object() || !entry.contains("id") || !entry["id"].is_string())
+                    throw request_error("neuralese-adapters-unavailable",
+                                        "adapters decoded through a projection are served by the reference server", 501);
+                const std::string id = entry["id"].get<std::string>();
+                const auto found = loras.find(id);
+                if (found == loras.end())
+                    throw request_error("neuralese-adapter-not-loaded", id + " has no LoRA on this server (PUT /v1/neuralese/adapters/" + id + "/lora)", 409);
+                bound.push_back(found->second);
+                scales.push_back(entry.value("scale", 1.0f));
+            }
+        }
+        if (llama_set_adapters_lora(ctx, bound.data(), bound.size(), scales.data()) != 0)
+            throw request_error("neuralese-adapters", "the context refused the adapters", 500);
+    }
+
+    json load_lora(const std::string & id, const std::string & gguf) {
+        std::lock_guard<std::mutex> lock(mutex);
+        FILE * file = fmemopen((void *) gguf.data(), gguf.size(), "rb");
+        llama_adapter_lora * adapter = llama_adapter_lora_init_from_file_ptr(model, file);
+        if (file) fclose(file);
+        if (!adapter) throw request_error("neuralese-adapter-lora", "not a LoRA for this model", 400);
+        const auto found = loras.find(id);
+        if (found != loras.end()) {
+            llama_set_adapters_lora(ctx, nullptr, 0, nullptr);
+            llama_adapter_lora_free(found->second);
+        }
+        loras[id] = adapter;
+        return { { "id", id }, { "loaded", true } };
+    }
     std::atomic<uint64_t> next_id { 0 };
     std::vector<std::string> escaped; // control-token text that must stay text inside content
 
@@ -996,8 +1031,8 @@ struct engine {
     // GradSession.decision_logprobs: the reply is cut from the full rendering after the prompt, through its last
     // end-of-message marker.
     json decide(const json & body) {
-        refuse_adapters(body, "adapters");
         std::lock_guard<std::mutex> lock(mutex);
+        bind_adapters(body, "adapters");
         const json messages = body.value("messages", json::array());
         const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
         const json options = body.value("options", json::array());
@@ -1073,8 +1108,8 @@ struct engine {
     }
 
     json generate(const json & body) {
-        refuse_adapters(body, "x_natlang_adapters");
         std::lock_guard<std::mutex> lock(mutex);
+        bind_adapters(body, "x_natlang_adapters");
         const std::string request_id = "chatcmpl-" + std::to_string(next_id++);
         const json messages = body.value("messages", json::array());
         const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
@@ -1415,6 +1450,7 @@ struct engine {
     // run over them, and the content projection gives one payload vector per token (the mean). No stop decision.
     json encode(const json & body) {
         std::lock_guard<std::mutex> lock(mutex);
+        bind_adapters(body, nullptr);
         const std::string text = body.value("text", "");
         const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
         if (ids.empty()) throw request_error("neuralese-encode", "empty text");
@@ -1641,7 +1677,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             }
             if (path == "/v1/neuralese/info") {
                 return ok(200, { { "dialects", json::array({ e.dialect }) }, { "width", e.width }, { "dtype", "f32" },
-                                 { "max_block_length", e.max_block }, { "grad", false }, { "cutoff", nz_heads_cutoff(e.heads) },
+                                 { "max_block_length", e.max_block }, { "grad", false }, { "adapters", "lora" }, { "cutoff", nz_heads_cutoff(e.heads) },
                                  { "server", "llama.cpp" } });
             }
             std::smatch m;
@@ -1655,7 +1691,9 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             return fail(404, "not-found", path);
         }
         if (method == "PUT") {
+            static const std::regex lora_path(R"(^/v1/neuralese/adapters/(nz1_[a-z2-7]+)/lora$)");
             std::smatch m;
+            if (std::regex_match(path, m, lora_path)) return ok(201, e.load_lora(m[1].str(), body_text));
             if (!std::regex_match(path, m, block_path) || m[2].matched) return fail(404, "not-found", path);
             block b = decode_block(body_text);
             if (b.id != m[1].str()) return fail(400, "neuralese-id-mismatch", "content hashes to " + b.id);
