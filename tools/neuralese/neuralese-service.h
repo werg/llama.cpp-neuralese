@@ -30,5 +30,7 @@ nz_service * nz_service_load(const nz_service_options & options, std::string & e
 void         nz_service_free(nz_service * service);
 // {"dialect", "cutoff"} as JSON text
 std::string  nz_service_hello(const nz_service * service);
-// One request: GET/PUT/POST with the path and the raw body. Requests are served one at a time.
-nz_response  nz_service_handle(nz_service * service, const std::string & method, const std::string & path, const std::string & body);
+// One request: GET/PUT/POST with the path, the raw body and the requesting owner (`x-natlang-owner`; "" for none).
+// Requests are served one at a time.
+nz_response  nz_service_handle(nz_service * service, const std::string & method, const std::string & path, const std::string & body,
+                               const std::string & owner = "");

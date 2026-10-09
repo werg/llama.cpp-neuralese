@@ -9,8 +9,10 @@
 //   GET  /v1/neuralese/info            dialect, width, maximum block length, cutoff
 //   PUT  /v1/neuralese/blocks/{id}     store a block (one-tensor safetensors body); the ID is checked
 //   GET  /v1/neuralese/blocks/{id}     fetch a block; .../meta for its metadata
-//   POST /v1/neuralese/blocks/{id}/pin, .../unpin
-//   POST /v1/neuralese/collect         drop unpinned blocks not in {"referenced": [...]}
+//   POST /v1/neuralese/blocks/{id}/pin, .../unpin   pins count per owner (x-natlang-owner)
+//   POST /v1/neuralese/collect         {"referenced": [...]}: with an owner, it now holds exactly those (and its pinned
+//                                      blocks), and what it released is dropped unless another owner holds or pins it;
+//                                      without one, drops the unreferenced blocks no owner holds or pins
 //   POST /v1/neuralese/render          the rendered prompt of {"messages", "tools"?} (blocks as "<block>"), for conformance
 //   POST /v1/neuralese/encode          text into a block in one forward pass through the port: {"text", "type"?, "context"?}
 //   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
@@ -72,7 +74,7 @@ int main(int argc, char ** argv) {
     httplib::Server server;
     auto handler = [service](const char * method) {
         return [service, method](const httplib::Request & req, httplib::Response & res) {
-            const nz_response r = nz_service_handle(service, method, req.path, req.body);
+            const nz_response r = nz_service_handle(service, method, req.path, req.body, req.get_header_value("x-natlang-owner"));
             res.status = r.status;
             res.set_content(r.body, r.content_type);
         };

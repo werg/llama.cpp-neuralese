@@ -13,8 +13,10 @@
 //   GET  /v1/neuralese/info            dialect, width, maximum block length, cutoff
 //   PUT  /v1/neuralese/blocks/{id}     store a block (one-tensor safetensors body); the ID is checked
 //   GET  /v1/neuralese/blocks/{id}     fetch a block; .../meta for its metadata
-//   POST /v1/neuralese/blocks/{id}/pin, .../unpin
-//   POST /v1/neuralese/collect         drop unpinned blocks not in {"referenced": [...]}
+//   POST /v1/neuralese/blocks/{id}/pin, .../unpin   pins count per owner (x-natlang-owner)
+//   POST /v1/neuralese/collect         {"referenced": [...]}: with an owner, it now holds exactly those (and its pinned
+//                                      blocks), and what it released is dropped unless another owner holds or pins it;
+//                                      without one, drops the unreferenced blocks no owner holds or pins
 //   POST /v1/neuralese/render          the rendered prompt of {"messages", "tools"?} (blocks as "<block>"), for conformance
 //   POST /v1/neuralese/encode          text into a block in one forward pass through the port: {"text", "type"?, "context"?}
 //   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
@@ -294,10 +296,15 @@ block decode_block(const std::string & body) {
     }
 }
 
+// Owner-scoped holds and pins (the reference's serve/store.py `TensorStore`, without its persistent spill): an owner
+// (`x-natlang-owner`) holds the blocks it uploads and every block ID the service names to it, and releases them by
+// collecting; a block is dropped only when no owner holds or pins it. A collection without an owner drops only blocks
+// that no owner holds or pins. Anonymous pins belong to the owner "".
 class tensor_store {
 public:
-    block put(block b) {
+    block put(block b, const std::string & owner = "") {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!owner.empty()) holds_[b.id].insert(owner);
         auto it = blocks_.find(b.id);
         if (it != blocks_.end()) {
             if (it->second.type.empty() && !b.type.empty()) {
@@ -317,38 +324,65 @@ public:
         out = it->second;
         return true;
     }
-    void pin(const std::string & id) {
+    // `owner` holds every stored block among `ids`
+    void hold(const std::string & owner, const std::set<std::string> & ids) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto & id : ids) {
+            if (blocks_.count(id)) holds_[id].insert(owner);
+        }
+    }
+    void pin(const std::string & id, const std::string & owner = "") {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!blocks_.count(id)) {
             throw request_error("neuralese-unknown-block", id, 404);
         }
-        pins_[id]++;
+        pins_[id][owner]++;
+        if (!owner.empty()) holds_[id].insert(owner);
     }
-    void unpin(const std::string & id) {
+    void unpin(const std::string & id, const std::string & owner = "") {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = pins_.find(id);
-        if (it != pins_.end() && --it->second <= 0) {
-            pins_.erase(it);
-        }
+        if (it == pins_.end()) return;
+        auto by = it->second.find(owner);
+        if (by != it->second.end() && --by->second <= 0) it->second.erase(by);
+        if (it->second.empty()) pins_.erase(it);
     }
-    std::vector<std::string> collect(const std::set<std::string> & referenced) {
+    std::vector<std::string> collect(const std::set<std::string> & referenced, const std::string & owner = "") {
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<std::string> removed;
-        for (auto it = blocks_.begin(); it != blocks_.end();) {
-            if (!referenced.count(it->first) && !pins_.count(it->first)) {
-                removed.push_back(it->first);
-                it = blocks_.erase(it);
-            } else {
-                ++it;
+        if (owner.empty()) {
+            for (const auto & [id, _] : blocks_) {
+                if (!referenced.count(id) && !holds_.count(id) && !pins_.count(id)) removed.push_back(id);
+            }
+        } else {
+            std::vector<std::string> released;
+            for (const auto & [id, owners] : holds_) {
+                const auto pinned = pins_.find(id);
+                if (owners.count(owner) && !referenced.count(id) && (pinned == pins_.end() || !pinned->second.count(owner))) {
+                    released.push_back(id);
+                }
+            }
+            for (const auto & id : referenced) {
+                if (blocks_.count(id)) holds_[id].insert(owner);
+            }
+            for (const auto & id : released) {
+                auto it = holds_.find(id);
+                it->second.erase(owner);
+                if (it->second.empty()) {
+                    holds_.erase(it);
+                    if (!pins_.count(id)) removed.push_back(id);
+                }
             }
         }
+        for (const auto & id : removed) blocks_.erase(id);
         return removed;
     }
 
 private:
     std::mutex mutex_;
     std::map<std::string, block> blocks_;
-    std::map<std::string, int> pins_;
+    std::map<std::string, std::set<std::string>> holds_;
+    std::map<std::string, std::map<std::string, int>> pins_;
 };
 
 //
@@ -1722,10 +1756,30 @@ std::string nz_service_hello(const nz_service * s) {
                   { "gpu_layers", s->n_gpu_layers } }).dump();
 }
 
-nz_response nz_service_handle(nz_service * s, const std::string & method, const std::string & path, const std::string & body_text) {
+// Every block ID a JSON value names (as a whole string anywhere in it).
+static void block_ids(const json & v, std::set<std::string> & out) {
+    static const std::regex id(R"(^nz1_[a-z2-7]+$)");
+    if (v.is_string()) {
+        const auto & text = v.get_ref<const std::string &>();
+        if (text.rfind("nz1_", 0) == 0 && std::regex_match(text, id)) out.insert(text);
+    } else if (v.is_structured()) {
+        for (const auto & item : v) block_ids(item, out);
+    }
+}
+
+nz_response nz_service_handle(nz_service * s, const std::string & method, const std::string & path, const std::string & body_text,
+                              const std::string & owner) {
     engine & e = s->e;
     static const std::regex block_path(R"(^/v1/neuralese/blocks/(nz1_[a-z2-7]+)(/meta|/pin|/unpin)?$)");
-    auto ok = [](int status, const json & v) { return nz_response { status, v.dump(), "application/json" }; };
+    // The requesting owner holds every block the service names to it.
+    auto ok = [&](int status, const json & v) {
+        if (!owner.empty() && status < 400) {
+            std::set<std::string> ids;
+            block_ids(v, ids);
+            if (!ids.empty()) e.store.hold(owner, ids);
+        }
+        return nz_response { status, v.dump(), "application/json" };
+    };
     auto fail = [&](int status, const std::string & code, const std::string & detail) { return ok(status, error_body(code, detail)); };
     try {
         if (method == "GET") {
@@ -1736,7 +1790,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             if (path == "/v1/neuralese/info") {
                 return ok(200, { { "dialects", json::array({ e.dialect }) }, { "width", e.width }, { "dtype", "f32" },
                                  { "max_block_length", e.max_block }, { "grad", false }, { "adapters", "lora" }, { "cutoff", nz_heads_cutoff(e.heads) },
-                                 { "server", "llama.cpp" } });
+                                 { "server", "llama.cpp" }, { "store", { { "owners", true }, { "persistent", false } } } });
             }
             std::smatch m;
             if (path.rfind("/v1/neuralese/blocks/", 0) == 0) {
@@ -1744,6 +1798,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
                 block b;
                 if (!e.store.get(m[1].str(), b)) return fail(404, "neuralese-unknown-block", m[1].str());
                 if (m[2].matched) return ok(200, b.meta());
+                if (!owner.empty()) e.store.hold(owner, { b.id });
                 return nz_response { 200, encode_block(b), "application/octet-stream" };
             }
             return fail(404, "not-found", path);
@@ -1755,13 +1810,13 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             if (!std::regex_match(path, m, block_path) || m[2].matched) return fail(404, "not-found", path);
             block b = decode_block(body_text);
             if (b.id != m[1].str()) return fail(400, "neuralese-id-mismatch", "content hashes to " + b.id);
-            return ok(201, e.store.put(b).meta());
+            return ok(201, e.store.put(b, owner).meta());
         }
         if (method != "POST") return fail(405, "method-not-allowed", method);
         if (path.rfind("/v1/neuralese/blocks/", 0) == 0) {
             std::smatch m;
             if (!std::regex_match(path, m, block_path) || !m[2].matched || m[2].str() == "/meta") return fail(404, "not-found", path);
-            if (m[2].str() == "/pin") e.store.pin(m[1].str()); else e.store.unpin(m[1].str());
+            if (m[2].str() == "/pin") e.store.pin(m[1].str(), owner); else e.store.unpin(m[1].str(), owner);
             return ok(200, { { "ok", true } });
         }
         if (path == "/v1/neuralese/grad") return fail(501, "neuralese-grad-unavailable", "gradient sessions are served by the reference server");
@@ -1769,7 +1824,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
         if (path == "/v1/neuralese/collect") {
             std::set<std::string> referenced;
             if (body.is_object() && body.contains("referenced")) for (const auto & id : body["referenced"]) referenced.insert(id.get<std::string>());
-            return ok(200, { { "removed", e.store.collect(referenced) } });
+            return nz_response { 200, json({ { "removed", e.store.collect(referenced, owner) } }).dump(), "application/json" };
         }
         if (body.is_discarded() || !body.is_object()) return fail(400, "bad-json", "request body is not a JSON object");
         if (path == "/v1/chat/completions") {
