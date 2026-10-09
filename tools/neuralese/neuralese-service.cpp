@@ -853,7 +853,7 @@ struct engine {
     std::atomic<uint64_t> next_id { 0 };
     std::vector<std::string> escaped; // control-token text that must stay text inside content
 
-    int decode_tokens(const std::vector<llama_token> & tokens, llama_pos pos, bool logits_last) {
+    int decode_tokens(const std::vector<llama_token> & tokens, llama_pos pos, bool logits_last, llama_seq_id seq = 0) {
         for (size_t off = 0; off < tokens.size(); off += (size_t) n_batch) {
             const int32_t n = (int32_t) std::min<size_t>(n_batch, tokens.size() - off);
             llama_batch batch = llama_batch_init(n, 0, 1);
@@ -862,7 +862,7 @@ struct engine {
                 batch.token[i] = tokens[off + i];
                 batch.pos[i] = pos + (llama_pos) (off + i);
                 batch.n_seq_id[i] = 1;
-                batch.seq_id[i][0] = 0;
+                batch.seq_id[i][0] = seq;
                 batch.logits[i] = logits_last && off + i + 1 == tokens.size();
             }
             const int status = llama_decode(ctx, batch);
@@ -1032,6 +1032,44 @@ struct engine {
     // end-of-message marker.
     json decide(const json & body) {
         std::lock_guard<std::mutex> lock(mutex);
+        prompt_cache.valid = false;
+        return decide_locked(body, false);
+    }
+
+    // Batched decision readout (POST /v1/natlang/score and /v1/neuralese/decide_many, natlang
+    // plans/BATCHED_EXECUTION.md): {items: [{messages, continuations|options, tools?, adapters?}]} ->
+    // {results: [{log_probs, tokens} | {error}]}. Each result equals decide on that item alone; consecutive items
+    // with the same rendered prompt and adapters share one prefill (sequence 0 keeps the bare prompt; an item's
+    // shared reply head runs in sequence 2). An item that fails returns {error} and fails alone.
+    json decide_many(const json & body) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!body.contains("items") || !body["items"].is_array()) throw request_error("neuralese-decision", "items must be a list");
+        json results = json::array();
+        prompt_cache.valid = false;
+        for (const auto & item : body["items"]) {
+            try {
+                if (!item.is_object()) throw request_error("neuralese-decision", "an item is an object");
+                json request = item;
+                if (!request.contains("options") && request.contains("continuations")) request["options"] = request["continuations"];
+                if (!request.contains("adapters") && body.contains("adapters")) request["adapters"] = body["adapters"];
+                results.push_back(decide_locked(request, true));
+            } catch (const std::exception & error) {
+                prompt_cache.valid = false;
+                results.push_back({ { "error", std::string(error.what()).substr(0, 500) } });
+            }
+        }
+        prompt_cache.valid = false;
+        return { { "results", results } };
+    }
+
+    struct {
+        bool valid = false;
+        std::string key;
+        llama_pos pos = 0;
+        std::vector<float> last;
+    } prompt_cache;
+
+    json decide_locked(const json & body, bool reuse_prompt) {
         bind_adapters(body, "adapters");
         const json messages = body.value("messages", json::array());
         const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
@@ -1066,16 +1104,35 @@ struct engine {
                 ++shared;
             }
         }
-        llama_pos pos = prefill(prompt);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-        std::vector<float> last(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
-        if (shared) {
-            std::vector<llama_token> head(rests[0].begin(), rests[0].begin() + (long) shared);
-            if (decode_tokens(head, pos, true) != 0) throw request_error("decode-failed", "decision prefix", 500);
-            pos += (llama_pos) shared;
+        std::string key = body.contains("adapters") ? body["adapters"].dump() : std::string("null");
+        key += '\x1f' + prompt_text;
+        for (const auto & id : prompt.blocks) key += '\x1f' + id;
+        llama_pos pos;
+        std::vector<float> last;
+        if (reuse_prompt && prompt_cache.valid && prompt_cache.key == key) {
+            pos = prompt_cache.pos;
+            last = prompt_cache.last;
+        } else {
+            prompt_cache.valid = false;
+            pos = prefill(prompt);
             last.assign(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
+            prompt_cache.key = key;
+            prompt_cache.pos = pos;
+            prompt_cache.last = last;
+            prompt_cache.valid = reuse_prompt;
         }
         llama_memory_t mem = llama_get_memory(ctx);
+        llama_seq_id source = 0;  // the bare prompt stays in sequence 0 for the next item
+        llama_memory_seq_rm(mem, 2, -1, -1);
+        if (shared) {
+            llama_memory_seq_cp(mem, 0, 2, -1, -1);
+            std::vector<llama_token> head(rests[0].begin(), rests[0].begin() + (long) shared);
+            if (decode_tokens(head, pos, true, 2) != 0) throw request_error("decode-failed", "decision prefix", 500);
+            pos += (llama_pos) shared;
+            last.assign(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
+            source = 2;
+        }
         json log_probs = json::array(), counts = json::array();
         for (const auto & r : rests) {
             const std::vector<llama_token> own(r.begin() + (long) shared, r.end());
@@ -1084,7 +1141,7 @@ struct engine {
                 total += token_logprob(last.data(), own[0]);
                 if (own.size() > 1) {
                     llama_memory_seq_rm(mem, 1, -1, -1);
-                    llama_memory_seq_cp(mem, 0, 1, -1, -1);
+                    llama_memory_seq_cp(mem, source, 1, -1, -1);
                     llama_batch batch = llama_batch_init((int32_t) own.size(), 0, 1);
                     batch.n_tokens = (int32_t) own.size() - 1;
                     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -1104,6 +1161,7 @@ struct engine {
             log_probs.push_back(total);
             counts.push_back(own.size());
         }
+        llama_memory_seq_rm(mem, 2, -1, -1);
         return { { "log_probs", log_probs }, { "tokens", counts } };
     }
 
@@ -1719,6 +1777,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             return ok(200, e.generate(body));
         }
         if (path == "/v1/neuralese/decide") return ok(200, e.decide(body));
+        if (path == "/v1/natlang/score" || path == "/v1/neuralese/decide_many") return ok(200, e.decide_many(body));
         if (path == "/v1/neuralese/encode") return ok(201, e.encode(body));
         if (path == "/v1/neuralese/write") return ok(201, e.write(body));
         if (path == "/v1/neuralese/digest") return ok(201, e.digest(body));
