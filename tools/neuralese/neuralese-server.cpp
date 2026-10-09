@@ -16,7 +16,8 @@
 //   POST /v1/neuralese/render          the rendered prompt of {"messages", "tools"?} (blocks as "<block>"), for conformance
 //   POST /v1/neuralese/encode          text into a block in one forward pass through the port: {"text", "type"?, "context"?}
 //   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
-//   POST /v1/neuralese/digest          the digest operator: {"name", "type", "value", "instructions", "system"?, "window"?}
+//   POST /v1/neuralese/view            the builtin view's Neuralese instance: {"value", "instructions"?, "system"?, "window"?};
+//                                      every write the template write of view's body
 //   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),

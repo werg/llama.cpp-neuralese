@@ -20,7 +20,8 @@
 //   POST /v1/neuralese/render          the rendered prompt of {"messages", "tools"?} (blocks as "<block>"), for conformance
 //   POST /v1/neuralese/encode          text into a block in one forward pass through the port: {"text", "type"?, "context"?}
 //   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
-//   POST /v1/neuralese/digest          the digest operator: {"name", "type", "value", "instructions", "system"?, "window"?}
+//   POST /v1/neuralese/view            the builtin view's Neuralese instance: {"value", "instructions"?, "system"?, "window"?};
+//                                      every write the template write of view's body
 //   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
@@ -76,10 +77,13 @@ namespace {
 // errors
 //
 
-// The digest operator's write site (natlang training/neuralese digest.py; pinned by tests/fixtures/digest-site.json).
-const char * DIGEST_INSTRUCTIONS = "Write a digest of the value below for the listing of the call that receives it: what the value is, how it is organised, and what in it bears on the call's instructions, so that the call knows what to look up. The full value stays in the call's variable for exact reading, so do not copy exact details; keep the digest short.";
-const char * DIGEST_PREFIX = "const digest: Neuralese<Digest> = ";
-const int32_t DIGEST_SITE_MARGIN = 512;
+// The write site of the builtin view's Neuralese instance (natlang training/neuralese view.py; pinned by
+// tests/fixtures/view-site.json): view's body as the system text, and the reply forced by template readout to
+// return_result with the value written (VIEW_TEMPLATE, offered as VIEW_TOOLS).
+const char * VIEW_INSTRUCTIONS = "Write a view of value: a shorter form of it that a reader uses in its place.\n\nWithout instructions, the view is faithful: keep everything needed to reproduce value exactly, its content, its structure and its exact details (names, numbers, identifiers, code), and drop only what repeats or can be restated more briefly without loss.\n\nWith instructions, they say what the view is for: keep what that purpose needs, including how value is organised and where in it the rest can be found, and leave out what the purpose does not need.";
+const char * VIEW_TOOLS = R"json([{"type":"function","function":{"name":"return_result","description":"Finish the call: value is the result.","parameters":{"type":"object","properties":{"status":{"type":"string","enum":["success"]},"value":{"type":"string"}},"required":["status","value"]}}}])json";
+const char * VIEW_TEMPLATE = R"json({"call":"return_result","arguments":{"status":"success"},"argument":"value","value":"write"})json";
+const int32_t VIEW_SITE_MARGIN = 1024;
 
 struct request_error : std::runtime_error {
     std::string code;
@@ -1659,47 +1663,52 @@ struct engine {
         return blocks[0];
     }
 
-    // Digest (POST /v1/neuralese/digest): the digest operator's plan, as the reference's digest.py (DECISIONS.md 43).
-    // A value that fits one write site's window is digested there; a longer one is split into token chunks, each
-    // digested at a part site, and a combine site reads the part digests and writes the final one.
-    json digest(const json & body) {
-        const std::string name = body.value("name", "").empty() ? "value" : body.value("name", "");
-        const std::string type = body.value("type", "").empty() ? "unknown" : body.value("type", "");
-        const std::string value = body.value("value", ""), instructions = body.value("instructions", "");
+    // View (POST /v1/neuralese/view): the builtin view's Neuralese instance by its plan, as the reference's view.py
+    // (DECISIONS.md 2026-10-09). Every write is the template write of view's body at its site: the reply forced to
+    // return_result with the value written. A value that fits one write site's window is viewed there; a longer one is
+    // split into token chunks, each viewed at a part site, and a combine site reads the part views and writes the final
+    // one. Without instructions the view is faithful.
+    json view(const json & body) {
+        const std::string value = body.value("value", "");
+        const std::string instructions = body.contains("instructions") && body["instructions"].is_string() ? body["instructions"].get<std::string>() : "";
         const json system = body.contains("system") && !body["system"].is_null()
-            && !(body["system"].is_string() && body["system"].get<std::string>().empty()) ? body["system"] : json(DIGEST_INSTRUCTIONS);
+            && !(body["system"].is_string() && body["system"].get<std::string>().empty()) ? body["system"] : json(VIEW_INSTRUCTIONS);
         // window: the model's context (as served: the smaller of its training context and this server's -c) less the
-        // site's own text, the block and a margin
+        // site's own text, the tool, the forced reply, the block and a margin
         const int32_t context = std::min<int32_t>(llama_model_n_ctx_train(model), (int32_t) llama_n_ctx(ctx));
-        const int32_t overhead = (int32_t) common_tokenize(vocab, instructions, false, true).size() + max_block + DIGEST_SITE_MARGIN;
+        const int32_t overhead = (int32_t) common_tokenize(vocab, instructions, false, true).size() + max_block + VIEW_SITE_MARGIN;
         int32_t window = std::max(256, context - overhead);
         if (body.contains("window") && body["window"].is_number_integer() && body["window"].get<int32_t>() > 0) {
             window = std::min(window, body["window"].get<int32_t>());
         }
-        const std::string about = "The call that receives the value has these instructions:\n" + instructions + "\n\n";
+        const std::string purpose = instructions.empty() ? "" : "instructions:\n" + instructions + "\n\n";
         auto site = [&](const json & content) {
             return json::array({ { { "role", "system" }, { "content", system } }, { { "role", "user" }, { "content", content } } });
         };
+        static const json tools = json::parse(VIEW_TOOLS), templ = json::parse(VIEW_TEMPLATE);
         auto write_at = [&](const json & messages) {
-            return write({ { "messages", messages }, { "prefix", DIGEST_PREFIX } })["id"].get<std::string>();
+            const json request = { { "messages", messages }, { "tools", tools }, { "neuralese_template", templ },
+                                   { "max_tokens", max_block + 64 } };
+            const json blocks = generate(request)["neuralese"]["blocks"];
+            if (blocks.empty()) throw request_error("neuralese-view", "a view write produced no block", 500);
+            return blocks[0]["id"].get<std::string>();
         };
         const std::vector<llama_token> ids = common_tokenize(vocab, value, false, true);
         std::string id;
         size_t parts = 1;
         if ((int32_t) ids.size() <= window) {
-            id = write_at(site(about + "The value of " + name + " (" + type + "):\n" + value));
+            id = write_at(site(purpose + "value:\n" + value));
         } else {
             std::vector<std::string> blocks;
             const size_t count = (ids.size() + (size_t) window - 1) / (size_t) window;
             for (size_t i = 0; i < count; ++i) {
                 const std::vector<llama_token> chunk(ids.begin() + (long) (i * window),
                                                      ids.begin() + (long) std::min(ids.size(), (i + 1) * (size_t) window));
-                blocks.push_back(write_at(site(about + "Part " + std::to_string(i + 1) + " of " + std::to_string(count)
-                                               + " of the value of " + name + " (" + type + "):\n"
-                                               + common_detokenize(vocab, chunk, true))));
+                blocks.push_back(write_at(site(purpose + "value, part " + std::to_string(i + 1) + " of " + std::to_string(count)
+                                               + ":\n" + common_detokenize(vocab, chunk, true))));
             }
-            json content = json::array({ { { "type", "text" }, { "text", about + "Digests of the " + std::to_string(count)
-                                                                    + " parts of the value of " + name + " (" + type + "), in order:\n" } } });
+            json content = json::array({ { { "type", "text" }, { "text", purpose + "Views of the " + std::to_string(count)
+                                                                    + " parts of value, in order:\n" } } });
             for (size_t i = 0; i < blocks.size(); ++i) {
                 content.push_back({ { "type", "text" }, { "text", "Part " + std::to_string(i + 1) + ": " } });
                 content.push_back({ { "type", "neuralese" }, { "id", blocks[i] } });
@@ -1718,8 +1727,8 @@ struct engine {
 
 // The capabilities this server serves (spec/NEURALESE_PORT.md "Capabilities"); the reference server reports its own.
 json capabilities() {
-    return json::array({ "adapters.lora-load", "chat", "decide", "digest", "encode", "guidance.check", "render", "score",
-                         "store", "store.owners", "template", "write" });
+    return json::array({ "adapters.lora-load", "chat", "decide", "encode", "guidance.check", "render", "score",
+                         "store", "store.owners", "template", "view", "write" });
 }
 
 // `neuralese-<capability with dots as dashes>-unavailable`.
@@ -1895,7 +1904,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
         if (path == "/v1/natlang/score" || path == "/v1/neuralese/decide_many") return ok(200, e.decide_many(body));
         if (path == "/v1/neuralese/encode") return ok(201, e.encode(body));
         if (path == "/v1/neuralese/write") return ok(201, e.write(body));
-        if (path == "/v1/neuralese/digest") return ok(201, e.digest(body));
+        if (path == "/v1/neuralese/view") return ok(201, e.view(body));
         if (path == "/v1/neuralese/render") {
             const rendered r = e.render(body.value("messages", json::array()), body.contains("tools") ? body["tools"] : json(nullptr));
             std::string prompt;
