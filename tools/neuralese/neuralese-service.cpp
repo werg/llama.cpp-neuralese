@@ -856,7 +856,7 @@ struct engine {
         if (key && body.contains(key) && body[key].is_array()) {
             for (const auto & entry : body[key]) {
                 if (!entry.is_object() || !entry.contains("id") || !entry["id"].is_string())
-                    throw request_error("neuralese-adapters-unavailable",
+                    throw request_error("neuralese-adapters-projection-unavailable",
                                         "adapters decoded through a projection are served by the reference server", 501);
                 const std::string id = entry["id"].get<std::string>();
                 const auto found = loras.find(id);
@@ -922,7 +922,20 @@ struct engine {
         return b;
     }
 
+    // A neuralese part typed `value_type: "unknown"` renders unquoted on the reference server; this server cannot,
+    // so it refuses rather than render it as a string.
+    static void refuse_unknown_parts(const json & v) {
+        if (v.is_object()) {
+            if (v.value("type", "") == "neuralese" && v.value("value_type", "string") != "string")
+                throw request_error("neuralese-parts-value-type-unavailable", "parts with value_type \"unknown\" are served by the reference server", 501);
+            for (const auto & item : v) refuse_unknown_parts(item);
+        } else if (v.is_array()) {
+            for (const auto & item : v) refuse_unknown_parts(item);
+        }
+    }
+
     rendered render(const json & messages, const json & tools, bool add_generation_prompt = true) {
+        refuse_unknown_parts(messages);
         renderer r(escaped);
         std::vector<std::string> blocks;
         json plain = json::array();
@@ -1078,18 +1091,35 @@ struct engine {
     json decide_many(const json & body) {
         std::lock_guard<std::mutex> lock(mutex);
         if (!body.contains("items") || !body["items"].is_array()) throw request_error("neuralese-decision", "items must be a list");
+        const json & items = body["items"];
         json results = json::array();
+        for (size_t i = 0; i < items.size(); ++i) results.push_back(nullptr);
+        // Items run grouped by (adapters, messages, tools), as the reference server sorts them, so every item with the
+        // same prompt shares one prefill wherever it sits in the request; results keep the request's order.
+        std::vector<std::pair<std::string, size_t>> order;
+        for (size_t i = 0; i < items.size(); ++i) {
+            const json & item = items[i];
+            std::string key;
+            if (item.is_object()) {
+                const json adapters = item.contains("adapters") ? item["adapters"] : (body.contains("adapters") ? body["adapters"] : json(nullptr));
+                key = adapters.dump() + '\x1f' + item.value("messages", json::array()).dump() + '\x1f' +
+                      (item.contains("tools") ? item["tools"].dump() : std::string("null"));
+            }
+            order.emplace_back(key, i);
+        }
+        std::stable_sort(order.begin(), order.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
         prompt_cache.valid = false;
-        for (const auto & item : body["items"]) {
+        for (const auto & entry : order) {
+            const json & item = items[entry.second];
             try {
                 if (!item.is_object()) throw request_error("neuralese-decision", "an item is an object");
                 json request = item;
                 if (!request.contains("options") && request.contains("continuations")) request["options"] = request["continuations"];
                 if (!request.contains("adapters") && body.contains("adapters")) request["adapters"] = body["adapters"];
-                results.push_back(decide_locked(request, true));
+                results[entry.second] = decide_locked(request, true);
             } catch (const std::exception & error) {
                 prompt_cache.valid = false;
-                results.push_back({ { "error", std::string(error.what()).substr(0, 500) } });
+                results[entry.second] = { { "error", std::string(error.what()).substr(0, 500) } };
             }
         }
         prompt_cache.valid = false;
@@ -1248,6 +1278,10 @@ struct engine {
         bool free_after = false;
         if (!forced && body.contains("neuralese_template") && body["neuralese_template"].is_object()) {
             const json & t = body["neuralese_template"];
+            if (t.contains("value_type") && t["value_type"] != "string")
+                throw request_error("neuralese-template-value-type-unavailable", "value_type other than \"string\" is served by the reference server", 501);
+            if (t.contains("argument_path") && !t["argument_path"].is_null())
+                throw request_error("neuralese-template-argument-path-unavailable", "argument_path is served by the reference server", 501);
             const std::string mode = t.value("value", "");
             if (!t.contains("call") || !t["call"].is_string() || (mode != "write" && mode != "decode")) {
                 throw request_error("neuralese-template", "a template needs a call name and value 'write' or 'decode'");
@@ -1682,6 +1716,19 @@ struct engine {
 };
 
 
+// The capabilities this server serves (spec/NEURALESE_PORT.md "Capabilities"); the reference server reports its own.
+json capabilities() {
+    return json::array({ "adapters.lora-load", "chat", "decide", "digest", "encode", "guidance.check", "render", "score",
+                         "store", "store.owners", "template", "write" });
+}
+
+// `neuralese-<capability with dots as dashes>-unavailable`.
+std::string unavailable_code(const std::string & capability) {
+    std::string code = capability;
+    std::replace(code.begin(), code.end(), '.', '-');
+    return "neuralese-" + code + "-unavailable";
+}
+
 json error_body(const std::string & code, const std::string & detail) {
     return { { "error", { { "code", code }, { "message", detail } } } };
 }
@@ -1781,6 +1828,10 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
         return nz_response { status, v.dump(), "application/json" };
     };
     auto fail = [&](int status, const std::string & code, const std::string & detail) { return ok(status, error_body(code, detail)); };
+    // A capability this server does not serve (spec/NEURALESE_PORT.md "Capabilities"): 501 with its code, never 404.
+    auto unavailable = [&](const std::string & capability) {
+        return fail(501, unavailable_code(capability), capability + " is not served by this server (see capabilities in /v1/neuralese/info)");
+    };
     try {
         if (method == "GET") {
             if (path == "/health" || path == "/v1/health") return ok(200, { { "status", "ok" } });
@@ -1790,7 +1841,8 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             if (path == "/v1/neuralese/info") {
                 return ok(200, { { "dialects", json::array({ e.dialect }) }, { "width", e.width }, { "dtype", "f32" },
                                  { "max_block_length", e.max_block }, { "grad", false }, { "adapters", "lora" }, { "cutoff", nz_heads_cutoff(e.heads) },
-                                 { "server", "llama.cpp" }, { "store", { { "owners", true }, { "persistent", false } } } });
+                                 { "server", "llama.cpp" }, { "store", { { "owners", true }, { "persistent", false } } },
+                                 { "capabilities", capabilities() } });
             }
             std::smatch m;
             if (path.rfind("/v1/neuralese/blocks/", 0) == 0) {
@@ -1801,6 +1853,8 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
                 if (!owner.empty()) e.store.hold(owner, { b.id });
                 return nz_response { 200, encode_block(b), "application/octet-stream" };
             }
+            static const std::regex lora_get(R"(^/v1/neuralese/adapters/(nz1_[a-z2-7]+)/lora$)");
+            if (std::regex_match(path, m, lora_get)) return unavailable("adapters.lora-export");
             return fail(404, "not-found", path);
         }
         if (method == "PUT") {
@@ -1819,8 +1873,14 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             if (m[2].str() == "/pin") e.store.pin(m[1].str(), owner); else e.store.unpin(m[1].str(), owner);
             return ok(200, { { "ok", true } });
         }
-        if (path == "/v1/neuralese/grad") return fail(501, "neuralese-grad-unavailable", "gradient sessions are served by the reference server");
+        if (path == "/v1/neuralese/grad") return unavailable("grad");
+        if (path == "/v1/neuralese/optim") return unavailable("optim");
+        if (path == "/v1/neuralese/embed") return unavailable("embed");
+        if (path == "/v1/neuralese/adapters") return unavailable("adapters.create");
         json body = json::parse(body_text.empty() ? "{}" : body_text, nullptr, false);
+        // A malformed body is refused before anything acts on it: a collect that read it as "nothing referenced"
+        // would drop every unpinned block.
+        if (body.is_discarded() || !body.is_object()) return fail(400, "bad-json", "request body is not a JSON object");
         if (path == "/v1/neuralese/collect") {
             std::set<std::string> referenced;
             if (body.is_object() && body.contains("referenced")) for (const auto & id : body["referenced"]) referenced.insert(id.get<std::string>());
@@ -1828,7 +1888,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
         }
         if (body.is_discarded() || !body.is_object()) return fail(400, "bad-json", "request body is not a JSON object");
         if (path == "/v1/chat/completions") {
-            if (body.value("stream", false)) return fail(400, "stream-unsupported", "streaming is not supported");
+            if (body.value("stream", false)) return unavailable("chat.stream");
             return ok(200, e.generate(body));
         }
         if (path == "/v1/neuralese/decide") return ok(200, e.decide(body));

@@ -82,6 +82,10 @@ int main(int argc, char ** argv) {
     server.Get(".*", handler("GET"));
     server.Put(".*", handler("PUT"));
     server.Post(".*", handler("POST"));
+    // Every other method reaches the service too, which answers 405 in the shared error envelope.
+    server.Delete(".*", handler("DELETE"));
+    server.Patch(".*", handler("PATCH"));
+    server.Options(".*", handler("OPTIONS"));
 
     int bound = port;
     if (port == 0) {
