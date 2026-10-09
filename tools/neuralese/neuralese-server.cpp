@@ -6,7 +6,7 @@
 //   POST /v1/chat/completions          chat completion; message content and tool-call arguments may be
 //                                      arrays of {"type":"text","text":...} and {"type":"neuralese","id":...}
 //   GET  /health, /v1/health, /v1/models
-//   GET  /v1/neuralese/info            dialect, width, maximum block length, cutoff
+//   GET  /v1/neuralese/info            dialect, width, maximum block length, cutoff, capabilities
 //   PUT  /v1/neuralese/blocks/{id}     store a block (one-tensor safetensors body); the ID is checked
 //   GET  /v1/neuralese/blocks/{id}     fetch a block; .../meta for its metadata
 //   POST /v1/neuralese/blocks/{id}/pin, .../unpin   pins count per owner (x-natlang-owner)
@@ -18,7 +18,11 @@
 //   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
 //   POST /v1/neuralese/view            the builtin view's Neuralese instance: {"value", "instructions"?, "system"?, "window"?};
 //                                      every write the template write of view's body
-//   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
+//   POST /v1/neuralese/embed           a block initialised from text token embeddings: {"text", "type"?}
+//   POST /v1/neuralese/grad, optim, adapters; GET /v1/neuralese/adapters/{id}/lora
+//                                      501 neuralese-<capability>-unavailable: served by the reference server
+//
+// `"stream": true` on chat completions answers server-sent chat.completion.chunk events (the reference's format).
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
 // guidance (guidance.h: envelope and eval-code line checks with rollback; x_natlang_guidance.rejections in the reply),
@@ -75,7 +79,23 @@ int main(int argc, char ** argv) {
     httplib::Server server;
     auto handler = [service](const char * method) {
         return [service, method](const httplib::Request & req, httplib::Response & res) {
-            const nz_response r = nz_service_handle(service, method, req.path, req.body, req.get_header_value("x-natlang-owner"));
+            const std::string owner = req.get_header_value("x-natlang-owner");
+            if (nz_service_streams(method, req.path, req.body)) {
+                // Server-sent events, sent as the service produces them (chunked transfer).
+                res.status = 200;
+                res.set_header("cache-control", "no-cache");
+                const std::string path = req.path, body = req.body;
+                res.set_chunked_content_provider("text/event-stream", [service, method, path, body, owner](size_t, httplib::DataSink & sink) {
+                    nz_service_handle(service, method, path, body, owner, [&sink](const std::string & data) {
+                        const std::string event = "data: " + data + "\n\n";
+                        sink.write(event.data(), event.size()); // a client that left: the request still completes
+                    });
+                    sink.done();
+                    return true;
+                });
+                return;
+            }
+            const nz_response r = nz_service_handle(service, method, req.path, req.body, owner);
             res.status = r.status;
             res.set_content(r.body, r.content_type);
         };
@@ -83,10 +103,15 @@ int main(int argc, char ** argv) {
     server.Get(".*", handler("GET"));
     server.Put(".*", handler("PUT"));
     server.Post(".*", handler("POST"));
-    // Every other method reaches the service too, which answers 405 in the shared error envelope.
-    server.Delete(".*", handler("DELETE"));
-    server.Patch(".*", handler("PATCH"));
-    server.Options(".*", handler("OPTIONS"));
+    // Every other method (HEAD, DELETE, PATCH, OPTIONS, …) reaches the service, which answers 405 in the shared error
+    // envelope; httplib would otherwise answer HEAD from the GET route.
+    server.set_pre_routing_handler([service](const httplib::Request & req, httplib::Response & res) {
+        if (req.method == "GET" || req.method == "PUT" || req.method == "POST") return httplib::Server::HandlerResponse::Unhandled;
+        const nz_response r = nz_service_handle(service, req.method, req.path, req.body, req.get_header_value("x-natlang-owner"));
+        res.status = r.status;
+        res.set_content(r.body, r.content_type);
+        return httplib::Server::HandlerResponse::Handled;
+    });
 
     int bound = port;
     if (port == 0) {

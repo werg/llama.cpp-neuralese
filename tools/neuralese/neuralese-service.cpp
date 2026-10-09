@@ -10,7 +10,7 @@
 //   POST /v1/chat/completions          chat completion; message content and tool-call arguments may be
 //                                      arrays of {"type":"text","text":...} and {"type":"neuralese","id":...}
 //   GET  /health, /v1/health, /v1/models
-//   GET  /v1/neuralese/info            dialect, width, maximum block length, cutoff
+//   GET  /v1/neuralese/info            dialect, width, maximum block length, cutoff, capabilities
 //   PUT  /v1/neuralese/blocks/{id}     store a block (one-tensor safetensors body); the ID is checked
 //   GET  /v1/neuralese/blocks/{id}     fetch a block; .../meta for its metadata
 //   POST /v1/neuralese/blocks/{id}/pin, .../unpin   pins count per owner (x-natlang-owner)
@@ -22,13 +22,18 @@
 //   POST /v1/neuralese/write           the write procedure at a write site: {"messages", "prefix"?, "tools"?}
 //   POST /v1/neuralese/view            the builtin view's Neuralese instance: {"value", "instructions"?, "system"?, "window"?};
 //                                      every write the template write of view's body
-//   POST /v1/neuralese/grad            501: gradient sessions live in the reference server
+//   POST /v1/neuralese/embed           a block initialised from text token embeddings: {"text", "type"?}
+//   POST /v1/neuralese/grad, optim, adapters; GET /v1/neuralese/adapters/{id}/lora
+//                                      501 neuralese-<capability>-unavailable: served by the reference server
+//
+// `"stream": true` on chat completions answers server-sent chat.completion.chunk events (the reference's format).
 //
 // Request fields beyond OpenAI's: neuralese_temperature (0, the default, delivers the payload mean),
 // guidance (guidance.h: envelope and eval-code line checks with rollback; x_natlang_guidance.rejections in the reply),
 // neuralese_max_length (capped by --max-block), neuralese_length (an optional size hint: exactly that many vectors, no
 // stop decision) and neuralese_passes (with a hint, block-wise in that many parallel passes), neuralese_template (template readout: the reply forced to a call cut at
-// its value, {"call", "arguments"?, "argument"?, "value": "write" | "decode"}), and the test hook x_natlang_forced (a plan of text
+// its value, {"call", "arguments"?, "argument"?, "argument_path"?, "value": "write" | "decode", "value_type"?}; value_type
+// "unknown" writes the value unquoted, typed Neuralese<unknown>), and the test hook x_natlang_forced (a plan of text
 // strings and {"neuralese": "write"} items that replaces sampling).
 //
 // Blocks are rendered as <open> + one embedding position per vector + <close>. Literal occurrences of
@@ -430,7 +435,9 @@ struct rendered {
 
 class renderer {
 public:
-    renderer(const std::vector<std::string> & escaped) : escaped_(escaped) {
+    // `block_type(id)`: the stored block's type, so a block typed Neuralese<unknown> defaults to value_type "unknown"
+    renderer(const std::vector<std::string> & escaped, std::function<std::string(const std::string &)> block_type = nullptr)
+        : escaped_(escaped), block_type_(std::move(block_type)) {
         escaped_.insert(escaped_.end(), { PH_OPEN, PH_CLOSE, ES_OPEN, ES_CLOSE });
         std::stable_sort(escaped_.begin(), escaped_.end(), [](const std::string & a, const std::string & b) {
             return a.size() > b.size();
@@ -441,16 +448,54 @@ public:
         std::string out;
         for (const auto & part : parts) {
             if (part["type"] == "text") {
-                out += escape(part.value("text", ""));
+                out += escape(part.contains("text") && part["text"].is_string() ? part["text"].get<std::string>() : "");
             } else {
                 if (!part.contains("id") || !part["id"].is_string() || part["id"].get<std::string>().rfind("nz1_", 0) != 0) {
                     throw request_error("neuralese-bad-part", "invalid block part " + part.dump());
                 }
+                const std::string id = part["id"].get<std::string>();
+                // A part's value_type, else the stored block's: "unknown" renders unquoted as a whole argument value
+                std::string value_type = part.contains("value_type") && part["value_type"].is_string()
+                    ? part["value_type"].get<std::string>() : "";
+                if (value_type.empty() && block_type_ && block_type_(id) == "Neuralese<unknown>") value_type = "unknown";
                 out += placeholder(blocks.size());
-                blocks.push_back(part["id"].get<std::string>());
+                value_types_.push_back(value_type);
+                blocks.push_back(id);
             }
         }
         return out;
+    }
+
+    // A tool-call argument value that is exactly one block typed "unknown": it renders unquoted, in native value
+    // syntax (the reference's render_messages `native_values`).
+    void note_native(const std::string & value) {
+        if (value.size() <= PH_OPEN.size() + PH_CLOSE.size() || value.compare(0, PH_OPEN.size(), PH_OPEN) != 0 ||
+            value.compare(value.size() - PH_CLOSE.size(), PH_CLOSE.size(), PH_CLOSE) != 0) return;
+        const std::string number = value.substr(PH_OPEN.size(), value.size() - PH_OPEN.size() - PH_CLOSE.size());
+        if (number.empty() || number.size() > 9 || number.find_first_not_of("0123456789") != std::string::npos) return;
+        const size_t index = (size_t) std::stoull(number);
+        if (index < value_types_.size() && value_types_[index] == "unknown") native_.insert(value);
+    }
+
+    // Every string in a JSON value that is exactly a native block marker.
+    void note_native_strings(const json & v) {
+        if (v.is_string()) note_native(v.get<std::string>());
+        else if (v.is_structured()) for (const auto & item : v) note_native_strings(item);
+    }
+
+    // The rendered template text with each native block's quotes removed (`"m"` or `'m'` becomes `m`).
+    std::string unquote_native(std::string text) const {
+        for (const auto & marker : native_) {
+            for (const char quote : { '"', '\'' }) {
+                const std::string quoted = std::string(1, quote) + marker + std::string(1, quote);
+                size_t at = 0;
+                while ((at = text.find(quoted, at)) != std::string::npos) {
+                    text.replace(at, quoted.size(), marker);
+                    at += marker.size();
+                }
+            }
+        }
+        return text;
     }
 
     // control-token text inside content becomes an escape placeholder
@@ -481,7 +526,11 @@ public:
         std::function<json(const json &)> walk = [&](const json & x) -> json {
             if (is_parts(x)) {
                 for (const auto & part : x) {
-                    if (part["type"] == "neuralese") return flatten(x, blocks);
+                    if (part["type"] == "neuralese") {
+                        const std::string value = flatten(x, blocks);
+                        note_native(value);
+                        return value;
+                    }
                 }
             }
             if (x.is_string()) return escape(x.get<std::string>());
@@ -499,6 +548,9 @@ public:
 
 private:
     std::vector<std::string> escaped_;
+    std::function<std::string(const std::string &)> block_type_;
+    std::vector<std::string> value_types_;  // per block, in order: "unknown", "string" or "" (unset)
+    std::set<std::string> native_;
 };
 
 // split rendered template text at placeholders
@@ -742,19 +794,30 @@ private:
     }
 };
 
+// A string with block placeholders -> a part array; a string without them stays a string. Placeholder-like text that
+// names no written block (private-use characters the model wrote) stays text, as in the reference's chat._to_parts.
 json to_parts(const std::string & text, const std::vector<std::string> & ids) {
-    if (text.find(PH_OPEN) == std::string::npos) {
-        return text;
+    std::vector<std::pair<size_t, size_t>> found; // (start, end) of placeholders that name a written block
+    std::vector<size_t> indices;
+    bool any = false;
+    for (size_t pos = text.find(PH_OPEN); pos != std::string::npos; pos = text.find(PH_OPEN, pos + PH_OPEN.size())) {
+        const size_t start = pos + PH_OPEN.size();
+        size_t end = start;
+        while (end < text.size() && isdigit((unsigned char) text[end])) ++end;
+        if (end == start || text.compare(end, PH_CLOSE.size(), PH_CLOSE) != 0) continue;
+        any = true;
+        const std::string number = text.substr(start, end - start);
+        if (number.size() > 9 || (size_t) std::stoul(number) >= ids.size()) continue;
+        found.push_back({ pos, end + PH_CLOSE.size() });
+        indices.push_back((size_t) std::stoul(number));
     }
+    if (!any) return text;
     json parts = json::array();
-    size_t pos = 0, last = 0;
-    while ((pos = text.find(PH_OPEN, last)) != std::string::npos) {
-        const size_t end = text.find(PH_CLOSE, pos);
-        if (end == std::string::npos) break;
-        if (pos > last) parts.push_back({ { "type", "text" }, { "text", text.substr(last, pos - last) } });
-        const size_t index = std::stoul(text.substr(pos + PH_OPEN.size(), end - pos - PH_OPEN.size()));
-        parts.push_back({ { "type", "neuralese" }, { "id", ids.at(index) } });
-        last = end + PH_CLOSE.size();
+    size_t last = 0;
+    for (size_t i = 0; i < found.size(); ++i) {
+        if (found[i].first > last) parts.push_back({ { "type", "text" }, { "text", text.substr(last, found[i].first - last) } });
+        parts.push_back({ { "type", "neuralese" }, { "id", ids[indices[i]] } });
+        last = found[i].second;
     }
     if (last < text.size()) parts.push_back({ { "type", "text" }, { "text", text.substr(last) } });
     return parts;
@@ -774,6 +837,62 @@ std::string strip(const std::string & s) {
     return s.substr(a, b - a);
 }
 
+// A Qwen-family `<tool_call>` body, {"name": …, "arguments": {…}} (arguments may be JSON text) -> [(name, arguments)].
+// Throws on anything else (the reference's chat.parse_json_call).
+std::vector<std::pair<std::string, json>> parse_json_call(const std::string & body) {
+    const json call = json::parse(body);
+    if (!call.is_object() || !call.contains("name") || !call["name"].is_string()) throw std::runtime_error("a tool call names its function");
+    json arguments = call.contains("arguments") ? call["arguments"] : json::object();
+    if (arguments.is_string()) arguments = json::parse(arguments.get<std::string>());
+    if (!arguments.is_object()) throw std::runtime_error("tool call arguments are an object");
+    return { { call["name"].get<std::string>(), arguments } };
+}
+
+std::vector<std::pair<std::string, json>> parse_pythonic_calls(const std::string & body) {
+    return pythonic_parser(body).calls();
+}
+
+// Tool-call markup in model output: `open` body `close`, the body the shortest run up to the next `close`
+// (with `trim`, surrounding whitespace removed: the reference's `<tool_call>\s*(.*?)\s*</tool_call>`).
+struct call_span { size_t start, end; std::string body; };
+
+std::vector<call_span> call_spans(const std::string & text, const std::string & open, const std::string & close, bool trim) {
+    std::vector<call_span> out;
+    size_t last = 0;
+    while (true) {
+        const size_t a = text.find(open, last);
+        const size_t b = a == std::string::npos ? std::string::npos : text.find(close, a + open.size());
+        if (b == std::string::npos) break;
+        const std::string body = text.substr(a + open.size(), b - a - open.size());
+        out.push_back({ a, b + close.size(), trim ? strip(body) : body });
+        last = b + close.size();
+    }
+    return out;
+}
+
+using call_parser = std::vector<std::pair<std::string, json>> (*)(const std::string &);
+
+bool parses(call_parser parse, const std::string & body) {
+    try { parse(body); return true; } catch (const std::exception &) { return false; }
+}
+
+// `text` without the markup spans whose bodies parse; markup that does not parse stays visible (the runtime treats
+// leaked markup as a malformed call).
+std::string without_calls(const std::string & text, const std::string & open, const std::string & close, bool trim, call_parser parse) {
+    std::string out;
+    size_t last = 0;
+    for (const auto & span : call_spans(text, open, close, trim)) {
+        if (!parses(parse, span.body)) continue;
+        out += text.substr(last, span.start - last);
+        last = span.end;
+    }
+    return out + text.substr(last);
+}
+
+// Model output (with block placeholders) -> an assistant message with parts where blocks are (the reference's
+// chat.build_message): thinking in `<think>…</think>`, or everything before a lone `</think>` (thinking templates open
+// the block in the generation prompt); Pythonic calls `<|tool_call_start|>[…]<|tool_call_end|>` (LFM2) and then JSON
+// calls `<tool_call>{…}</tool_call>` (Qwen-family templates: Maple, Mellum), numbered in that order.
 json build_message(std::string text, const std::vector<std::string> & ids, const std::string & prefix) {
     for (const char * marker : { "<|im_end|>", "<|endoftext|>" }) {
         size_t p;
@@ -785,40 +904,42 @@ json build_message(std::string text, const std::vector<std::string> & ids, const
     if (t1 != std::string::npos) {
         reasoning = strip(text.substr(t0 + 7, t1 - t0 - 7));
         text = text.substr(0, t0) + text.substr(t1 + 8);
+    } else if (const size_t close = text.find("</think>"); close != std::string::npos) {
+        reasoning = strip(text.substr(0, close));
+        text = text.substr(close + 8);
     }
+    static const std::string py_open = "<|tool_call_start|>", py_close = "<|tool_call_end|>";
+    static const std::string js_open = "<tool_call>", js_close = "</tool_call>";
+    const struct { const std::string & open, & close; bool trim; call_parser parse; } syntaxes[] = {
+        { py_open, py_close, false, parse_pythonic_calls }, { js_open, js_close, true, parse_json_call } };
     json tool_calls = json::array();
-    std::string content;
-    const std::string open = "<|tool_call_start|>", close = "<|tool_call_end|>";
-    size_t last = 0;
-    while (true) {
-        const size_t a = text.find(open, last);
-        const size_t b = a == std::string::npos ? std::string::npos : text.find(close, a + open.size());
-        if (b == std::string::npos) break;
-        content += text.substr(last, a - last);
-        const std::string body = text.substr(a + open.size(), b - a - open.size());
-        bool parsed = true;
-        std::vector<std::pair<std::string, json>> calls;
-        try {
-            calls = pythonic_parser(body).calls();
-        } catch (const std::exception &) {
-            parsed = false;
-        }
-        if (parsed) {
+    for (const auto & syntax : syntaxes) {
+        for (const auto & span : call_spans(text, syntax.open, syntax.close, syntax.trim)) {
+            std::vector<std::pair<std::string, json>> calls;
+            try { calls = syntax.parse(span.body); } catch (const std::exception &) { continue; }
             for (auto & [name, args] : calls) {
                 tool_calls.push_back({ { "id", prefix + "_" + std::to_string(tool_calls.size()) }, { "type", "function" },
                                        { "function", { { "name", name }, { "arguments", restore(args, ids).dump() } } } });
             }
-        } else {
-            content += text.substr(a, b + close.size() - a); // leaked markup stays visible
         }
-        last = b + close.size();
     }
-    content += text.substr(last);
+    std::string content = text;
+    for (const auto & syntax : syntaxes) content = without_calls(content, syntax.open, syntax.close, syntax.trim, syntax.parse);
     content = strip(content);
     json message = { { "role", "assistant" }, { "content", content.empty() ? json(nullptr) : to_parts(content, ids) } };
     if (!reasoning.empty()) message["reasoning_content"] = reasoning;
     if (!tool_calls.empty()) message["tool_calls"] = tool_calls;
     return message;
+}
+
+// Whether `text` ends on a whole UTF-8 character (not inside a multi-byte sequence).
+bool utf8_complete(const std::string & text) {
+    size_t i = text.size(), back = 0;
+    while (i > 0 && back < 4 && ((unsigned char) text[i - 1] & 0xC0) == 0x80) { --i; ++back; }
+    if (i == 0) return back == 0;
+    const unsigned char lead = (unsigned char) text[i - 1];
+    const size_t need = lead < 0x80 ? 0 : (lead >> 5) == 0x6 ? 1 : (lead >> 4) == 0xE ? 2 : (lead >> 3) == 0x1E ? 3 : back;
+    return back >= need;
 }
 
 uint32_t derive_seed(const std::string & what) {
@@ -921,26 +1042,19 @@ struct engine {
             throw request_error("neuralese-dialect-mismatch", id + " is in " + b.dialect + ", this server speaks " + dialect);
         }
         if (b.width != width) {
-            throw request_error("neuralese-bad-block", id + " has width " + std::to_string(b.width));
+            throw request_error("neuralese-bad-block", id + " has width " + std::to_string(b.width) + ", this server reads " + std::to_string(width));
         }
         return b;
     }
 
-    // A neuralese part typed `value_type: "unknown"` renders unquoted on the reference server; this server cannot,
-    // so it refuses rather than render it as a string.
-    static void refuse_unknown_parts(const json & v) {
-        if (v.is_object()) {
-            if (v.value("type", "") == "neuralese" && v.value("value_type", "string") != "string")
-                throw request_error("neuralese-parts-value-type-unavailable", "parts with value_type \"unknown\" are served by the reference server", 501);
-            for (const auto & item : v) refuse_unknown_parts(item);
-        } else if (v.is_array()) {
-            for (const auto & item : v) refuse_unknown_parts(item);
-        }
+    // The stored type of a block ("" when absent or untyped).
+    std::string block_type(const std::string & id) {
+        block b;
+        return store.get(id, b) ? b.type : std::string();
     }
 
     rendered render(const json & messages, const json & tools, bool add_generation_prompt = true) {
-        refuse_unknown_parts(messages);
-        renderer r(escaped);
+        renderer r(escaped, [this](const std::string & id) { return block_type(id); });
         std::vector<std::string> blocks;
         json plain = json::array();
         for (const auto & m : messages) {
@@ -959,6 +1073,8 @@ struct engine {
                     std::string text;
                     if (is_parts(arguments)) {
                         text = r.flatten(arguments, blocks);
+                        const json parsed = json::parse(text, nullptr, false);
+                        if (!parsed.is_discarded()) r.note_native_strings(parsed);
                     } else if (arguments.is_string()) {
                         text = arguments.get<std::string>();
                         json parsed = text.empty() ? json::object() : json::parse(text, nullptr, false);
@@ -985,7 +1101,7 @@ struct engine {
         inputs.add_generation_prompt = add_generation_prompt;
         inputs.use_jinja = true;
         const common_chat_params params = common_chat_templates_apply(templates.get(), inputs);
-        return split_rendered(params.prompt, blocks, r);
+        return split_rendered(r.unquote_native(params.prompt), blocks, r);
     }
 
     // Prefill a rendered prompt (text, literal text and read blocks) on sequence 0 from position 0, with logits at
@@ -1036,14 +1152,53 @@ struct engine {
         return pos;
     }
 
-    // The model's own rendering of an assistant reply that calls `name` with `arguments` and then `argument`, cut at that
-    // argument's value (the reference's chat.call_reply): with `quoted` the prefix ends with the opening quote and the
-    // suffix runs from the closing quote through the end of the turn; without, the prefix ends where the value starts.
+    // `value` with the value at `path` (from key `at` on) replaced: object keys are strings, list indices integers,
+    // and every key must exist (the reference's chat._replace_value_path).
+    static json replace_value_path(const json & value, const json & path, size_t at, const json & replacement) {
+        if (at == path.size()) return replacement;
+        const json & key = path[at];
+        if (value.is_object() && key.is_string() && value.contains(key.get<std::string>())) {
+            json out = value;
+            out[key.get<std::string>()] = replace_value_path(value[key.get<std::string>()], path, at + 1, replacement);
+            return out;
+        }
+        if (value.is_array() && key.is_number_integer() && key.get<int64_t>() >= 0 && key.get<int64_t>() < (int64_t) value.size()) {
+            json out = value;
+            out[(size_t) key.get<int64_t>()] = replace_value_path(value[(size_t) key.get<int64_t>()], path, at + 1, replacement);
+            return out;
+        }
+        throw request_error("neuralese-template", "the selected write value path is absent or ambiguous");
+    }
+
+    // The value at `path` (the reference's chat._at_value_path).
+    static json at_value_path(json value, const json & path) {
+        for (const auto & key : path) {
+            if (value.is_object() && key.is_string() && value.contains(key.get<std::string>())) {
+                value = json(value[key.get<std::string>()]);
+            } else if (value.is_array() && key.is_number_integer() && key.get<int64_t>() >= 0 && key.get<int64_t>() < (int64_t) value.size()) {
+                value = json(value[(size_t) key.get<int64_t>()]);
+            } else {
+                throw request_error("neuralese-template", "the selected write value path is absent or ambiguous");
+            }
+        }
+        return value;
+    }
+
+    // The model's own rendering of an assistant reply that calls `name` with `arguments` and then `argument` (or the
+    // value at `argument_path` inside the arguments, a list of keys that starts at `argument`), cut at that value (the
+    // reference's chat.call_reply): with `quoted` the prefix ends with the opening quote and the suffix runs from the
+    // closing quote through the end of the turn; without, the prefix ends where the value starts.
     std::pair<std::string, std::string> call_reply(const std::string & name, const json & arguments, const std::string & argument,
-                                                   bool quoted) {
+                                                   bool quoted, const json & argument_path = json(nullptr)) {
         static const std::string VALUE = "natlangValue7f3a9c";
         json args = arguments.is_object() ? arguments : json::object();
-        args[argument] = VALUE;
+        if (argument_path.is_null()) {
+            args[argument] = VALUE;
+        } else {
+            if (argument_path.empty() || !argument_path[0].is_string() || argument_path[0].get<std::string>() != argument)
+                throw request_error("neuralese-template", "write path must begin at the declared argument");
+            args = replace_value_path(args, argument_path, 0, VALUE);
+        }
         const json user = { { "role", "user" }, { "content", "x" } };
         const json call = { { "role", "assistant" }, { "content", "" }, { "tool_calls", json::array({ { { "type", "function" },
             { "function", { { "name", name }, { "arguments", args.dump() } } } } }) } };
@@ -1064,6 +1219,18 @@ struct engine {
         }
         prefix.pop_back();
         return { prefix, "" };
+    }
+
+    // A written value's cut (the reference's chat.write_reply): value_type "string" sits inside the quoted string;
+    // "unknown" sits unquoted, in native value syntax, so the quotes are cut from both sides.
+    std::pair<std::string, std::string> write_reply(const std::string & name, const json & arguments, const std::string & argument,
+                                                    const std::string & value_type, const json & argument_path) {
+        auto [prefix, suffix] = call_reply(name, arguments, argument, true, argument_path);
+        if (value_type == "string") return { prefix, suffix };
+        if (value_type != "unknown") throw request_error("neuralese-template", "write value_type must be string or unknown");
+        if (prefix.empty() || (prefix.back() != '"' && prefix.back() != '\'') || suffix.empty() || suffix.front() != prefix.back())
+            throw request_error("neuralese-template", "the chat template does not quote string arguments");
+        return { prefix.substr(0, prefix.size() - 1), suffix.substr(1) };
     }
 
     // log softmax of logits at token: logit[token] - logsumexp(logits)
@@ -1121,9 +1288,13 @@ struct engine {
                 if (!request.contains("options") && request.contains("continuations")) request["options"] = request["continuations"];
                 if (!request.contains("adapters") && body.contains("adapters")) request["adapters"] = body["adapters"];
                 results[entry.second] = decide_locked(request, true);
-            } catch (const std::exception & error) {
+            } catch (const request_error & error) {
+                // "code: detail", as the reference server reports a request error
                 prompt_cache.valid = false;
                 results[entry.second] = { { "error", std::string(error.what()).substr(0, 500) } };
+            } catch (const std::exception & error) {
+                prompt_cache.valid = false;
+                results[entry.second] = { { "error", ("internal: " + std::string(error.what())).substr(0, 500) } };
             }
         }
         prompt_cache.valid = false;
@@ -1233,10 +1404,15 @@ struct engine {
         return { { "log_probs", log_probs }, { "tokens", counts } };
     }
 
-    json generate(const json & body) {
+    std::string next_request_id() { return "chatcmpl-" + std::to_string(next_id++); }
+
+    // A chat completion. `on_delta`, when given, receives the output as it is produced (streaming): {"text": …} for
+    // decoded text (whole UTF-8 characters) and {"neuralese": meta} for each written block, as the reference engine's
+    // `on_delta` listener.
+    json generate(const json & body, const std::function<void(const json &)> & on_delta = nullptr, std::string request_id = "") {
         std::lock_guard<std::mutex> lock(mutex);
         bind_adapters(body, "x_natlang_adapters");
-        const std::string request_id = "chatcmpl-" + std::to_string(next_id++);
+        if (request_id.empty()) request_id = next_request_id();
         const json messages = body.value("messages", json::array());
         const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
         const int32_t max_tokens = body.contains("max_tokens") && body["max_tokens"].is_number()
@@ -1280,19 +1456,35 @@ struct engine {
         // Template readout: the reply is forced to a call cut at its value argument (call_reply); "write" writes the
         // value as a block and closes the call, "decode" decodes from the value on. The test hook's plan replaces it.
         bool free_after = false;
-        if (!forced && body.contains("neuralese_template") && body["neuralese_template"].is_object()) {
-            const json & t = body["neuralese_template"];
-            if (t.contains("value_type") && t["value_type"] != "string")
-                throw request_error("neuralese-template-value-type-unavailable", "value_type other than \"string\" is served by the reference server", 501);
-            if (t.contains("argument_path") && !t["argument_path"].is_null())
-                throw request_error("neuralese-template-argument-path-unavailable", "argument_path is served by the reference server", 501);
-            const std::string mode = t.value("value", "");
+        // A template write of value_type "unknown": the block is typed Neuralese<unknown> and its parts in the reply
+        // carry value_type "unknown" (the value sits unquoted in the model's cache).
+        const json templ = body.contains("neuralese_template") && body["neuralese_template"].is_object() ? body["neuralese_template"] : json(nullptr);
+        const bool unknown_value = !templ.is_null() && templ.contains("value_type") && templ["value_type"] == "unknown";
+        const bool unknown_write = unknown_value && templ.value("value", json(nullptr)) == "write";
+        if (!forced && !templ.is_null()) {
+            const json & t = templ;
+            const std::string mode = t.contains("value") && t["value"].is_string() ? t["value"].get<std::string>() : "";
             if (!t.contains("call") || !t["call"].is_string() || (mode != "write" && mode != "decode")) {
                 throw request_error("neuralese-template", "a template needs a call name and value 'write' or 'decode'");
             }
-            const std::string argument = t.contains("argument") && t["argument"].is_string() ? t["argument"].get<std::string>() : "value";
-            const auto [prefix, suffix] = call_reply(t["call"].get<std::string>(), t.contains("arguments") ? t["arguments"] : json::object(),
-                                                     argument, mode == "write");
+            const json argument_path = t.contains("argument_path") ? t["argument_path"] : json(nullptr);
+            if (!argument_path.is_null()) {
+                bool keys = argument_path.is_array();
+                if (keys) for (const auto & key : argument_path) keys = keys && (key.is_string() || key.is_number_integer());
+                if (!keys) throw request_error("neuralese-template", "argument_path must be a list of string or integer keys");
+            }
+            const std::string argument = t.contains("argument") && t["argument"].is_string() && !t["argument"].get<std::string>().empty()
+                ? t["argument"].get<std::string>() : "value";
+            const json arguments = t.contains("arguments") && t["arguments"].is_object() ? t["arguments"] : json::object();
+            std::string prefix, suffix;
+            if (mode == "decode") {
+                std::tie(prefix, suffix) = call_reply(t["call"].get<std::string>(), arguments, argument, false, argument_path);
+            } else {
+                if (t.contains("value_type") && !t["value_type"].is_string())
+                    throw request_error("neuralese-template", "write value_type must be string or unknown");
+                const std::string value_type = t.contains("value_type") ? t["value_type"].get<std::string>() : "string";
+                std::tie(prefix, suffix) = write_reply(t["call"].get<std::string>(), arguments, argument, value_type, argument_path);
+            }
             auto prefix_tokens = common_tokenize(vocab, prefix, false, true);
             if (mode == "decode") {
                 // A text cut at value= can split the trained =[ or ={ token.
@@ -1345,6 +1537,21 @@ struct engine {
             }
         }
         size_t plan_at = 0;
+
+        // Streaming: text goes out in whole UTF-8 characters (a token may end inside one).
+        std::string unsent;
+        auto flush_text = [&]() {
+            if (on_delta && !unsent.empty()) on_delta({ { "text", unsent } });
+            unsent.clear();
+        };
+        auto emit_text = [&](llama_token token) {
+            if (!on_delta) return;
+            unsent += common_token_to_piece(vocab, token, true);
+            if (utf8_complete(unsent)) flush_text();
+        };
+        auto emit_block = [&](const block & b) {
+            if (on_delta) on_delta({ { "neuralese", b.meta() } });
+        };
 
         llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
         if (temperature > 0.0f) {
@@ -1491,7 +1698,9 @@ struct engine {
                 }
                 // The payload first: at temperature 0 it is its mean, and the store keeps the first block of an ID, which
                 // must be the one carrying the write record.
-                block b = store.put(make_block(r.payload.data(), r.n, width, dialect, record, r.truncated));
+                block made = make_block(r.payload.data(), r.n, width, dialect, record, r.truncated);
+                if (unknown_value) made.type = "Neuralese<unknown>";
+                block b = store.put(made);
                 for (const auto & part : parts) store.put(part);
                 written.push_back(b);
                 items.push_back({ true, 0, index });
@@ -1499,6 +1708,7 @@ struct engine {
                     pieces.push_back("__nz");
                     current_logits();
                 }
+                emit_block(b);
                 pos = first + r.n + 1;
                 generated += r.n + 2;
                 // a forced plan's own close marker is written by the procedure instead
@@ -1515,8 +1725,11 @@ struct engine {
                 pieces.push_back(common_token_to_piece(vocab, token, true));
                 guide_step();
             }
+            // as the reference: after the reply checks (text streamed before a rollback is not retracted)
+            emit_text(token);
         }
         llama_sampler_free(sampler);
+        flush_text();
         for (const auto & snap : snapshots) llama_memory_seq_rm(mem, snap.seq, -1, -1);
 
         // output text with block placeholders
@@ -1524,13 +1737,39 @@ struct engine {
         std::vector<std::string> ids;
         for (const auto & it : items) {
             if (it.is_block) {
-                text += placeholder(ids.size());
+                // A value written unquoted (value_type "unknown") is parsed as the string the placeholder is.
+                text += unknown_write ? "\"" + placeholder(ids.size()) + "\"" : placeholder(ids.size());
                 ids.push_back(written[it.block_index].id);
             } else {
                 text += common_token_to_piece(vocab, it.token, true);
             }
         }
         json message = build_message(text, ids, request_id);
+        if (unknown_write && message.contains("tool_calls")) {
+            // The written value's parts carry value_type "unknown" (the reference engine's `_response`).
+            std::function<void(json &)> mark = [&](json & v) {
+                if (v.is_array()) { for (auto & item : v) mark(item); }
+                else if (v.is_object()) {
+                    if (v.value("type", json(nullptr)) == "neuralese") v["value_type"] = "unknown";
+                    else for (auto & item : v) mark(item);
+                }
+            };
+            const std::string argument = templ.contains("argument") && templ["argument"].is_string() && !templ["argument"].get<std::string>().empty()
+                ? templ["argument"].get<std::string>() : "value";
+            for (auto & call : message["tool_calls"]) {
+                json arguments = json::parse(call["function"]["arguments"].get<std::string>());
+                if (templ.contains("argument_path") && !templ["argument_path"].is_null()) {
+                    // mark the value in place: walk the path through the arguments
+                    at_value_path(arguments, templ["argument_path"]); // absent: neuralese-template
+                    json * at = &arguments;
+                    for (const auto & key : templ["argument_path"]) at = key.is_string() ? &(*at)[key.get<std::string>()] : &(*at)[(size_t) key.get<int64_t>()];
+                    mark(*at);
+                } else if (arguments.is_object() && arguments.contains(argument)) {
+                    mark(arguments[argument]);
+                }
+                call["function"]["arguments"] = arguments.dump();
+            }
+        }
         if (finish == "stop" && message.contains("tool_calls")) finish = "tool_calls";
         json metas = json::array();
         for (const auto & b : written) metas.push_back(b.meta());
@@ -1578,19 +1817,47 @@ struct engine {
     // grad.encode_text. The write site is the rendered `context` (or BOS), then the open marker; the text's token
     // embeddings, interface-normed, are supplied at the sketch positions (S3 phase A), layers [0, k) and then [k, n)
     // run over them, and the content projection gives one payload vector per token (the mean). No stop decision.
+    // The token embedding matrix, loaded once (`code`: the error code of the endpoint that needs it).
+    void load_tok_embd(const char * code) {
+        if (!tok_embd.empty()) return;
+        tok_embd.resize(llama_model_get_tok_embd(model, nullptr));
+        if (tok_embd.empty() || llama_model_get_tok_embd(model, tok_embd.data()) != tok_embd.size() ||
+            tok_embd.size() % (size_t) width != 0) {
+            tok_embd.clear();
+            throw request_error(code, "the token embedding matrix is unavailable", 500);
+        }
+    }
+
+    static std::string text_field(const json & body, const char * key) {
+        return body.contains(key) && body[key].is_string() ? body[key].get<std::string>() : std::string();
+    }
+
+    // Embed (POST /v1/neuralese/embed): a block initialised from text, the token embeddings of `text` (runtime
+    // registration, no writer), as the reference's grad.embed_text. Producer {"kind": "text-init", "text"}.
+    json embed(const json & body) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const std::string text = text_field(body, "text");
+        const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
+        if (ids.empty()) throw request_error("neuralese-embed", "empty text");
+        load_tok_embd("neuralese-embed");
+        const int32_t n = (int32_t) ids.size();
+        std::vector<float> rows((size_t) n * width);
+        for (int32_t i = 0; i < n; ++i) {
+            if (ids[i] < 0 || (size_t) (ids[i] + 1) * width > tok_embd.size()) throw request_error("neuralese-embed", "token outside the embedding matrix", 500);
+            std::copy_n(tok_embd.data() + (size_t) ids[i] * width, width, rows.data() + (size_t) i * width);
+        }
+        block b = make_block(rows.data(), n, width, dialect, { { "kind", "text-init" }, { "text", text } });
+        if (body.contains("type") && body["type"].is_string()) b.type = body["type"].get<std::string>();
+        return store.put(b).meta();
+    }
+
     json encode(const json & body) {
         std::lock_guard<std::mutex> lock(mutex);
         bind_adapters(body, nullptr);
-        const std::string text = body.value("text", "");
+        const std::string text = text_field(body, "text");
         const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
         if (ids.empty()) throw request_error("neuralese-encode", "empty text");
-        if (tok_embd.empty()) {
-            tok_embd.resize(llama_model_get_tok_embd(model, nullptr));
-            if (tok_embd.empty() || llama_model_get_tok_embd(model, tok_embd.data()) != tok_embd.size()) {
-                tok_embd.clear();
-                throw request_error("neuralese-encode", "the token embedding matrix is unavailable", 500);
-            }
-        }
+        load_tok_embd("neuralese-encode");
         llama_pos pos = 0;
         const json context = body.contains("context") ? body["context"] : json(nullptr);
         if (context.is_array() && !context.empty()) {
@@ -1727,8 +1994,9 @@ struct engine {
 
 // The capabilities this server serves (spec/NEURALESE_PORT.md "Capabilities"); the reference server reports its own.
 json capabilities() {
-    return json::array({ "adapters.lora-load", "chat", "decide", "encode", "guidance.check", "render", "score",
-                         "store", "store.owners", "template", "view", "write" });
+    return json::array({ "adapters.lora-load", "chat", "chat.stream", "decide", "embed", "encode", "guidance.check",
+                         "parts.value-type", "render", "score", "store", "store.owners", "template",
+                         "template.argument-path", "template.value-type", "view", "write" });
 }
 
 // `neuralese-<capability with dots as dashes>-unavailable`.
@@ -1740,6 +2008,96 @@ std::string unavailable_code(const std::string & capability) {
 
 json error_body(const std::string & code, const std::string & detail) {
     return { { "error", { { "code", code }, { "message", detail } } } };
+}
+
+// A streamed chat completion (`"stream": true`), event by event as the reference's http.py `_stream`: a role delta;
+// text `content` deltas until a tool call opens (call markup, `<|tool_call_start|>` or `<tool_call>`, is held back);
+// per written block a `[{"type": "neuralese", "id"}]` content delta with `neuralese.block` set to its meta; the
+// parsed calls as one `tool_calls` delta; a final chunk with `finish_reason`, `usage`, `neuralese`,
+// `x_natlang_guidance` (when guidance was on) and `x_natlang_message`, the complete parsed message. An error after the
+// first event is an `{"error": …}` event. `event` receives each event's JSON; the caller ends the stream ([DONE]).
+void stream_chat(engine & e, const json & body, const std::function<void(const json &)> & event) {
+    const std::string request_id = e.next_request_id();
+    const int64_t created = (int64_t) time(nullptr);
+    auto chunk = [&](const json & delta, const json & finish = json(nullptr), const json & extra = json::object()) {
+        json value = { { "id", request_id }, { "object", "chat.completion.chunk" }, { "created", created }, { "model", e.model_name },
+                       { "choices", json::array({ { { "index", 0 }, { "delta", delta }, { "finish_reason", finish } } }) } };
+        for (auto it = extra.begin(); it != extra.end(); ++it) value[it.key()] = it.value();
+        return value;
+    };
+    event(chunk({ { "role", "assistant" } }));
+    static const std::vector<std::string> markers = { "<|tool_call_start|>", "<tool_call>" };
+    std::string streamed, pending;
+    bool in_call = false;
+    auto on_delta = [&](const json & item) {
+        if (in_call) return;
+        if (item.contains("text")) {
+            pending += item["text"].get<std::string>();
+            size_t at = std::string::npos;
+            for (const auto & marker : markers) at = std::min(at, pending.find(marker));
+            std::string out;
+            if (at != std::string::npos) {
+                out = pending.substr(0, at);
+                pending.clear();
+                in_call = true;
+            } else {
+                // hold back a tail that may be the start of call markup
+                size_t keep = 0;
+                for (const auto & marker : markers) {
+                    for (size_t n = 1; n < marker.size(); ++n) {
+                        if (pending.size() >= n && pending.compare(pending.size() - n, n, marker, 0, n) == 0) keep = std::max(keep, n);
+                    }
+                }
+                out = pending.substr(0, pending.size() - keep);
+                pending = pending.substr(pending.size() - keep);
+            }
+            if (!out.empty()) {
+                streamed += out;
+                event(chunk({ { "content", out } }));
+            }
+        } else {
+            const json & meta = item["neuralese"];
+            event(chunk({ { "content", json::array({ { { "type", "neuralese" }, { "id", meta["id"] } } }) } }, json(nullptr),
+                        { { "neuralese", { { "block", meta } } } }));
+        }
+    };
+    try {
+        const json response = e.generate(body, on_delta, request_id);
+        const json & choice = response["choices"][0];
+        const json & message = choice["message"];
+        const std::string sent = strip(streamed);
+        if (message["content"].is_string() && message["content"].get<std::string>().compare(0, sent.size(), sent) == 0 &&
+            message["content"].get<std::string>().size() > sent.size()) {
+            event(chunk({ { "content", message["content"].get<std::string>().substr(sent.size()) } }));
+        } else if (!in_call && !pending.empty()) {
+            event(chunk({ { "content", pending } }));
+        }
+        if (message.contains("tool_calls")) {
+            json calls = json::array();
+            size_t index = 0;
+            for (const auto & call : message["tool_calls"]) {
+                const json & arguments = call["function"]["arguments"];
+                calls.push_back({ { "index", index++ }, { "id", call["id"] }, { "type", "function" },
+                                  { "function", { { "name", call["function"]["name"] },
+                                                  { "arguments", arguments.is_string() ? arguments.get<std::string>() : arguments.dump() } } } });
+            }
+            event(chunk({ { "tool_calls", calls } }));
+        }
+        json extra = { { "x_natlang_message", message }, { "usage", response["usage"] }, { "neuralese", response["neuralese"] } };
+        if (response.contains("x_natlang_guidance")) extra["x_natlang_guidance"] = response["x_natlang_guidance"];
+        event(chunk(json::object(), choice["finish_reason"], extra));
+    } catch (const request_error & err) {
+        event(error_body(err.code, err.what()));
+    } catch (const std::exception & err) {
+        event(error_body("internal", err.what()));
+    }
+}
+
+// Whether a request is a streamed chat completion: POST /v1/chat/completions with a JSON object body whose "stream"
+// is true.
+bool streams(const std::string & method, const std::string & path, const json & body) {
+    return method == "POST" && path == "/v1/chat/completions" && body.is_object() && body.contains("stream") &&
+           body["stream"].is_boolean() && body["stream"].get<bool>();
 }
 
 } // namespace
@@ -1823,8 +2181,12 @@ static void block_ids(const json & v, std::set<std::string> & out) {
     }
 }
 
+bool nz_service_streams(const std::string & method, const std::string & path, const std::string & body_text) {
+    return streams(method, path, json::parse(body_text.empty() ? "{}" : body_text, nullptr, false));
+}
+
 nz_response nz_service_handle(nz_service * s, const std::string & method, const std::string & path, const std::string & body_text,
-                              const std::string & owner) {
+                              const std::string & owner, const nz_event_sink & events) {
     engine & e = s->e;
     static const std::regex block_path(R"(^/v1/neuralese/blocks/(nz1_[a-z2-7]+)(/meta|/pin|/unpin)?$)");
     // The requesting owner holds every block the service names to it.
@@ -1848,10 +2210,13 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
                 return ok(200, { { "object", "list" }, { "data", json::array({ { { "id", e.model_name }, { "object", "model" } } }) } });
             }
             if (path == "/v1/neuralese/info") {
+                // The reference's fields, with this server's values: no gradient sessions (grad_order 0), no adapter
+                // kinds applied directly (adapters are loaded as LoRAs: capability adapters.lora-load), no projections.
                 return ok(200, { { "dialects", json::array({ e.dialect }) }, { "width", e.width }, { "dtype", "f32" },
-                                 { "max_block_length", e.max_block }, { "grad", false }, { "adapters", "lora" }, { "cutoff", nz_heads_cutoff(e.heads) },
-                                 { "server", "llama.cpp" }, { "store", { { "owners", true }, { "persistent", false } } },
-                                 { "capabilities", capabilities() } });
+                                 { "store", { { "owners", true }, { "persistent", false } } },
+                                 { "max_block_length", e.max_block }, { "grad", false }, { "grad_order", 0 }, { "stream", true },
+                                 { "cutoff", nz_heads_cutoff(e.heads) }, { "adapters", json::array() }, { "projections", json::object() },
+                                 { "server", "llama.cpp" }, { "capabilities", capabilities() } });
             }
             std::smatch m;
             if (path.rfind("/v1/neuralese/blocks/", 0) == 0) {
@@ -1884,7 +2249,6 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
         }
         if (path == "/v1/neuralese/grad") return unavailable("grad");
         if (path == "/v1/neuralese/optim") return unavailable("optim");
-        if (path == "/v1/neuralese/embed") return unavailable("embed");
         if (path == "/v1/neuralese/adapters") return unavailable("adapters.create");
         json body = json::parse(body_text.empty() ? "{}" : body_text, nullptr, false);
         // A malformed body is refused before anything acts on it: a collect that read it as "nothing referenced"
@@ -1892,14 +2256,36 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
         if (body.is_discarded() || !body.is_object()) return fail(400, "bad-json", "request body is not a JSON object");
         if (path == "/v1/neuralese/collect") {
             std::set<std::string> referenced;
-            if (body.is_object() && body.contains("referenced")) for (const auto & id : body["referenced"]) referenced.insert(id.get<std::string>());
+            if (body.contains("referenced") && !body["referenced"].is_null()) {
+                if (!body["referenced"].is_array()) return fail(400, "bad-json", "referenced must be a list of block IDs");
+                for (const auto & id : body["referenced"]) {
+                    if (!id.is_string()) return fail(400, "bad-json", "referenced must be a list of block IDs");
+                    referenced.insert(id.get<std::string>());
+                }
+            }
             return nz_response { 200, json({ { "removed", e.store.collect(referenced, owner) } }).dump(), "application/json" };
         }
-        if (body.is_discarded() || !body.is_object()) return fail(400, "bad-json", "request body is not a JSON object");
-        if (path == "/v1/chat/completions") {
-            if (body.value("stream", false)) return unavailable("chat.stream");
-            return ok(200, e.generate(body));
+        if (streams(method, path, body)) {
+            // Server-sent events: through `events` as they are produced, else collected into one event-stream body.
+            std::string collected;
+            auto send = [&](const std::string & data) {
+                if (events) events(data);
+                else collected += "data: " + data + "\n\n";
+            };
+            stream_chat(e, body, [&](const json & value) {
+                // the requesting owner holds every block an event names
+                if (!owner.empty() && !value.contains("error")) {
+                    std::set<std::string> ids;
+                    block_ids(value, ids);
+                    if (!ids.empty()) e.store.hold(owner, ids);
+                }
+                send(value.dump());
+            });
+            send("[DONE]");
+            return nz_response { 200, collected, "text/event-stream" };
         }
+        if (path == "/v1/chat/completions") return ok(200, e.generate(body));
+        if (path == "/v1/neuralese/embed") return ok(201, e.embed(body));
         if (path == "/v1/neuralese/decide") return ok(200, e.decide(body));
         if (path == "/v1/natlang/score" || path == "/v1/neuralese/decide_many") return ok(200, e.decide_many(body));
         if (path == "/v1/neuralese/encode") return ok(201, e.encode(body));

@@ -3,14 +3,24 @@
 // system (the JS side writes or mounts them first).
 //
 //   nzw_load(options JSON) -> 0, or 1 with nzw_error()        {"model", "heads", "n_ctx"?, "max_block"?, "threads"?, ...}
-//   nzw_handle(method, path, body, length) -> status            then nzw_body() / nzw_body_length() / nzw_content_type()
+//   nzw_handle(method, path, body, length, events) -> status    then nzw_body() / nzw_body_length() / nzw_content_type()
+//
+// A streamed chat completion ("stream": true) answers 200 text/event-stream. With `events` nonzero each event's data
+// (a JSON chunk, then "[DONE]") goes to the module's `nzwOnEvent(bytes)` while the request runs and the body is
+// empty; with `events` 0 the body is the whole event stream.
 
 #include "../neuralese-service.h"
 
+#include <emscripten/em_js.h>
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <string>
+
+// One server-sent event's data, handed to JavaScript while the request runs (copied out of the heap).
+EM_JS(void, nzw_emit_event, (const char * data, int length), {
+    if (Module["nzwOnEvent"]) Module["nzwOnEvent"](HEAPU8.slice(data >>> 0, (data >>> 0) + length));
+});
 
 namespace {
 nz_service * service = nullptr;
@@ -49,12 +59,14 @@ const char * nzw_hello() {
     return hello.c_str();
 }
 
-int nzw_handle(const char * method, const char * path, const uint8_t * body, int length) {
+int nzw_handle(const char * method, const char * path, const uint8_t * body, int length, int events) {
     if (!service) {
         last = { 503, R"({"error":{"code":"not-loaded","message":"call nzw_load first"}})", "application/json" };
         return last.status;
     }
-    last = nz_service_handle(service, method, path, std::string(reinterpret_cast<const char *>(body), (size_t) length));
+    const nz_event_sink sink = events ? nz_event_sink([](const std::string & data) { nzw_emit_event(data.data(), (int) data.size()); })
+                                      : nz_event_sink();
+    last = nz_service_handle(service, method, path, std::string(reinterpret_cast<const char *>(body), (size_t) length), "", sink);
     return last.status;
 }
 
