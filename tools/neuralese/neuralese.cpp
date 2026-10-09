@@ -33,6 +33,7 @@ struct nz_heads {
     int32_t pos_dim    = 0;
     float   eps        = 1e-5f;
     float   tau        = 1.0f;
+    float   read_adapter_eps = 1e-5f;
     float   gate       = 1.0f;
     llama_token open_token  = -1;
     llama_token close_token = -1;
@@ -43,6 +44,10 @@ struct nz_heads {
     bool stop_counts   = true;  // false: the count is not an input; position row 0 stands in for it
 
     ggml_tensor * interface_w     = nullptr;
+    ggml_tensor * read_adapter_norm = nullptr;
+    ggml_tensor * read_adapter_proj_w = nullptr;
+    ggml_tensor * read_adapter_proj_b = nullptr;
+    bool read_adapter = false;
     ggml_tensor * fb_readout_norm = nullptr;
     ggml_tensor * fb_readout      = nullptr; // [n_embd, n_vocab]
     ggml_tensor * fb_table_t      = nullptr; // [n_vocab, n_embd]: the mixture table, transposed
@@ -142,6 +147,35 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
     h->open_token = (llama_token) open_id;
     h->close_token = (llama_token) close_id;
 
+    const int64_t read_adapter_id = gguf_find_key(h->gctx, "neuralese.read_adapter");
+    if (read_adapter_id >= 0) {
+        const char * read_adapter_name = gguf_get_kv_type(h->gctx, read_adapter_id) == GGUF_TYPE_STRING
+            ? gguf_get_val_str(h->gctx, read_adapter_id) : nullptr;
+        if (read_adapter_name == nullptr || std::string(read_adapter_name) != "full-residual-v1") {
+            fprintf(stderr, "%s: unsupported neuralese.read_adapter\n", __func__);
+            ok = false;
+        } else {
+            h->read_adapter = true;
+            const int64_t eps_id = gguf_find_key(h->gctx, "neuralese.read_adapter.norm_eps");
+            if (eps_id < 0 || gguf_get_kv_type(h->gctx, eps_id) != GGUF_TYPE_FLOAT32) {
+                fprintf(stderr, "%s: missing or invalid neuralese.read_adapter.norm_eps\n", __func__);
+                ok = false;
+            } else {
+                h->read_adapter_eps = gguf_get_val_f32(h->gctx, eps_id);
+                if (!std::isfinite(h->read_adapter_eps) || h->read_adapter_eps <= 0.0f) {
+                    fprintf(stderr, "%s: invalid reader adapter norm epsilon\n", __func__);
+                    ok = false;
+                }
+            }
+        }
+    } else if (gguf_find_key(h->gctx, "neuralese.read_adapter.norm_eps") >= 0 ||
+               ggml_get_tensor(h->wctx, "nz.read_adapter.norm.weight") != nullptr ||
+               ggml_get_tensor(h->wctx, "nz.read_adapter.proj.weight") != nullptr ||
+               ggml_get_tensor(h->wctx, "nz.read_adapter.proj.bias") != nullptr) {
+        fprintf(stderr, "%s: reader adapter tensors need neuralese.read_adapter metadata\n", __func__);
+        ok = false;
+    }
+
     struct { ggml_tensor ** dst; const char * name; } tensors[] = {
         { &h->interface_w,     "nz.interface.weight" },
         { &h->fb_readout_norm, "nz.feedback.readout_norm.weight" },
@@ -167,6 +201,19 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
     for (auto & t : tensors) {
         *t.dst = ok ? get_tensor(h, t.name) : nullptr;
         ok = ok && *t.dst != nullptr;
+    }
+    if (ok && h->read_adapter) {
+        h->read_adapter_norm = get_tensor(h, "nz.read_adapter.norm.weight");
+        h->read_adapter_proj_w = get_tensor(h, "nz.read_adapter.proj.weight");
+        h->read_adapter_proj_b = get_tensor(h, "nz.read_adapter.proj.bias");
+        ok = h->read_adapter_norm && h->read_adapter_proj_w && h->read_adapter_proj_b;
+        if (ok && (ggml_n_dims(h->read_adapter_norm) != 1 || h->read_adapter_norm->ne[0] != h->n_embd ||
+                   ggml_n_dims(h->read_adapter_proj_w) != 2 || h->read_adapter_proj_w->ne[0] != h->n_embd ||
+                   h->read_adapter_proj_w->ne[1] != h->n_embd || ggml_n_dims(h->read_adapter_proj_b) != 1 ||
+                   h->read_adapter_proj_b->ne[0] != h->n_embd)) {
+            fprintf(stderr, "%s: reader adapter tensor shape mismatch\n", __func__);
+            ok = false;
+        }
     }
     ggml_tensor * gate = ok ? get_tensor(h, "nz.feedback.gate") : nullptr;
     ok = ok && gate != nullptr;
@@ -404,6 +451,17 @@ int32_t nz_read(llama_context * ctx, const nz_heads * h, const float * payload, 
     }
     std::vector<float> normed((size_t) n * h->n_embd);
     nz_interface(h, payload, normed.data(), n);
+    if (h->read_adapter) {
+        graph_run g;
+        ggml_tensor * x = g.input(normed.data(), h->n_embd, n);
+        ggml_tensor * update = linear(g.ctx, rms(g.ctx, x, h->read_adapter_norm, h->read_adapter_eps),
+                                      h->read_adapter_proj_w, h->read_adapter_proj_b);
+        ggml_tensor * y = ggml_add(g.ctx, x, update);
+        if (!g.compute(h, { y })) {
+            return -1;
+        }
+        get(y, normed.data());
+    }
     return decode_embd(ctx, normed.data(), n, h->n_embd, pos, seq, false);
 }
 

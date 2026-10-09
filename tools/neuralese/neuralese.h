@@ -44,7 +44,7 @@ llama_token  nz_heads_open_token (const nz_heads * heads);
 llama_token  nz_heads_close_token(const nz_heads * heads);
 const char * nz_heads_dialect   (const nz_heads * heads);
 
-// interface norm, applied to every vector entering the read port: n rows of n_embd floats
+// Legacy interface norm, also used by text encoding: n rows of n_embd floats
 void nz_interface(const nz_heads * heads, const float * in, float * out, int32_t n);
 
 // head primitives (n rows of n_embd floats each)
@@ -53,8 +53,8 @@ float nz_stop_logit(const nz_heads * heads, const float * h_cut, int32_t count);
 void  nz_content(const nz_heads * heads, const float * sketches, const float * h_final, int32_t n,
                  float * mean, float * log_sigma);
 
-// Read port: decode the interface-normed payload as embeddings at positions pos, pos+1, ...
-// of sequence seq. Returns the llama_decode status.
+// Read port: apply the configured interface and reader adapter, then decode the payload as embeddings at
+// positions pos, pos+1, ... of sequence seq. Returns the llama_decode status.
 int32_t nz_read(llama_context * ctx, const nz_heads * heads, const float * payload, int32_t n,
                 llama_pos pos, llama_seq_id seq);
 
