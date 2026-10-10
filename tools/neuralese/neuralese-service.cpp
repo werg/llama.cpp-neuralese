@@ -1439,6 +1439,22 @@ struct engine {
         return { { "log_probs", log_probs }, { "tokens", counts } };
     }
 
+    // The completion allowance (SERVER_HARMONIZATION #20, as http.py `completion_limit`): `max_tokens`, else
+    // `max_completion_tokens`, absent or null 512. A non-negative integer is honoured as given; 0 generates nothing
+    // (empty reply, finish_reason "length"). Anything else answers 400 bad-max-tokens rather than a silent default.
+    static int32_t completion_limit(const json & body) {
+        for (const char * key : { "max_tokens", "max_completion_tokens" }) {
+            if (!body.contains(key) || body[key].is_null()) continue;
+            const json & value = body[key];
+            if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<int64_t>() < 0)) {
+                throw request_error("bad-max-tokens", std::string(key) + " must be a non-negative integer, got " + value.dump());
+            }
+            // Past int32: unbounded in effect (the served context ends the reply first).
+            return (int32_t) std::min<uint64_t>(value.get<uint64_t>(), INT32_MAX);
+        }
+        return 512;
+    }
+
     std::string next_request_id() { return "chatcmpl-" + std::to_string(next_id++); }
 
     // A chat completion. `on_delta`, when given, receives the output as it is produced (streaming): {"text": …} for
@@ -1455,10 +1471,7 @@ struct engine {
         if (request_id.empty()) request_id = next_request_id();
         const json messages = body.value("messages", json::array());
         const json tools = body.contains("tools") ? body["tools"] : json(nullptr);
-        const int32_t max_tokens = body.contains("max_tokens") && body["max_tokens"].is_number()
-            ? body["max_tokens"].get<int32_t>()
-            : (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number()
-                   ? body["max_completion_tokens"].get<int32_t>() : 512);
+        const int32_t max_tokens = completion_limit(body);
         const float temperature = body.contains("temperature") && body["temperature"].is_number()
             ? body["temperature"].get<float>() : 0.0f;
         const float nz_temperature = body.contains("neuralese_temperature") && body["neuralese_temperature"].is_number()
@@ -2146,10 +2159,13 @@ bool stream_chat(engine & e, const json & body, const std::function<bool(const j
 }
 
 // Whether a request is a streamed chat completion: POST /v1/chat/completions with a JSON object body whose "stream"
-// is true.
+// is true. One with a malformed completion limit is not: it answers its 400 as a plain response before any event, as
+// the reference (which builds the request before opening the stream).
 bool streams(const std::string & method, const std::string & path, const json & body) {
-    return method == "POST" && path == "/v1/chat/completions" && body.is_object() && body.contains("stream") &&
-           body["stream"].is_boolean() && body["stream"].get<bool>();
+    if (!(method == "POST" && path == "/v1/chat/completions" && body.is_object() && body.contains("stream") &&
+          body["stream"].is_boolean() && body["stream"].get<bool>())) return false;
+    try { engine::completion_limit(body); } catch (const request_error &) { return false; }
+    return true;
 }
 
 } // namespace
