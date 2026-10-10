@@ -23,7 +23,7 @@
 //   POST /v1/neuralese/view            the builtin view's Neuralese instance: {"value", "instructions"?, "system"?, "window"?};
 //                                      every write the template write of view's body
 //   POST /v1/neuralese/embed           a block initialised from text token embeddings: {"text", "type"?}
-//   POST /v1/neuralese/grad, optim, adapters; GET /v1/neuralese/adapters/{id}/lora
+//   POST /v1/neuralese/grad, optim, adapters, init_body; GET /v1/neuralese/adapters/{id}/lora
 //                                      501 neuralese-<capability>-unavailable: served by the reference server
 //
 // `"stream": true` on chat completions answers server-sent chat.completion.chunk events (the reference's format).
@@ -2365,6 +2365,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
         if (path == "/v1/neuralese/grad") return unavailable("grad");
         if (path == "/v1/neuralese/optim") return unavailable("optim");
         if (path == "/v1/neuralese/adapters") return unavailable("adapters.create");
+        if (path == "/v1/neuralese/init_body") return unavailable("init-body");
         json body = json::parse(body_text.empty() ? "{}" : body_text, nullptr, false);
         // A malformed body is refused before anything acts on it: a collect that read it as "nothing referenced"
         // would drop every unpinned block.
