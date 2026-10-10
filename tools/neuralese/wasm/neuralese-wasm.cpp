@@ -7,7 +7,8 @@
 //
 // A streamed chat completion ("stream": true) answers 200 text/event-stream. With `events` nonzero each event's data
 // (a JSON chunk, then "[DONE]") goes to the module's `nzwOnEvent(bytes)` while the request runs and the body is
-// empty; with `events` 0 the body is the whole event stream.
+// empty; `nzwOnEvent` returning false (its consumer has gone) stops generation. With `events` 0 the body is the whole
+// event stream.
 
 #include "../neuralese-service.h"
 
@@ -18,8 +19,10 @@
 #include <string>
 
 // One server-sent event's data, handed to JavaScript while the request runs (copied out of the heap).
-EM_JS(void, nzw_emit_event, (const char * data, int length), {
-    if (Module["nzwOnEvent"]) Module["nzwOnEvent"](HEAPU8.slice(data >>> 0, (data >>> 0) + length));
+// The hook answers false (exactly) when its consumer has gone; generation then stops.
+EM_JS(int, nzw_emit_event, (const char * data, int length), {
+    if (!Module["nzwOnEvent"]) return 1;
+    return Module["nzwOnEvent"](HEAPU8.slice(data >>> 0, (data >>> 0) + length)) === false ? 0 : 1;
 });
 
 namespace {
@@ -64,7 +67,7 @@ int nzw_handle(const char * method, const char * path, const uint8_t * body, int
         last = { 503, R"({"error":{"code":"not-loaded","message":"call nzw_load first"}})", "application/json" };
         return last.status;
     }
-    const nz_event_sink sink = events ? nz_event_sink([](const std::string & data) { nzw_emit_event(data.data(), (int) data.size()); })
+    const nz_event_sink sink = events ? nz_event_sink([](const std::string & data) { return nzw_emit_event(data.data(), (int) data.size()) != 0; })
                                       : nz_event_sink();
     last = nz_service_handle(service, method, path, std::string(reinterpret_cast<const char *>(body), (size_t) length), "", sink);
     return last.status;

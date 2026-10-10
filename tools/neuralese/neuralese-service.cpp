@@ -54,6 +54,7 @@
 #include "llama.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 
 #include <nlohmann/json.hpp>
 #include "hash/hash.h"
@@ -88,7 +89,10 @@ namespace {
 const char * VIEW_INSTRUCTIONS = "Write a view of value: a shorter form of it that a reader uses in its place.\n\nWithout instructions, the view is faithful: keep everything needed to reproduce value exactly, its content, its structure and its exact details (names, numbers, identifiers, code), and drop only what repeats or can be restated more briefly without loss.\n\nWith instructions, they say what the view is for: keep what that purpose needs, including how value is organised and where in it the rest can be found, and leave out what the purpose does not need.";
 const char * VIEW_TOOLS = R"json([{"type":"function","function":{"name":"return_result","description":"Finish the call: value is the result.","parameters":{"type":"object","properties":{"status":{"type":"string","enum":["success"]},"value":{"type":"string"}},"required":["status","value"]}}}])json";
 const char * VIEW_TEMPLATE = R"json({"call":"return_result","arguments":{"status":"success"},"argument":"value","value":"write"})json";
-const int32_t VIEW_SITE_MARGIN = 1024;
+// view.py REPLY_TOKENS (a view write's max_tokens is max_block + VIEW_REPLY_TOKENS) and PART_MARGIN (tokens kept free
+// beside a chunk: a part site's longer header, retokenized chunk edges)
+const int32_t VIEW_REPLY_TOKENS = 64;
+const int32_t VIEW_PART_MARGIN = 32;
 
 struct request_error : std::runtime_error {
     std::string code;
@@ -1106,6 +1110,30 @@ struct engine {
 
     // Prefill a rendered prompt (text, literal text and read blocks) on sequence 0 from position 0, with logits at
     // its last position. Returns the next position.
+    // The served context: positions one request's prompt and reply may span (the smaller of the model's training context
+    // and this server's -c). Reported in info as `context`; view plans its write sites against it.
+    int32_t served_context() const { return std::min<int32_t>(llama_model_n_ctx_train(model), (int32_t) llama_n_ctx(ctx)); }
+
+    // Positions `prompt` takes in the cache, as prefill places it, without decoding: text tokens, the model's BOS once,
+    // and per block its opening marker, vectors and closing marker.
+    llama_pos prompt_positions(const rendered & prompt) {
+        llama_pos n = 0;
+        bool first = true, starts_with_bos = false;
+        const llama_token bos = llama_vocab_bos(vocab);
+        for (const auto & seg : prompt.segments) {
+            if (seg.kind == rendered::segment::BLOCK) {
+                if (first) first = false;
+                n += 2 + (llama_pos) lookup(prompt.blocks[seg.index]).length;
+                continue;
+            }
+            const auto ids = common_tokenize(vocab, seg.text, false, seg.kind == rendered::segment::TEXT);
+            if (first && !ids.empty()) { first = false; starts_with_bos = ids.front() == bos; }
+            n += (llama_pos) ids.size();
+        }
+        if (llama_vocab_get_add_bos(vocab) && !starts_with_bos) n += 1;
+        return n;
+    }
+
     llama_pos prefill(const rendered & prompt) {
         std::vector<block> inputs;
         for (const auto & id : prompt.blocks) {
@@ -1326,10 +1354,17 @@ struct engine {
             if (full.blocks != prompt.blocks) throw request_error("neuralese-decision", "options rendered different prompts");
             std::string full_text;
             for (const auto & seg : full.segments) full_text += seg.text;
-            if (full_text.compare(0, prompt_text.size(), prompt_text) != 0) {
-                throw request_error("neuralese-decision", "the template renders the reply's prompt differently");
-            }
-            std::string rest = full_text.substr(prompt_text.size());
+            // The option is scored after the prompt exactly as generation renders it (prompt_text). It is cut from the
+            // full rendering after the reply's own generation prefix (the prompt from its last <|im_start|>), not by
+            // matching the whole prompt: a template may render earlier turns differently once another assistant turn
+            // follows (LFM2.5 drops past reasoning), and those turns are not what the model saw while generating. As
+            // the reference's GradSession._target_items; a rendering without that prefix fails loudly.
+            const size_t turn = prompt_text.rfind("<|im_start|>");
+            if (turn == std::string::npos) throw request_error("neuralese-decision", "the rendered prompt has no generation prefix");
+            const std::string prefix = prompt_text.substr(turn);
+            const size_t at = full_text.rfind(prefix);
+            if (at == std::string::npos) throw request_error("neuralese-decision", "the target's rendering has no assistant prefix");
+            std::string rest = full_text.substr(at + prefix.size());
             const size_t end = rest.rfind("<|im_end|>");
             if (end != std::string::npos) rest = rest.substr(0, end + std::string("<|im_end|>").size());
             rests.push_back(common_tokenize(vocab, rest, false, true));
@@ -1409,7 +1444,12 @@ struct engine {
     // A chat completion. `on_delta`, when given, receives the output as it is produced (streaming): {"text": …} for
     // decoded text (whole UTF-8 characters) and {"neuralese": meta} for each written block, as the reference engine's
     // `on_delta` listener.
-    json generate(const json & body, const std::function<void(const json &)> & on_delta = nullptr, std::string request_id = "") {
+    //
+    // `cancelled`, when given, is asked before every generated position: true (a streamed reply's client has gone) stops
+    // the request with request_error "cancelled", so a client that leaves frees the server instead of waiting out
+    // max_tokens.
+    json generate(const json & body, const std::function<void(const json &)> & on_delta = nullptr, std::string request_id = "",
+                  const std::function<bool()> & cancelled = nullptr) {
         std::lock_guard<std::mutex> lock(mutex);
         bind_adapters(body, "x_natlang_adapters");
         if (request_id.empty()) request_id = next_request_id();
@@ -1554,6 +1594,7 @@ struct engine {
         };
 
         llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        const std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler_owner(sampler, llama_sampler_free);
         if (temperature > 0.0f) {
             llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
             llama_sampler_chain_add(sampler, llama_sampler_init_dist(derive_seed("text\x1f" + seed_key)));
@@ -1646,6 +1687,7 @@ struct engine {
             for (auto it = bans.begin(); it != bans.end();) it = it->first > target ? bans.erase(it) : std::next(it);
         };
         while (true) {
+            if (cancelled && cancelled()) throw request_error("cancelled", "the client went away", 499);
             if (generated >= max_tokens) { finish = "length"; break; }
             llama_token token;
             if (forced && free_after && plan_at >= plan.size()) forced = false;
@@ -1728,7 +1770,6 @@ struct engine {
             // as the reference: after the reply checks (text streamed before a rollback is not retracted)
             emit_text(token);
         }
-        llama_sampler_free(sampler);
         flush_text();
         for (const auto & snap : snapshots) llama_memory_seq_rm(mem, snap.seq, -1, -1);
 
@@ -1940,22 +1981,22 @@ struct engine {
         const std::string instructions = body.contains("instructions") && body["instructions"].is_string() ? body["instructions"].get<std::string>() : "";
         const json system = body.contains("system") && !body["system"].is_null()
             && !(body["system"].is_string() && body["system"].get<std::string>().empty()) ? body["system"] : json(VIEW_INSTRUCTIONS);
-        // window: the model's context (as served: the smaller of its training context and this server's -c) less the
-        // site's own text, the tool, the forced reply, the block and a margin
-        const int32_t context = std::min<int32_t>(llama_model_n_ctx_train(model), (int32_t) llama_n_ctx(ctx));
-        const int32_t overhead = (int32_t) common_tokenize(vocab, instructions, false, true).size() + max_block + VIEW_SITE_MARGIN;
-        int32_t window = std::max(256, context - overhead);
-        if (body.contains("window") && body["window"].is_number_integer() && body["window"].get<int32_t>() > 0) {
-            window = std::min(window, body["window"].get<int32_t>());
-        }
         const std::string purpose = instructions.empty() ? "" : "instructions:\n" + instructions + "\n\n";
         auto site = [&](const json & content) {
             return json::array({ { { "role", "system" }, { "content", system } }, { { "role", "user" }, { "content", content } } });
         };
         static const json tools = json::parse(VIEW_TOOLS), templ = json::parse(VIEW_TEMPLATE);
+        // window: what the writer attends to at the site, this server's served context, less the site's prompt without
+        // the value (view.py window_of), the reply (block and forced call) and a margin; a request can only lower it
+        const int32_t overhead = (int32_t) prompt_positions(render(site(purpose + "value:\n"), tools)) + max_block
+            + VIEW_REPLY_TOKENS + VIEW_PART_MARGIN;
+        int32_t window = std::max(256, served_context() - overhead);
+        if (body.contains("window") && body["window"].is_number_integer() && body["window"].get<int32_t>() > 0) {
+            window = std::min(window, body["window"].get<int32_t>());
+        }
         auto write_at = [&](const json & messages) {
             const json request = { { "messages", messages }, { "tools", tools }, { "neuralese_template", templ },
-                                   { "max_tokens", max_block + 64 } };
+                                   { "max_tokens", max_block + VIEW_REPLY_TOKENS } };
             const json blocks = generate(request)["neuralese"]["blocks"];
             if (blocks.empty()) throw request_error("neuralese-view", "a view write produced no block", 500);
             return blocks[0]["id"].get<std::string>();
@@ -2016,7 +2057,17 @@ json error_body(const std::string & code, const std::string & detail) {
 // parsed calls as one `tool_calls` delta; a final chunk with `finish_reason`, `usage`, `neuralese`,
 // `x_natlang_guidance` (when guidance was on) and `x_natlang_message`, the complete parsed message. An error after the
 // first event is an `{"error": …}` event. `event` receives each event's JSON; the caller ends the stream ([DONE]).
-void stream_chat(engine & e, const json & body, const std::function<void(const json &)> & event) {
+// Streams a chat completion through `deliver`, which answers false once the client has gone; `connected` (optional) says
+// whether it is still there between events. Either stops generation (generate's `cancelled`) and the stream ends
+// without further events; returns false then.
+bool stream_chat(engine & e, const json & body, const std::function<bool(const json &)> & deliver,
+                 const std::function<bool()> & connected = nullptr) {
+    bool gone = false;
+    auto event = [&](const json & value) { if (!gone && !deliver(value)) gone = true; };
+    auto cancelled = [&]() {
+        if (!gone && connected && !connected()) gone = true;
+        return gone;
+    };
     const std::string request_id = e.next_request_id();
     const int64_t created = (int64_t) time(nullptr);
     auto chunk = [&](const json & delta, const json & finish = json(nullptr), const json & extra = json::object()) {
@@ -2062,7 +2113,7 @@ void stream_chat(engine & e, const json & body, const std::function<void(const j
         }
     };
     try {
-        const json response = e.generate(body, on_delta, request_id);
+        const json response = e.generate(body, on_delta, request_id, cancelled);
         const json & choice = response["choices"][0];
         const json & message = choice["message"];
         const std::string sent = strip(streamed);
@@ -2091,6 +2142,7 @@ void stream_chat(engine & e, const json & body, const std::function<void(const j
     } catch (const std::exception & err) {
         event(error_body("internal", err.what()));
     }
+    return !gone;
 }
 
 // Whether a request is a streamed chat completion: POST /v1/chat/completions with a JSON object body whose "stream"
@@ -2105,7 +2157,49 @@ bool streams(const std::string & method, const std::string & path, const json & 
 struct nz_service {
     engine e;
     int n_gpu_layers = 0;
+    ggml_threadpool * threadpool = nullptr; // nz_pool_acquire: the context's and the heads' CPU threads
 };
+
+// The service's CPU threads: one persistent ggml threadpool (created once per thread count and kept for the process's
+// life) shared by the llama context and the heads, instead of ggml's default of creating and joining n_threads - 1
+// threads for every graph (every decoded token). Under Emscripten pthreads that per-graph churn deadlocked
+// intermittently: a ggml worker hung in emscripten's thread exit (_emscripten_thread_exit waiting in
+// _emscripten_thread_mailbox_shutdown for its mailbox refcount) while the main thread waited for it in
+// ggml_threadpool_free's pthread_join (natlang plans/neuralese/SERVER_HARMONIZATION.md #32). With a persistent pool no
+// thread exits while the service runs; the workers park on the pool's condition variable between graphs. A pool is
+// lent to one live service at a time; a second concurrent service gets its own.
+struct nz_pool { ggml_threadpool * pool; bool lent; };
+static std::mutex nz_pools_mutex;
+static std::map<int, nz_pool> nz_pools;
+static std::vector<ggml_threadpool *> nz_owned_pools;
+
+static ggml_threadpool * nz_pool_acquire(int n_threads) {
+    if (n_threads <= 1) return nullptr;
+    std::lock_guard<std::mutex> lock(nz_pools_mutex);
+    auto it = nz_pools.find(n_threads);
+    ggml_threadpool_params params = ggml_threadpool_params_default(n_threads);
+    if (it == nz_pools.end()) it = nz_pools.emplace(n_threads, nz_pool { ggml_threadpool_new(&params), false }).first;
+    if (!it->second.lent) {
+        it->second.lent = true;
+        return it->second.pool;
+    }
+    ggml_threadpool * own = ggml_threadpool_new(&params);
+    nz_owned_pools.push_back(own);
+    return own;
+}
+
+static void nz_pool_release(ggml_threadpool * pool) {
+    if (!pool) return;
+    std::lock_guard<std::mutex> lock(nz_pools_mutex);
+    for (auto & entry : nz_pools) {
+        if (entry.second.pool == pool) { entry.second.lent = false; return; }
+    }
+    auto own = std::find(nz_owned_pools.begin(), nz_owned_pools.end(), pool);
+    if (own != nz_owned_pools.end()) {
+        nz_owned_pools.erase(own);
+        ggml_threadpool_free(pool);
+    }
+}
 
 nz_service * nz_service_load(const nz_service_options & o, std::string & error) {
     static bool initialised = false;
@@ -2125,11 +2219,13 @@ nz_service * nz_service_load(const nz_service_options & o, std::string & error) 
     e.model = llama_model_load_from_file(o.model_path.c_str(), mp);
     if (!e.model) { error = "could not load the model " + o.model_path; delete s; return nullptr; }
     e.vocab = llama_model_get_vocab(e.model);
+    s->threadpool = nz_pool_acquire(o.n_threads);
     nz_heads_params hp;
     hp.n_threads = o.n_threads;
+    hp.threadpool = s->threadpool;
     hp.use_gpu = o.n_gpu_layers > 0;
     e.heads = nz_heads_load(o.heads_path.c_str(), hp);
-    if (!e.heads) { error = "could not load the Neuralese heads " + o.heads_path; llama_model_free(e.model); delete s; return nullptr; }
+    if (!e.heads) { error = "could not load the Neuralese heads " + o.heads_path; llama_model_free(e.model); nz_pool_release(s->threadpool); delete s; return nullptr; }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = o.n_ctx;
     cp.n_batch = e.n_batch;
@@ -2139,7 +2235,8 @@ nz_service * nz_service_load(const nz_service_options & o, std::string & error) 
     cp.n_threads = o.n_threads;
     cp.n_threads_batch = o.n_threads;
     e.ctx = llama_init_from_model(e.model, cp);
-    if (!e.ctx) { error = "could not create the context"; nz_heads_free(e.heads); llama_model_free(e.model); delete s; return nullptr; }
+    if (!e.ctx) { error = "could not create the context"; nz_heads_free(e.heads); llama_model_free(e.model); nz_pool_release(s->threadpool); delete s; return nullptr; }
+    if (s->threadpool) llama_attach_threadpool(e.ctx, s->threadpool, s->threadpool);
     e.templates = common_chat_templates_init(e.model, "");
     e.dialect = o.dialect.empty() ? nz_heads_dialect(e.heads) : o.dialect;
     e.max_block = std::min(o.max_block, nz_heads_max_length(e.heads));
@@ -2156,6 +2253,7 @@ void nz_service_free(nz_service * s) {
     llama_free(s->e.ctx);
     nz_heads_free(s->e.heads);
     llama_model_free(s->e.model);
+    nz_pool_release(s->threadpool);
     delete s;
 }
 
@@ -2186,7 +2284,8 @@ bool nz_service_streams(const std::string & method, const std::string & path, co
 }
 
 nz_response nz_service_handle(nz_service * s, const std::string & method, const std::string & path, const std::string & body_text,
-                              const std::string & owner, const nz_event_sink & events) {
+                              const std::string & owner, const nz_event_sink & events,
+                              const std::function<bool()> & connected) {
     engine & e = s->e;
     static const std::regex block_path(R"(^/v1/neuralese/blocks/(nz1_[a-z2-7]+)(/meta|/pin|/unpin)?$)");
     // The requesting owner holds every block the service names to it.
@@ -2214,7 +2313,7 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
                 // kinds applied directly (adapters are loaded as LoRAs: capability adapters.lora-load), no projections.
                 return ok(200, { { "dialects", json::array({ e.dialect }) }, { "width", e.width }, { "dtype", "f32" },
                                  { "store", { { "owners", true }, { "persistent", false } } },
-                                 { "max_block_length", e.max_block }, { "grad", false }, { "grad_order", 0 }, { "stream", true },
+                                 { "max_block_length", e.max_block }, { "context", e.served_context() }, { "grad", false }, { "grad_order", 0 }, { "stream", true },
                                  { "cutoff", nz_heads_cutoff(e.heads) }, { "adapters", json::array() }, { "projections", json::object() },
                                  { "server", "llama.cpp" }, { "capabilities", capabilities() } });
             }
@@ -2269,19 +2368,20 @@ nz_response nz_service_handle(nz_service * s, const std::string & method, const 
             // Server-sent events: through `events` as they are produced, else collected into one event-stream body.
             std::string collected;
             auto send = [&](const std::string & data) {
-                if (events) events(data);
-                else collected += "data: " + data + "\n\n";
+                if (events) return events(data);
+                collected += "data: " + data + "\n\n";
+                return true;
             };
-            stream_chat(e, body, [&](const json & value) {
+            const bool delivered = stream_chat(e, body, [&](const json & value) {
                 // the requesting owner holds every block an event names
                 if (!owner.empty() && !value.contains("error")) {
                     std::set<std::string> ids;
                     block_ids(value, ids);
                     if (!ids.empty()) e.store.hold(owner, ids);
                 }
-                send(value.dump());
-            });
-            send("[DONE]");
+                return send(value.dump());
+            }, connected);
+            if (delivered) send("[DONE]");
             return nz_response { 200, collected, "text/event-stream" };
         }
         if (path == "/v1/chat/completions") return ok(200, e.generate(body));

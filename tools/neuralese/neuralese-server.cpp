@@ -86,10 +86,11 @@ int main(int argc, char ** argv) {
                 res.set_header("cache-control", "no-cache");
                 const std::string path = req.path, body = req.body;
                 res.set_chunked_content_provider("text/event-stream", [service, method, path, body, owner](size_t, httplib::DataSink & sink) {
+                    // A client that leaves stops generation: a failed write, or a closed socket between events.
                     nz_service_handle(service, method, path, body, owner, [&sink](const std::string & data) {
                         const std::string event = "data: " + data + "\n\n";
-                        sink.write(event.data(), event.size()); // a client that left: the request still completes
-                    });
+                        return sink.write(event.data(), event.size());
+                    }, [&sink]() { return sink.is_writable(); });
                     sink.done();
                     return true;
                 });

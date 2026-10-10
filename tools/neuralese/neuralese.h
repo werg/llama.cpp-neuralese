@@ -31,6 +31,9 @@ struct nz_heads;
 struct nz_heads_params {
     int  n_threads = 4;     // CPU threads when the heads run on the CPU
     bool use_gpu   = false; // run the heads on the first GPU backend, if there is one
+    // CPU heads compute on this persistent pool (as the llama context, llama_attach_threadpool) instead of creating and
+    // joining n_threads - 1 threads per graph; nullptr keeps ggml's per-graph threads
+    struct ggml_threadpool * threadpool = nullptr;
 };
 
 // load a Neuralese projector GGUF; returns nullptr on failure

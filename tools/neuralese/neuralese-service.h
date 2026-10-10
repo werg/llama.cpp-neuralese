@@ -32,14 +32,17 @@ void         nz_service_free(nz_service * service);
 // {"dialect", "cutoff"} as JSON text
 std::string  nz_service_hello(const nz_service * service);
 // Receives each server-sent event's data (a JSON chunk, an {"error": …} event, and finally "[DONE]") of a streamed
-// response as it is produced; the transport frames it ("data: …\n\n").
-using nz_event_sink = std::function<void(const std::string & data)>;
+// response as it is produced; the transport frames it ("data: …\n\n"). It answers false when the event could not be
+// delivered because the client has gone: generation then stops and no further events are sent.
+using nz_event_sink = std::function<bool(const std::string & data)>;
 
 // Whether the request is a streamed chat completion (POST /v1/chat/completions with "stream": true): its answer is
 // 200 text/event-stream, and every failure after the request is accepted is an error event in the stream.
 bool         nz_service_streams(const std::string & method, const std::string & path, const std::string & body);
 // One request: GET/PUT/POST with the path, the raw body and the requesting owner (`x-natlang-owner`; "" for none).
 // Requests are served one at a time. A streamed request sends its events through `events` while it runs and answers
-// with an empty body; without `events` its answer's body is the whole event stream.
+// with an empty body; without `events` its answer's body is the whole event stream. `connected` (optional) is asked
+// before each generated position of a streamed request: false (the client has gone) stops it as a failed delivery does.
 nz_response  nz_service_handle(nz_service * service, const std::string & method, const std::string & path, const std::string & body,
-                               const std::string & owner = "", const nz_event_sink & events = nullptr);
+                               const std::string & owner = "", const nz_event_sink & events = nullptr,
+                               const std::function<bool()> & connected = nullptr);

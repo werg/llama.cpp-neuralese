@@ -232,6 +232,7 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
     if (!h->backend) {
         h->backend = ggml_backend_cpu_init();
         ggml_backend_cpu_set_n_threads(h->backend, h->n_threads);
+        if (params.threadpool) ggml_backend_cpu_set_threadpool(h->backend, params.threadpool);
     }
     h->wbuf = ggml_backend_alloc_ctx_tensors(h->wctx, h->backend);
     FILE * fp = h->wbuf ? fopen(path, "rb") : nullptr;
