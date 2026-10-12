@@ -4,11 +4,16 @@
 //   llama-logits-dump -m MODEL.gguf --ids IDS.i32 --out LOGITS.f32 [--ubatch N] [--greedy N] [-t THREADS] [-ngl N]
 //   llama-logits-dump -m MODEL.gguf --tokenize TEXT.txt --ids-out IDS.i32      (special tokens parsed, no BOS added)
 //
+// --states STATES.f32 also writes, for localizing a divergence layer by layer, the residual stream after each
+// layer's attention ("ffn_inp-L") and after its FFN ("l_out-L") at every position, as float32
+// [n_layer][2][n_tokens][n_embd] (the prompt must be one ubatch).
+//
 // IDS.i32 is raw little-endian int32 token ids; LOGITS.f32 is raw float32 [n_tokens][n_vocab]. With --greedy N the
 // greedy continuation of the prompt (N tokens) is printed as a JSON line on stdout. Weights are memory-mapped and
 // not repacked (no extra buffer types), so a CPU run's resident weight memory is reclaimable page cache.
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,9 +46,40 @@ static void write_file(const char * path, const void * data, size_t size) {
     fclose(fp);
 }
 
+// residual stream taps for --states: name -> rows copied out of the graph
+struct state_taps {
+    int n_layer = 0;
+    int n_tokens = 0;
+    int n_embd = 0;
+    std::vector<float> data; // [n_layer][2][n_tokens][n_embd]
+};
+
+static bool tap_states(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * taps = (state_taps *) user_data;
+    int kind = -1, il = -1;
+    if (sscanf(t->name, "ffn_inp-%d", &il) == 1) {
+        kind = 0;
+    } else if (sscanf(t->name, "l_out-%d", &il) == 1) {
+        kind = 1;
+    }
+    if (kind < 0 || il < 0 || il >= taps->n_layer || t->ne[0] != taps->n_embd || t->ne[1] != taps->n_tokens) {
+        return ask ? false : true;
+    }
+    if (ask) {
+        return true;
+    }
+    if (t->type != GGML_TYPE_F32) {
+        return true;
+    }
+    std::vector<float> tmp(ggml_nelements(t));
+    ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
+    memcpy(taps->data.data() + ((size_t) il * 2 + kind) * taps->n_tokens * taps->n_embd, tmp.data(), tmp.size() * 4);
+    return true;
+}
+
 int main(int argc, char ** argv) {
     const char * model_path = nullptr, * ids_path = nullptr, * out_path = nullptr;
-    const char * text_path = nullptr, * ids_out_path = nullptr;
+    const char * text_path = nullptr, * ids_out_path = nullptr, * states_path = nullptr;
     int ubatch = 0, greedy = 0, threads = 0, ngl = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -59,6 +95,7 @@ int main(int argc, char ** argv) {
         else if (a == "--out") out_path = next();
         else if (a == "--tokenize") text_path = next();
         else if (a == "--ids-out") ids_out_path = next();
+        else if (a == "--states") states_path = next();
         else if (a == "--ubatch") ubatch = atoi(next());
         else if (a == "--greedy") greedy = atoi(next());
         else if (a == "-t") threads = atoi(next());
@@ -115,6 +152,16 @@ int main(int argc, char ** argv) {
     if (threads > 0) {
         cparams.n_threads = cparams.n_threads_batch = threads;
     }
+    state_taps taps;
+    if (states_path) {
+        taps.n_layer = llama_model_n_layer(model);
+        taps.n_tokens = n;
+        taps.n_embd = llama_model_n_embd(model);
+        taps.data.assign((size_t) taps.n_layer * 2 * n * taps.n_embd, 0.0f);
+        cparams.cb_eval = tap_states;
+        cparams.cb_eval_user_data = &taps;
+        cparams.n_ubatch = n;
+    }
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
         fprintf(stderr, "cannot create context\n");
@@ -140,6 +187,9 @@ int main(int argc, char ** argv) {
     }
     if (out_path) {
         write_file(out_path, logits.data(), logits.size() * sizeof(float));
+    }
+    if (states_path) {
+        write_file(states_path, taps.data.data(), taps.data.size() * sizeof(float));
     }
 
     auto argmax = [&](const float * row) {
