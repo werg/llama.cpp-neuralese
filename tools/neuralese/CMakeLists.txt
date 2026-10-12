@@ -14,6 +14,11 @@ add_executable(${TARGET} neuralese-parity.cpp)
 target_link_libraries(${TARGET} PRIVATE neuralese)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+set(TARGET llama-logits-dump)
+add_executable(${TARGET} logits-dump.cpp)
+target_link_libraries(${TARGET} PRIVATE llama)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
 # tree-sitter with its TypeScript grammar, for guided generation (vendor/: tree-sitter 0.26.0, tree-sitter-typescript
 # 0.23.2, the versions natlang's reference server uses)
 add_library(nz-tree-sitter STATIC vendor/tree-sitter/src/lib.c vendor/tree-sitter-typescript/typescript/src/parser.c
