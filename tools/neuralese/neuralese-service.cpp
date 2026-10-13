@@ -964,6 +964,9 @@ struct engine {
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
     nz_heads * heads = nullptr;
+    // direct-v1 projectors: the final residual (before the output norm) at the last decoded position, from which a
+    // block is written (refreshed by every decode with logits)
+    std::vector<float> top;
     common_chat_templates_ptr templates;
     tensor_store store;
     std::string dialect;
@@ -1034,7 +1037,15 @@ struct engine {
                 return status;
             }
         }
+        if (logits_last && !tokens.empty()) capture_top();
         return 0;
+    }
+
+    // direct-v1: the final residual at the one output row of the last decode
+    void capture_top() {
+        if (!nz_heads_direct(heads)) return;
+        const float * h = llama_get_embeddings_layer_inp(ctx, (uint32_t) llama_model_n_layer(model));
+        top.assign(h, h + width);
     }
 
     block lookup(const std::string & id) {
@@ -1123,7 +1134,7 @@ struct engine {
         for (const auto & seg : prompt.segments) {
             if (seg.kind == rendered::segment::BLOCK) {
                 if (first) first = false;
-                n += 2 + (llama_pos) lookup(prompt.blocks[seg.index]).length;
+                n += (nz_heads_read_markers(heads) ? 2 : 0) + (llama_pos) lookup(prompt.blocks[seg.index]).length;
                 continue;
             }
             const auto ids = common_tokenize(vocab, seg.text, false, seg.kind == rendered::segment::TEXT);
@@ -1163,14 +1174,15 @@ struct engine {
                 auto ids = common_tokenize(vocab, seg.text, false, false);
                 pending.insert(pending.end(), ids.begin(), ids.end());
             } else {
-                pending.push_back(open_id);
+                const bool markers = nz_heads_read_markers(heads);
+                if (markers) pending.push_back(open_id);
                 flush(false);
                 const block & b = inputs[seg.index];
                 if (nz_read(ctx, heads, b.payload.data(), (int32_t) b.length, pos, 0) != 0) {
                     throw request_error("decode-failed", "read port", 500);
                 }
                 pos += (llama_pos) b.length;
-                pending.push_back(close_id);
+                if (markers) pending.push_back(close_id);
             }
         }
         if (pending.empty()) {
@@ -1622,7 +1634,8 @@ struct engine {
         std::string finish = "stop";
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         llama_memory_t mem = llama_get_memory(ctx);
-        struct snapshot { size_t count; llama_seq_id seq; std::vector<float> logits; llama_pos pos; int32_t generated; };
+        struct snapshot { size_t count; llama_seq_id seq; std::vector<float> logits; llama_pos pos; int32_t generated;
+                          std::vector<float> top; };
         std::vector<snapshot> snapshots;
         std::vector<llama_seq_id> spare { 3, 4, 5, 6 };
         std::map<size_t, std::set<llama_token>> bans;
@@ -1640,7 +1653,7 @@ struct engine {
             spare.pop_back();
             llama_memory_seq_rm(mem, s, -1, -1);
             llama_memory_seq_cp(mem, 0, s, -1, -1);
-            snapshots.push_back({ items.size(), s, cur, pos, generated });
+            snapshots.push_back({ items.size(), s, cur, pos, generated, top });
         };
         if (guide) {
             current_logits();
@@ -1683,6 +1696,7 @@ struct engine {
             cur = usable->logits;
             pos = usable->pos;
             generated = usable->generated;
+            top = usable->top;
             std::vector<llama_token> between;
             for (size_t i = usable->count; i < target; ++i) between.push_back(items[i].token);
             if (!between.empty()) {
@@ -1724,9 +1738,11 @@ struct engine {
                 const int32_t remaining = max_tokens - generated;
                 // Do not emit a partial opening marker. A complete soft block needs open + >=1 payload + close.
                 if (remaining < 3) { finish = "length"; break; }
+                const bool direct = nz_heads_direct(heads);
                 std::vector<float> h_cut(width);
-                if (nz_open(ctx, heads, pos, 0, h_cut.data()) != 0) throw request_error("decode-failed", "open", 500);
-                const llama_pos first = pos + 1;
+                // direct-v1: the open marker is not read; the block is written from the current final state
+                if (!direct && nz_open(ctx, heads, pos, 0, h_cut.data()) != 0) throw request_error("decode-failed", "open", 500);
+                const llama_pos first = direct ? pos : pos + 1;
                 nz_write_params wp;
                 wp.max_length = std::min(nz_max, remaining - 2);
                 wp.temperature = nz_temperature;
@@ -1735,11 +1751,25 @@ struct engine {
                 const size_t index = written.size();
                 wp.seed = derive_seed("neuralese\x1f" + seed_key + "\x1f" + std::to_string(index));
                 nz_write_result r;
-                if (nz_write(ctx, heads, 0, first, h_cut.data(), wp, r) != 0) throw request_error("decode-failed", "write", 500);
-                if (nz_read_back(ctx, heads, 0, first, r) != 0) throw request_error("decode-failed", "read back", 500);
+                if (direct) {
+                    if (nz_temperature > 0.0f) throw request_error("neuralese-temperature", "direct Neuralese values have no trained stochastic payload distribution");
+                    if (top.size() != (size_t) width) throw request_error("decode-failed", "direct write without a final state", 500);
+                    const float * logits_now = guide ? cur.data() : llama_get_logits_ith(ctx, -1); // guidance keeps its own copy (rollbacks)
+                    if (nz_write_direct(ctx, heads, 0, first, top.data(), logits_now, wp, r) != 0) throw request_error("decode-failed", "write", 500);
+                    if (nz_read_back(ctx, heads, 0, first, r) != 0) throw request_error("decode-failed", "read back", 500);
+                    capture_top();
+                } else {
+                    if (nz_write(ctx, heads, 0, first, h_cut.data(), wp, r) != 0) throw request_error("decode-failed", "write", 500);
+                    if (nz_read_back(ctx, heads, 0, first, r) != 0) throw request_error("decode-failed", "read back", 500);
+                }
                 json record = { { "kind", "write" }, { "request", request_id }, { "index", index },
                                 { "cutoff", nz_heads_cutoff(heads) }, { "temperature", nz_temperature },
                                 { "seed", wp.seed }, { "rng", "mt19937-normal" }, { "stop_logits", r.stop_logits } };
+                if (direct) {
+                    // the reference's direct writer runs the full depth; the projector's cutoff is the port's metadata
+                    record["algorithm"] = "neuralese-direct-v1";
+                    record["cutoff"] = llama_model_n_layer(model);
+                }
                 if (wp.length > 0) {
                     record["length_hint"] = wp.length;
                     record["passes"] = r.passes;
@@ -1764,7 +1794,7 @@ struct engine {
                     current_logits();
                 }
                 emit_block(b);
-                pos = first + r.n + 1;
+                pos = first + r.n + (direct ? 0 : 1);
                 generated += r.n + 2;
                 // a forced plan's own close marker is written by the procedure instead
                 if (forced && plan_at < plan.size() && !plan[plan_at].write && plan[plan_at].token == close_id) ++plan_at;
@@ -1907,6 +1937,7 @@ struct engine {
 
     json encode(const json & body) {
         std::lock_guard<std::mutex> lock(mutex);
+        if (nz_heads_direct(heads)) throw request_error("neuralese-encode-unavailable", "text encoding through a direct-v1 projector is not ported", 501);
         bind_adapters(body, nullptr);
         const std::string text = text_field(body, "text");
         const std::vector<llama_token> ids = common_tokenize(vocab, text, false, true);
@@ -2258,6 +2289,10 @@ nz_service * nz_service_load(const nz_service_options & o, std::string & error) 
     e.max_block = std::min(o.max_block, nz_heads_max_length(e.heads));
     e.width = nz_heads_n_embd(e.heads);
     e.model_name = o.alias;
+    if (nz_heads_direct(e.heads)) {
+        // the final residual at each decode's output row, from which direct blocks are written
+        llama_set_embeddings_layer_inp(e.ctx, (uint32_t) llama_model_n_layer(e.model), true);
+    }
     for (llama_token t : { nz_heads_open_token(e.heads), nz_heads_close_token(e.heads) }) {
         e.escaped.push_back(common_token_to_piece(e.vocab, t, true));
     }

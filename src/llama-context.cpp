@@ -2020,7 +2020,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
-        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens, n_outputs_prev, n_outputs);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2285,7 +2285,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
+                                         size_t output_offset, size_t n_outputs) {
     bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
@@ -2302,18 +2303,27 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         const size_t nbytes = ggml_nbytes(t);
         const size_t nfloats = nbytes / sizeof(float);
         GGML_ASSERT(n_tokens > 0);
-        GGML_ASSERT(nfloats % n_tokens == 0);
 
-        const size_t row_floats = nfloats / n_tokens;
+        // The full-depth graph's final residual (layer input n_layer, before the output norm) holds only the output
+        // rows (the last layer selects them); it is stored by output index, as the logits.
+        const bool output_rows = t->ne[1] != (int64_t) n_tokens;
+        if (output_rows && nfloats == 0) {
+            continue;
+        }
+        GGML_ASSERT(!output_rows || t->ne[1] == (int64_t) n_outputs);
+        const size_t n_rows = output_rows ? n_outputs : n_tokens;
+        GGML_ASSERT(nfloats % n_rows == 0);
+
+        const size_t row_floats = nfloats / n_rows;
         GGML_ASSERT(row_floats == model.hparams.n_embd);
-        const size_t dst_offset = token_offset * row_floats;
+        const size_t dst_offset = (output_rows ? output_offset : token_offset) * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         // Tensor-split backends require a zero source offset.
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
-        extracted = true;
+        extracted = extracted || !output_rows;
     }
     return extracted;
 }

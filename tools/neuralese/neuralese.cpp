@@ -67,6 +67,22 @@ struct nz_heads {
     ggml_tensor * ct_proj_b       = nullptr;
     ggml_tensor * ct_sigma_w      = nullptr;
     ggml_tensor * ct_sigma_b      = nullptr;
+
+    // direct-v1 profile (neuralese.profile "direct-v1"; natlang plans/neuralese/NEURALESE_DIRECT_V1.md): no read
+    // markers and no interface norm (a block's vectors are read as input embeddings), and the writer runs the full model:
+    // the value at each position is softmax(logits(h))·E plus the causal conv stack's correction over the last final
+    // states, and the next position reads the greedy token's embedding.
+    bool direct       = false;
+    bool read_markers = true;
+    struct conv_block {
+        std::vector<float> norm, taps, up_w, up_b, down_w, down_b; // taps [kernel][d], up_w [hidden][d], down_w [d][hidden]
+    };
+    std::vector<conv_block> stack;
+    int32_t stack_kernel = 0;
+    int32_t stack_hidden = 0;
+    float   stack_eps    = 0.0f;
+    std::vector<llama_token> stop_ids;  // the readout's stop tokens (the reference engine's stop_ids)
+    ggml_tensor * table_t = nullptr;    // [n_vocab, n_embd]: the input embedding matrix, transposed, for the mixture
 };
 
 // Matrices that only enter ggml_mul_mat may be stored as F16 or Q8_0 (smaller projector files, e.g. for the browser);
@@ -74,7 +90,7 @@ struct nz_heads {
 static bool matmul_weight(const std::string & name) {
     static const char * names[] = { "nz.feedback.readout.weight", "nz.feedback.table_t", "nz.feedback.mlp_in.weight",
         "nz.feedback.mlp_out.weight", "nz.stop.mlp_in.weight", "nz.stop.mlp_out.weight", "nz.content.proj.weight",
-        "nz.content.log_sigma.weight" };
+        "nz.content.log_sigma.weight", "nz.direct.table_t" };
     for (const char * n : names) if (name == n) return true;
     return false;
 }
@@ -111,6 +127,110 @@ static bool get_f32(const gguf_context * g, const char * key, float & out) {
     return true;
 }
 
+// Allocate the projector's tensors on the heads' backend and read them from the file.
+static bool load_weights(nz_heads * h, const char * path, const nz_heads_params & params) {
+    if (params.use_gpu) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (dev) {
+            h->backend = ggml_backend_dev_init(dev, nullptr);
+        }
+    }
+    if (!h->backend) {
+        h->backend = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(h->backend, h->n_threads);
+        if (params.threadpool) ggml_backend_cpu_set_threadpool(h->backend, params.threadpool);
+    }
+    h->wbuf = ggml_backend_alloc_ctx_tensors(h->wctx, h->backend);
+    FILE * fp = h->wbuf ? fopen(path, "rb") : nullptr;
+    if (!fp) {
+        fprintf(stderr, "nz_heads_load: failed to allocate or read the projector weights\n");
+        return false;
+    }
+    std::vector<uint8_t> buf;
+    const size_t data_offset = gguf_get_data_offset(h->gctx);
+    for (int64_t i = 0; i < gguf_get_n_tensors(h->gctx); ++i) {
+        ggml_tensor * t = ggml_get_tensor(h->wctx, gguf_get_tensor_name(h->gctx, i));
+        const size_t n = ggml_nbytes(t);
+        buf.resize(n);
+        if (fseek(fp, (long) (data_offset + gguf_get_tensor_offset(h->gctx, i)), SEEK_SET) != 0 ||
+            fread(buf.data(), 1, n, fp) != n) {
+            fprintf(stderr, "nz_heads_load: short read for %s\n", ggml_get_name(t));
+            fclose(fp);
+            return false;
+        }
+        ggml_backend_tensor_set(t, buf.data(), 0, n);
+    }
+    fclose(fp);
+    h->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(h->backend));
+    return true;
+}
+
+// The direct-v1 projector: the conv stack (kept on the host; a few positions per step) and the mixture table.
+static bool load_direct(nz_heads * h, const char * path, const nz_heads_params & params) {
+    uint32_t blocks = 0, kernel = 0, hidden = 0;
+    if (!get_u32(h->gctx, "neuralese.direct.blocks", blocks) || !get_u32(h->gctx, "neuralese.direct.kernel", kernel) ||
+        !get_u32(h->gctx, "neuralese.direct.hidden", hidden) || !get_f32(h->gctx, "neuralese.direct.norm_eps", h->stack_eps)) {
+        return false;
+    }
+    const int64_t fid = gguf_find_key(h->gctx, "neuralese.direct.feedback");
+    if (fid < 0 || gguf_get_kv_type(h->gctx, fid) != GGUF_TYPE_STRING || std::string(gguf_get_val_str(h->gctx, fid)) != "token") {
+        fprintf(stderr, "nz_heads_load: direct-v1 needs neuralese.direct.feedback \"token\"\n");
+        return false;
+    }
+    if (gguf_find_key(h->gctx, "neuralese.direct.token_choice") >= 0 ||
+        ggml_get_tensor(h->wctx, "nz.token_choice.blk.0.norm.weight") != nullptr) {
+        // The reference applies the TokenChoiceProjection to every text and write readout; not ported yet.
+        fprintf(stderr, "nz_heads_load: direct-v1 TokenChoiceProjection is not supported by this runtime yet\n");
+        return false;
+    }
+    const int64_t sid = gguf_find_key(h->gctx, "neuralese.direct.stop_ids");
+    if (sid < 0 || gguf_get_kv_type(h->gctx, sid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(h->gctx, sid) != GGUF_TYPE_INT32 ||
+        gguf_get_arr_n(h->gctx, sid) == 0) {
+        fprintf(stderr, "nz_heads_load: direct-v1 needs neuralese.direct.stop_ids (int32 array)\n");
+        return false;
+    }
+    const int32_t * ids = (const int32_t *) gguf_get_arr_data(h->gctx, sid);
+    h->stop_ids.assign(ids, ids + gguf_get_arr_n(h->gctx, sid));
+    if (blocks < 1 || kernel < 1 || hidden < 1 || !std::isfinite(h->stack_eps) || h->stack_eps <= 0.0f) {
+        fprintf(stderr, "nz_heads_load: invalid direct-v1 stack geometry\n");
+        return false;
+    }
+    h->stack_kernel = (int32_t) kernel;
+    h->stack_hidden = (int32_t) hidden;
+    h->table_t = get_tensor(h, "nz.direct.table_t");
+    if (!h->table_t || h->table_t->ne[1] != h->n_embd) {
+        fprintf(stderr, "nz_heads_load: nz.direct.table_t missing or not [n_vocab, n_embd]\n");
+        return false;
+    }
+    h->n_vocab = (int32_t) h->table_t->ne[0];
+    if (!load_weights(h, path, params)) {
+        return false;
+    }
+    const int64_t d = h->n_embd;
+    auto host = [&](const std::string & name, int64_t ne0, int64_t ne1, std::vector<float> & out) {
+        ggml_tensor * t = get_tensor(h, name.c_str());
+        if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != ne0 || t->ne[1] != ne1 || ggml_nelements(t) != ne0 * ne1) {
+            fprintf(stderr, "nz_heads_load: %s missing or not F32 [%lld, %lld]\n", name.c_str(), (long long) ne1, (long long) ne0);
+            return false;
+        }
+        out.resize((size_t) ne0 * ne1);
+        ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
+        for (float v : out) if (!std::isfinite(v)) { fprintf(stderr, "nz_heads_load: %s is not finite\n", name.c_str()); return false; }
+        return true;
+    };
+    h->stack.resize(blocks);
+    for (uint32_t b = 0; b < blocks; ++b) {
+        const std::string p = "nz.direct.blk." + std::to_string(b) + ".";
+        auto & blk = h->stack[b];
+        if (!host(p + "norm.weight", d, 1, blk.norm) || !host(p + "taps", d, kernel, blk.taps) ||
+            !host(p + "up.weight", d, hidden, blk.up_w) || !host(p + "up.bias", hidden, 1, blk.up_b) ||
+            !host(p + "down.weight", hidden, d, blk.down_w) || !host(p + "down.bias", d, 1, blk.down_b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
     auto * h = new nz_heads();
     h->n_threads = params.n_threads;
@@ -122,13 +242,37 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
         return nullptr;
     }
     uint32_t n_embd = 0, cutoff = 0, max_length = 0, open_id = 0, close_id = 0;
+    const int64_t profile_id = gguf_find_key(h->gctx, "neuralese.profile");
+    const std::string profile = profile_id >= 0 && gguf_get_kv_type(h->gctx, profile_id) == GGUF_TYPE_STRING
+        ? gguf_get_val_str(h->gctx, profile_id) : "legacy-rms-v1";
+    if (profile != "legacy-rms-v1" && profile != "direct-v1") {
+        fprintf(stderr, "%s: unsupported neuralese.profile %s\n", __func__, profile.c_str());
+        nz_heads_free(h);
+        return nullptr;
+    }
+    h->direct = profile == "direct-v1";
+    h->read_markers = !h->direct;
     bool ok = get_u32(h->gctx, "neuralese.n_embd", n_embd) &&
               get_u32(h->gctx, "neuralese.cutoff", cutoff) &&
               get_u32(h->gctx, "neuralese.max_length", max_length) &&
               get_u32(h->gctx, "neuralese.open_token_id", open_id) &&
               get_u32(h->gctx, "neuralese.close_token_id", close_id) &&
               get_f32(h->gctx, "neuralese.norm_eps", h->eps) &&
-              get_f32(h->gctx, "neuralese.feedback.tau", h->tau);
+              (h->direct || get_f32(h->gctx, "neuralese.feedback.tau", h->tau));
+    if (ok && h->direct) {
+        h->n_embd = (int32_t) n_embd;
+        h->cutoff = (int32_t) cutoff;
+        h->max_length = (int32_t) max_length;
+        h->open_token = (llama_token) open_id;
+        h->close_token = (llama_token) close_id;
+        const int64_t did = gguf_find_key(h->gctx, "neuralese.dialect");
+        h->dialect = did >= 0 ? gguf_get_val_str(h->gctx, did) : "";
+        if (!load_direct(h, path, params)) {
+            nz_heads_free(h);
+            return nullptr;
+        }
+        return h;
+    }
     const int64_t did = gguf_find_key(h->gctx, "neuralese.dialect");
     h->dialect = did >= 0 ? gguf_get_val_str(h->gctx, did) : "";
     // Optional (projectors exported before stop sources existed use the shallow source with the count).
@@ -222,42 +366,10 @@ nz_heads * nz_heads_load(const char * path, const nz_heads_params & params) {
         return nullptr;
     }
 
-    // weights on the chosen backend
-    if (params.use_gpu) {
-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-        if (dev) {
-            h->backend = ggml_backend_dev_init(dev, nullptr);
-        }
-    }
-    if (!h->backend) {
-        h->backend = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(h->backend, h->n_threads);
-        if (params.threadpool) ggml_backend_cpu_set_threadpool(h->backend, params.threadpool);
-    }
-    h->wbuf = ggml_backend_alloc_ctx_tensors(h->wctx, h->backend);
-    FILE * fp = h->wbuf ? fopen(path, "rb") : nullptr;
-    if (!fp) {
-        fprintf(stderr, "%s: failed to allocate or read the projector weights\n", __func__);
+    if (!load_weights(h, path, params)) {
         nz_heads_free(h);
         return nullptr;
     }
-    std::vector<uint8_t> buf;
-    const size_t data_offset = gguf_get_data_offset(h->gctx);
-    for (int64_t i = 0; i < gguf_get_n_tensors(h->gctx); ++i) {
-        ggml_tensor * t = ggml_get_tensor(h->wctx, gguf_get_tensor_name(h->gctx, i));
-        const size_t n = ggml_nbytes(t);
-        buf.resize(n);
-        if (fseek(fp, (long) (data_offset + gguf_get_tensor_offset(h->gctx, i)), SEEK_SET) != 0 ||
-            fread(buf.data(), 1, n, fp) != n) {
-            fprintf(stderr, "%s: short read for %s\n", __func__, ggml_get_name(t));
-            fclose(fp);
-            nz_heads_free(h);
-            return nullptr;
-        }
-        ggml_backend_tensor_set(t, buf.data(), 0, n);
-    }
-    fclose(fp);
-    h->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(h->backend));
     ggml_backend_tensor_get(gate, &h->gate, 0, sizeof(float));
     h->n_vocab = (int32_t) h->fb_readout->ne[1];
     h->pos_dim = (int32_t) h->stop_position->ne[0];
@@ -292,6 +404,8 @@ int32_t      nz_heads_max_length (const nz_heads * h) { return h->max_length; }
 llama_token  nz_heads_open_token (const nz_heads * h) { return h->open_token; }
 llama_token  nz_heads_close_token(const nz_heads * h) { return h->close_token; }
 const char * nz_heads_dialect    (const nz_heads * h) { return h->dialect.c_str(); }
+bool         nz_heads_direct     (const nz_heads * h) { return h->direct; }
+bool         nz_heads_read_markers(const nz_heads * h) { return h->read_markers; }
 
 //
 // head computation: small graphs over the projector weights, on the heads' backend
@@ -449,6 +563,10 @@ int32_t nz_read(llama_context * ctx, const nz_heads * h, const float * payload, 
                 llama_pos pos, llama_seq_id seq) {
     if (n <= 0) {
         return 0;
+    }
+    if (h->direct) {
+        // raw identity: the vectors are input embeddings
+        return decode_embd(ctx, payload, n, h->n_embd, pos, seq, false);
     }
     std::vector<float> normed((size_t) n * h->n_embd);
     nz_interface(h, payload, normed.data(), n);
@@ -670,9 +788,153 @@ int32_t nz_write(llama_context * ctx, const nz_heads * h, llama_seq_id seq, llam
 
 int32_t nz_read_back(llama_context * ctx, const nz_heads * h, llama_seq_id seq, llama_pos pos_first,
                      const nz_write_result & r) {
+    if (h->direct) {
+        // no close marker: the payload is read and decoding resumes from the logits at its last vector
+        if (r.n <= 0) return -1;
+        return decode_embd(ctx, r.payload.data(), r.n, h->n_embd, pos_first, seq, true);
+    }
     const int32_t status = nz_read(ctx, h, r.payload.data(), r.n, pos_first, seq);
     if (status != 0) {
         return status;
     }
     return decode_token(ctx, h->close_token, pos_first + r.n, seq);
+}
+
+//
+// direct-v1 writer
+//
+
+namespace {
+
+// The causal conv stack over `rows` (n final states, oldest first; positions before the window read zero) at the last
+// row: CausalConvStack in natlang_neuralese/model/neuralese_projection.py, blocks of RMS norm, depthwise causal conv
+// and a SiLU MLP added to the residual.
+std::vector<float> stack_last(const nz_heads * h, const std::vector<float> & rows, int32_t n) {
+    const int32_t d = h->n_embd, hid = h->stack_hidden, kernel = h->stack_kernel;
+    std::vector<float> x(rows.begin(), rows.begin() + (size_t) n * d), y((size_t) n * d), mixed(d), a(hid);
+    for (const auto & blk : h->stack) {
+        for (int32_t t = 0; t < n; ++t) {
+            const float * xt = x.data() + (size_t) t * d;
+            double sq = 0.0;
+            for (int32_t j = 0; j < d; ++j) sq += (double) xt[j] * xt[j];
+            const float inv = 1.0f / std::sqrt((float) (sq / d) + h->stack_eps);
+            for (int32_t j = 0; j < d; ++j) y[(size_t) t * d + j] = xt[j] * inv * blk.norm[j];
+        }
+        std::vector<float> next(x);
+        for (int32_t t = 0; t < n; ++t) {
+            std::fill(mixed.begin(), mixed.end(), 0.0f);
+            for (int32_t k = 0; k < kernel && k <= t; ++k) {
+                const float * yt = y.data() + (size_t) (t - k) * d;
+                const float * tap = blk.taps.data() + (size_t) k * d;
+                for (int32_t j = 0; j < d; ++j) mixed[j] += yt[j] * tap[j];
+            }
+            for (int32_t i = 0; i < hid; ++i) {
+                const float * w = blk.up_w.data() + (size_t) i * d;
+                double acc = blk.up_b[i];
+                for (int32_t j = 0; j < d; ++j) acc += (double) w[j] * mixed[j];
+                const float v = (float) acc;
+                a[i] = v / (1.0f + std::exp(-v));
+            }
+            float * out = next.data() + (size_t) t * d;
+            for (int32_t j = 0; j < d; ++j) {
+                const float * w = blk.down_w.data() + (size_t) j * hid;
+                double acc = blk.down_b[j];
+                for (int32_t i = 0; i < hid; ++i) acc += (double) w[i] * a[i];
+                out[j] += (float) acc;
+            }
+        }
+        x.swap(next);
+    }
+    return std::vector<float>(x.end() - d, x.end());
+}
+
+} // namespace
+
+int32_t nz_write_direct(llama_context * ctx, const nz_heads * h, llama_seq_id seq, llama_pos pos_first,
+                        const float * top, const float * top_logits, const nz_write_params & params,
+                        nz_write_result & r) {
+    if (!h->direct) {
+        return -1;
+    }
+    const int32_t d       = h->n_embd;
+    const int32_t n_vocab = h->n_vocab;
+    const int32_t n_layer = llama_model_n_layer(llama_get_model(ctx));
+    const int32_t max_len = params.max_length < 0 ? h->max_length : std::min(params.max_length, h->max_length);
+    const int32_t hint    = params.length > 0 ? std::min(params.length, max_len) : 0;
+    // the receptive field of the stack: the current and (kernel - 1) earlier positions per block
+    const int32_t window  = 1 + (int32_t) h->stack.size() * (h->stack_kernel - 1);
+    llama_memory_t mem    = llama_get_memory(ctx);
+    if (params.temperature > 0.0f || max_len < 1 || params.allow_empty) {
+        return -1; // direct values have no trained stochastic payload; a direct block is never empty
+    }
+    if (llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))) != n_vocab) {
+        return -1;
+    }
+
+    r = nz_write_result();
+    std::vector<float> history(top, top + d);   // final states, oldest first, at most `window` rows
+    std::vector<float> logits(top_logits, top_logits + n_vocab);
+    // the greedy tokens run on a scratch copy of the sequence (a recurrent state cannot be rolled back)
+    llama_memory_seq_rm(mem, params.seq_sketch, -1, -1);
+    llama_memory_seq_cp(mem, seq, params.seq_sketch, -1, -1);
+    llama_set_embeddings_layer_inp(ctx, (uint32_t) n_layer, true);
+    int32_t status = 0, count = 0;
+    while (true) {
+        // the readout at the newest state: greedy token and stop log-odds (the reference's DirectWriter.decide)
+        int32_t token = 0;
+        float best = logits[0], top_logit = logits[0];
+        for (int32_t v = 1; v < n_vocab; ++v) {
+            if (logits[v] > best) { best = logits[v]; token = v; }
+        }
+        top_logit = best;
+        double z = 0.0;
+        for (int32_t v = 0; v < n_vocab; ++v) z += std::exp((double) logits[v] - top_logit);
+        const double log_z = top_logit + std::log(z);
+        double stop_mass = 0.0;
+        for (llama_token t : h->stop_ids) {
+            if (t >= 0 && t < n_vocab) stop_mass += std::exp((double) logits[t] - log_z);
+        }
+        const double stop_logp = std::log(stop_mass);
+        const double stop_logit = stop_logp - std::log1p(-std::min(std::exp(stop_logp), 1.0 - 1e-7));
+        if (count > 0) {
+            r.stop_logits.push_back((float) stop_logit);
+        }
+        bool stop = count > 0 && std::find(h->stop_ids.begin(), h->stop_ids.end(), token) != h->stop_ids.end();
+        if (hint > 0) {
+            stop = count == hint;
+        }
+        if (stop || count == max_len) {
+            r.truncated = !stop && hint == 0;
+            break;
+        }
+        // value = softmax(logits)·E + (stack(history) - h)[last]
+        std::vector<float> value(d);
+        {
+            graph_run g;
+            ggml_tensor * l = g.input(logits.data(), n_vocab, 1);
+            ggml_tensor * mixture = ggml_mul_mat(g.ctx, h->table_t, ggml_soft_max(g.ctx, l));
+            if (!g.compute(h, { mixture })) { status = -1; break; }
+            get(mixture, value.data());
+        }
+        const int32_t rows = (int32_t) (history.size() / d);
+        const std::vector<float> stacked = stack_last(h, history, rows);
+        const float * last = history.data() + (size_t) (rows - 1) * d;
+        for (int32_t j = 0; j < d; ++j) value[j] += stacked[j] - last[j];
+        // the next position reads the greedy token
+        status = decode_token(ctx, token, pos_first + count, params.seq_sketch);
+        if (status != 0) break;
+        const float * l = llama_get_logits_ith(ctx, -1);
+        logits.assign(l, l + n_vocab);
+        const float * state = llama_get_embeddings_layer_inp(ctx, (uint32_t) n_layer);
+        history.insert(history.end(), state, state + d);
+        if ((int32_t) (history.size() / d) > window) history.erase(history.begin(), history.begin() + d);
+        r.payload.insert(r.payload.end(), value.begin(), value.end());
+        r.final_h.insert(r.final_h.end(), state, state + d);
+        count++;
+    }
+    llama_memory_seq_rm(mem, params.seq_sketch, -1, -1);
+    r.n = count;
+    r.mean = r.payload;
+    r.log_sigma.assign(r.payload.size(), 0.0f);
+    return status;
 }

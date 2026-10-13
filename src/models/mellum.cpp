@@ -199,6 +199,9 @@ llama_model_mellum::graph<iswa>::graph(const llama_model & model, const llm_grap
     }
     cur = inpL;
 
+    // the final residual before the output norm, for the output rows (llama_set_embeddings_layer_inp(ctx, n_layer))
+    res->t_layer_inp[n_layer] = cur;
+
     cur = build_norm(cur,
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);

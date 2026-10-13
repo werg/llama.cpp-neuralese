@@ -97,6 +97,22 @@ int32_t nz_open(llama_context * ctx, const nz_heads * heads, llama_pos pos, llam
 int32_t nz_write(llama_context * ctx, const nz_heads * heads, llama_seq_id seq, llama_pos pos_first,
                  const float * h_cut, const nz_write_params & params, nz_write_result & result);
 
+// Direct-v1 projectors (neuralese.profile "direct-v1"): blocks carry no read markers and no interface (nz_read
+// decodes the vectors as input embeddings; nz_read_back reads the payload with logits at its last vector), and
+// blocks are written by nz_write_direct instead of nz_open + nz_write.
+bool nz_heads_direct      (const nz_heads * heads);
+bool nz_heads_read_markers(const nz_heads * heads);
+
+// Write a direct-v1 block from the final state `top` (the residual before the output norm at the last position of
+// seq, n_embd floats) and its logits (n_vocab floats). Each step takes the greedy readout token at the newest state;
+// with no length hint the block closes when that token is a stop token (after at least one vector) or at the maximum
+// (truncated). The value is softmax(logits)·E plus the conv stack's correction, and the next position reads the greedy
+// token on a scratch copy of seq (params.seq_sketch). seq itself is unchanged; the payload starts at pos_first. The
+// context must output the final residual (llama_set_embeddings_layer_inp(ctx, n_layer, true), which this enables).
+int32_t nz_write_direct(llama_context * ctx, const nz_heads * heads, llama_seq_id seq, llama_pos pos_first,
+                        const float * top, const float * top_logits, const nz_write_params & params,
+                        nz_write_result & result);
+
 // Read back a written block: payload at pos_first.., then the close marker with logits.
 int32_t nz_read_back(llama_context * ctx, const nz_heads * heads, llama_seq_id seq, llama_pos pos_first,
                      const nz_write_result & result);

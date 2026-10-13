@@ -240,7 +240,8 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens,
+                              size_t output_offset, size_t n_outputs);
 
     //
     // graph
