@@ -1825,6 +1825,26 @@ curl http://127.0.0.1:8080/v1/systemone \
 
 An invalid request returns the error `400`. A model that is not a decision model returns the error `501`. A request with images returns the error `501` if the model does not support image input, or if no multimodal projector is loaded.
 
+## natlang API Endpoints
+
+### POST `/v1/natlang/score`: decision readout
+
+Scores candidate replies to a conversation. For each item, each continuation is rendered as the closed final assistant message after `messages` (the chat template with `add_generation_prompt: false`), and its log-probability is summed over the tokens after the rendered prompt (the same messages with the generation prompt). No token is generated.
+
+*Options:*
+
+`items`: Array of `{ messages, continuations, tools?, lora? }`. `messages` and `tools` are as in `/v1/chat/completions`, including `{"type": "native_state", "id": ...}` content parts for states loaded with `--native-state`; `continuations` is a nonempty array of strings; `lora` selects adapter scales for the item as in a completion request.
+
+`lora`: Default adapter scales for items without their own.
+
+*Result:*
+
+```json
+{ "results": [ { "log_probs": [-0.21, -3.4], "tokens": [3, 3] }, { "error": "each item needs \"messages\"" } ] }
+```
+
+One entry per item: `log_probs[k]` and `tokens[k]` for its `k`-th continuation, or the `error` of an item that could not be rendered (the other items are still scored). The continuations of an item share its prompt prefix: it is computed once and continued in several slots.
+
 ## Server tools
 
 The server exposes a REST API under `/tools` that allows the Web UI to call server tools. This endpoint is intended to be used internally by the Web UI and subject to change or to be removed in the future.
