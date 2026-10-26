@@ -1417,6 +1417,12 @@ private:
 
         metrics.init();
 
+        if (params_base.cache_idle_slots && !params_base.lora_adapters.empty()) {
+            // the prompt cache is not consulted with LoRA adapters (see get_available_slot)
+            SRV_WRN("%s", "--cache-idle-slots is not used with LoRA adapters, disabling\n");
+            params_base.cache_idle_slots = false;
+        }
+
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
@@ -1628,6 +1634,10 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
+            // cached prompt states do not record the adapters they were computed with, so with LoRA adapters a
+            // restored state could serve a request with other adapters; each slot's own cache is checked instead
+            update_cache = update_cache && params_base.lora_adapters.empty();
+
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -1694,9 +1704,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        // process per-request lora adapters
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
+        // process per-request lora adapters; a request without them uses the defaults, and the cache is cleared
+        // whenever the effective adapters change either way
+        {
+            auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
             if (!are_lora_equal(task_loras, slot.lora)) {
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
@@ -1707,8 +1718,6 @@ private:
                 }
                 slot.lora = task_loras;
             }
-        } else {
-            slot.lora = params_base.lora_adapters;
         }
 
         // if using alora, make sure it's only a single one requested and active
