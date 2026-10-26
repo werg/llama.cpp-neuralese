@@ -31,6 +31,9 @@ struct server_context_meta {
     server_chat_params & chat_params;
     std::map<std::string, bool> chat_template_caps;
 
+    // natlang native state spans (--native-state), by ID: the tokens that consume each
+    const std::map<std::string, std::vector<llama_token>> & native_state_tokens;
+
     // tokens
     std::string bos_token_str;
     std::string eos_token_str;
@@ -113,6 +116,28 @@ struct server_context {
 };
 
 
+// natlang decision readout (POST /v1/natlang/score): for each item, the log-probability of each reply as the closed
+// final assistant message after the item's messages, summed over the reply tokens after the rendered prompt
+//   { items: [{ messages, continuations: [string], tools?, lora? }], lora? }
+//   -> { results: [{ log_probs: [number], tokens: [int] } | { error: string }] }
+// the replies of an item share its prompt prefix (one parent task, the others its children)
+struct server_score_batch {
+    std::vector<std::string>         errors;  // per item, empty if its tasks were made
+    std::vector<std::vector<size_t>> results; // per item, the result index of each reply
+    std::vector<double>              log_probs; // per result index, filled by the caller
+    std::vector<int32_t>             n_scored;  // per result index, filled by the caller
+};
+
+std::vector<server_task> server_score_tasks(
+        const server_context_meta & meta,
+        const llama_vocab * vocab,
+        const common_params & params,
+        const json & body,
+        server_response_reader & rd,
+        server_score_batch & out);
+
+json server_score_response(const server_score_batch & batch);
+
 // forward declarations
 struct server_res_generator;
 
@@ -153,6 +178,7 @@ struct server_routes {
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t post_systemone;
+    server_http_context::handler_t post_natlang_score;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
 

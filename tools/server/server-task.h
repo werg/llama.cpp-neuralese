@@ -17,6 +17,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
+    SERVER_TASK_TYPE_SCORE,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_CONTROL,
@@ -152,6 +153,9 @@ struct server_task {
     // if set on a parent, the children have their own prompt and only share its first n_tokens_shared tokens
     int32_t n_tokens_shared = 0;
 
+    // used by SERVER_TASK_TYPE_SCORE: the log-probability of the prompt tokens from this position on is summed
+    int32_t n_score_from = -1;
+
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
@@ -230,6 +234,8 @@ struct server_task {
                 return true;
             case SERVER_TASK_TYPE_DECISION:
                 return !decision.labels.empty();
+            case SERVER_TASK_TYPE_SCORE:
+                return true;
             default:
                 return false;
         }
@@ -508,6 +514,16 @@ struct server_task_result_rerank : server_task_result {
 
 struct server_task_result_decision : server_task_result {
     std::vector<float> scores; // one raw model output per option
+
+    int32_t n_tokens;
+
+    virtual json to_json() override;
+};
+
+// natlang decision readout: the summed log-probability of the scored prompt tokens
+struct server_task_result_score : server_task_result {
+    double  log_prob = 0.0;
+    int32_t n_scored = 0;
 
     int32_t n_tokens;
 

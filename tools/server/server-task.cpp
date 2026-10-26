@@ -1507,6 +1507,18 @@ json server_task_result_decision::to_json() {
 }
 
 //
+// server_task_result_score
+//
+json server_task_result_score::to_json() {
+    return json {
+        {"index",            index},
+        {"log_prob",         log_prob},
+        {"tokens",           n_scored},
+        {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
 // server_task_result_error
 //
 json server_task_result_error::to_json() {

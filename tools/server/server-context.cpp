@@ -40,6 +40,9 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// logits rows reserved per batch for the scored positions of SERVER_TASK_TYPE_SCORE tasks
+constexpr int32_t SERVER_N_SCORE_OUTPUTS = 64;
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -51,6 +54,9 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
+
+    // decision readout (POST /v1/natlang/score) reads several positions of a prompt in one batch
+    result.total = std::min<int32_t>(params.n_batch, result.total + SERVER_N_SCORE_OUTPUTS);
     return result;
 }
 
@@ -267,6 +273,10 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // SERVER_TASK_TYPE_SCORE: the summed log-probability and the number of the prompt tokens scored so far
+    double  score_log_prob = 0.0;
+    int32_t score_n        = 0;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -370,6 +380,8 @@ struct server_slot {
 
         last_nl_pos    = 0;
         generated_text = "";
+        score_log_prob = 0.0;
+        score_n        = 0;
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -891,6 +903,9 @@ public:
     std::map<std::string, std::vector<llama_token>> native_state_tokens;
 
     server_decision_context decision;
+
+    // scored positions in the current batch, at most SERVER_N_SCORE_OUTPUTS
+    int32_t n_score_outputs = 0;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -2363,6 +2378,62 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // add the log-probabilities of the scored tokens predicted in the current sub-batch, false (after an error) on failure
+    bool accumulate_score(server_slot & slot, int32_t n_batch_tokens, int32_t off) {
+        const auto & tokens = slot.task->tokens;
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        for (int32_t i = off; i < off + n_batch_tokens; i++) {
+            const auto & entry = batch.tokens[i];
+            if (entry.id_slot != slot.id || !entry.output || !entry.is_prompt) {
+                continue;
+            }
+            const int32_t next = entry.pos + 1;
+            if (next < slot.task->n_score_from || next >= slot.task->n_tokens()) {
+                continue;
+            }
+            const llama_token target = tokens[next];
+            if (target < 0 || target >= n_vocab) {
+                send_error(slot, "a scored reply must be text", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            const float * logits = llama_get_logits_ith(slot.ctx_tgt, i - off);
+            if (logits == nullptr) {
+                send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
+                return false;
+            }
+            float max_logit = logits[0];
+            for (int32_t v = 1; v < n_vocab; v++) {
+                max_logit = std::max(max_logit, logits[v]);
+            }
+            double sum = 0.0;
+            for (int32_t v = 0; v < n_vocab; v++) {
+                sum += std::exp((double) logits[v] - max_logit);
+            }
+            slot.score_log_prob += (double) logits[target] - max_logit - std::log(sum);
+            slot.score_n += 1;
+        }
+        return true;
+    }
+
+    void send_score(const server_slot & slot) {
+        auto res = std::make_unique<server_task_result_score>();
+        res->id       = slot.task->id;
+        res->index    = slot.task->index;
+        res->n_tokens = slot.task->n_tokens();
+        res->log_prob = slot.score_log_prob;
+        res->n_scored = slot.score_n;
+
+        const int32_t n_expected = slot.task->n_tokens() - slot.task->n_score_from;
+        if (slot.score_n != n_expected) {
+            send_error(slot, string_format("scored %d of %d reply tokens", slot.score_n, n_expected), ERROR_TYPE_SERVER);
+            return;
+        }
+
+        SLT_DBG(slot, "%s", "sending score result\n");
+
+        queue_results.send(std::move(res));
+    }
+
     void send_rerank(const server_slot & slot, const common_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
@@ -2554,6 +2625,7 @@ private:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
             case SERVER_TASK_TYPE_DECISION:
+            case SERVER_TASK_TYPE_SCORE:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -3157,6 +3229,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        n_score_outputs = 0;
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3427,6 +3500,11 @@ private:
                                 // the children start from the shared prefix, do not go past it
                                 if (slot.task->n_tokens_shared > 0) {
                                     n_past = std::min(n_past, slot.task->n_tokens_shared);
+                                }
+
+                                // a score reads the logits from the position before its first scored token on
+                                if (slot.task->type == SERVER_TASK_TYPE_SCORE) {
+                                    n_past = std::min(n_past, slot.task->n_score_from - 1);
                                 }
 
                                 // if there is an alora invoked, don't cache after the invocation start
@@ -3780,10 +3858,17 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
+                        // a score needs the logits that predict each scored token, up to the outputs reserved per batch
+                        const bool score_out = slot.task->type == SERVER_TASK_TYPE_SCORE &&
+                            slot.prompt.n_tokens() + 1 >= slot.task->n_score_from;
+                        if (score_out && n_score_outputs >= SERVER_N_SCORE_OUTPUTS) {
+                            break;
+                        }
+                        n_score_outputs += score_out;
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
+                            /* output    = */ slot.need_embd() || score_out,
                             /* is_prompt = */ true);
                         if (!slot.task->decision.order.empty()) {
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
@@ -4056,6 +4141,15 @@ private:
                 }
             }
 
+            if (slot.task && slot.task->type == SERVER_TASK_TYPE_SCORE &&
+                    (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT)) {
+                if (!accumulate_score(slot, n_batch_tokens, off)) {
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+            }
+
             if (!is_inside_view(slot.i_batch)) {
                 // the required token not in this sub-batch, skip
                 return;
@@ -4079,6 +4173,13 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
                     send_decision(slot, batch.view, slot.i_batch - off);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                if (slot.task->type == SERVER_TASK_TYPE_SCORE) {
+                    send_score(slot);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -4468,6 +4569,7 @@ server_context_meta server_context::get_meta() const {
 
         /* chat_params            */ impl->chat_params,
         /* chat_template_caps     */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
+        /* native_state_tokens    */ impl->native_state_tokens,
 
         /* bos_token_str          */ bos_token_str,
         /* eos_token_str          */ eos_token_str,
@@ -5583,6 +5685,33 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->post_natlang_score = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        server_score_batch batch;
+        auto & rd = res->rd;
+        rd.post_tasks(server_score_tasks(*meta, ctx_server.vocab, params, body, rd, batch));
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res; // connection is closed
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+        batch.log_probs.resize(all_results.results.size());
+        batch.n_scored.resize(all_results.results.size());
+        for (size_t i = 0; i < all_results.results.size(); i++) {
+            auto * result = dynamic_cast<server_task_result_score *>(all_results.results[i].get());
+            GGML_ASSERT(result != nullptr);
+            batch.log_probs[i] = result->log_prob;
+            batch.n_scored[i]  = result->n_scored;
+        }
+        res->ok(server_score_response(batch));
+        return res;
+    };
+
     this->get_lora_adapters = [this](const server_http_req & req) {
         auto res = create_response();
 
@@ -5934,4 +6063,153 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
         should_reset_buckets = false;
     }
+}
+
+//
+// natlang decision readout
+//
+
+std::vector<server_task> server_score_tasks(
+        const server_context_meta & meta,
+        const llama_vocab * vocab,
+        const common_params & params,
+        const json & body,
+        server_response_reader & rd,
+        server_score_batch & out) {
+    if (!body.contains("items") || !body.at("items").is_array()) {
+        throw std::invalid_argument("\"items\" must be an array");
+    }
+    const json & items = body.at("items");
+    const size_t n_slots = std::max(params.n_parallel, 1);
+
+    // the rendered chat prompt, tokenized as the chat completions endpoint does
+    auto render = [&](json chat) {
+        std::vector<raw_buffer> files;
+        const json parsed = oaicompat_chat_params_parse(chat, meta.chat_params, files);
+        if (!files.empty()) {
+            throw std::invalid_argument("a scored item cannot carry media");
+        }
+        const std::string prompt = parsed.at("prompt").get<std::string>();
+        if (!meta.native_state_tokens.empty() && prompt.find("<__natlang_native_state:") != std::string::npos) {
+            return server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_state_tokens), false);
+        }
+        return std::move(tokenize_input_prompts(vocab, nullptr, prompt, true, true, mtmd_helper_init_opt_default())[0]);
+    };
+
+    std::vector<server_task> tasks;
+    size_t n_results = 0;
+    out.errors.assign(items.size(), "");
+    out.results.assign(items.size(), {});
+    for (size_t i_item = 0; i_item < items.size(); i_item++) {
+        const json & item = items[i_item];
+        std::vector<server_task> own;
+        try {
+            if (!item.is_object() || !item.contains("messages") || !item.at("messages").is_array()) {
+                throw std::invalid_argument("each item needs \"messages\"");
+            }
+            const json replies = item.contains("continuations") ? item.at("continuations") : json_value(item, "options", json());
+            if (!replies.is_array() || replies.empty()) {
+                throw std::invalid_argument("each item needs a nonempty \"continuations\" array");
+            }
+            if (item.contains("adapters") && !item.at("adapters").empty()) {
+                throw std::invalid_argument("natlang adapter IDs are not served here; select LoRA adapters with \"lora\"");
+            }
+
+            json chat = { { "messages", item.at("messages") } };
+            if (item.contains("tools")) {
+                chat["tools"] = item.at("tools");
+            }
+            json prompt_chat = chat;
+            prompt_chat["add_generation_prompt"] = true;
+            const server_tokens prompt = render(prompt_chat);
+
+            std::vector<server_tokens> full;
+            size_t n_from = prompt.size();
+            for (const auto & reply : replies) {
+                if (!reply.is_string()) {
+                    throw std::invalid_argument("each continuation must be a string");
+                }
+                json full_chat = chat;
+                full_chat["messages"].push_back({ { "role", "assistant" }, { "content", reply } });
+                full_chat["add_generation_prompt"]  = false;
+                full_chat["continue_final_message"] = false;
+                full.push_back(render(full_chat));
+                n_from = std::min(n_from, prompt.get_common_prefix(full.back()));
+            }
+            // the reply starts where the rendered reply leaves the prompt (a tokenizer may merge across the boundary)
+            if (n_from == 0) {
+                throw std::invalid_argument("the reply does not continue the rendered prompt");
+            }
+
+            json params_json = json::object();
+            if (item.contains("lora")) {
+                params_json["lora"] = item.at("lora");
+            } else if (body.contains("lora")) {
+                params_json["lora"] = body.at("lora");
+            }
+            const task_params task_params = server_schema::eval_llama_cmpl_schema(vocab, params, meta.logit_bias_eog, params_json);
+
+            for (auto & tokens : full) {
+                if (tokens.size() <= n_from) {
+                    throw std::invalid_argument("a continuation rendered no tokens of its own");
+                }
+                server_task task(SERVER_TASK_TYPE_SCORE);
+                task.id           = rd.get_new_id();
+                task.index        = n_results + own.size();
+                task.params       = task_params;
+                task.n_score_from = (int32_t) n_from;
+                task.tokens       = std::move(tokens);
+                own.push_back(std::move(task));
+            }
+        } catch (const std::exception & e) {
+            out.errors[i_item] = e.what();
+            continue;
+        }
+
+        for (size_t k = 0; k < own.size(); k++) {
+            out.results[i_item].push_back(n_results + k);
+        }
+        n_results += own.size();
+
+        // groups of up to n_slots replies: the first computes the shared prompt prefix, the others continue from it
+        for (size_t i = 0; i < own.size(); i += n_slots) {
+            const size_t end = std::min(own.size(), i + n_slots);
+            server_task & parent = own[i];
+            size_t n_shared = parent.n_score_from - 1;
+            for (size_t j = i + 1; j < end; j++) {
+                n_shared = std::min(n_shared, parent.tokens.get_common_prefix(own[j].tokens));
+            }
+            if (end - i < 2 || n_shared == 0) {
+                for (size_t j = i; j < end; j++) {
+                    tasks.push_back(std::move(own[j]));
+                }
+                continue;
+            }
+            parent.n_tokens_shared = (int32_t) n_shared;
+            for (size_t j = i + 1; j < end; j++) {
+                own[j].id_parent = parent.id;
+                parent.child_tasks.push_back(std::move(own[j]));
+            }
+            tasks.push_back(std::move(parent));
+        }
+    }
+    return tasks;
+}
+
+json server_score_response(const server_score_batch & batch) {
+    json results = json::array();
+    for (size_t i = 0; i < batch.errors.size(); i++) {
+        if (!batch.errors[i].empty()) {
+            results.push_back({ { "error", batch.errors[i] } });
+            continue;
+        }
+        json log_probs = json::array();
+        json tokens    = json::array();
+        for (const size_t idx : batch.results[i]) {
+            log_probs.push_back(batch.log_probs.at(idx));
+            tokens.push_back(batch.n_scored.at(idx));
+        }
+        results.push_back({ { "log_probs", log_probs }, { "tokens", tokens } });
+    }
+    return json { { "results", results } };
 }
