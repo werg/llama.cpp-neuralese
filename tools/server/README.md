@@ -241,6 +241,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--prefill-assistant, --no-prefill-assistant` | whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)<br/>when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled<br/><br/>(env: LLAMA_ARG_PREFILL_ASSISTANT) |
 | `-sps, --slot-prompt-similarity SIMILARITY` | how much the prompt of a request must match the prompt of a slot in order to use that slot (default: 0.10, 0.0 = disabled) |
 | `--lora-init-without-apply` | load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: disabled) |
+| `--lora-per-sequence` | apply LoRA adapters per sequence: each request's adapter scales affect only its own tokens, so requests with different adapters are batched together (implies `--lora-init-without-apply`; aLoRA adapters are not supported in this mode) (default: disabled) |
 | `--sleep-idle-seconds SECONDS` | number of seconds of idleness after which the server will sleep (default: -1; -1 = disabled) |
 | `--log-prompts-dir PATH` | Log prompts to directory (auto-created if not present; only used for debugging, default: disabled) |
 | `--spec-draft-hf, -hfd, -hfrd, --hf-repo-draft <user>/<model>[:quant]` | Same as --hf-repo, but for the draft model (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_HF_REPO) |
@@ -1203,6 +1204,15 @@ This endpoint returns the loaded LoRA adapters. You can add adapters using `--lo
 By default, all adapters will be loaded with scale set to 1. To initialize all adapters scale to 0, add `--lora-init-without-apply`
 
 Please note that this value will be overwritten by the `lora` field for each request.
+
+With `--lora-per-sequence`, the `lora` field of a request sets that request's own scales and never changes another
+request's: requests with different adapter sets share one batch. Each adapter's low-rank product is computed for the
+whole batch and multiplied by a per-token scale, so the cost grows with the number of loaded adapters, not with the
+number of distinct stacks. Isolation is exact up to floating-point reduction order: on CPU, a concurrently batched
+request matches the same request decoded alone (tokens identical, |Δlogprob| ≤ 1e-5), for dense layers and for
+expert (`mul_mat_id`) layers alike; a request with all scales zero is bitwise identical to a server without adapters.
+On CUDA, mixture-of-experts kernels are already sensitive to batch composition without adapters, so compare against
+a batched baseline there.
 
 If an adapter is disabled, the scale will be set to 0.
 
