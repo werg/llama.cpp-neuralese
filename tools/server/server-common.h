@@ -11,6 +11,8 @@
 #include "json.h"
 
 #include <atomic>
+#include <map>
+#include <set>
 #include <chrono>
 #include <condition_variable>
 #include <cinttypes>
@@ -334,7 +336,17 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    std::set<std::string> native_states; // IDs of loaded native state spans (--native-state)
 };
+
+// the prompt text a native_state content part renders to; tokenize_native_states() expands it
+std::string native_state_marker(const std::string & id);
+
+// tokenize a prompt whose text may hold native state markers: text runs are tokenized separately (as the reference
+// engine tokenizes the segments around a state) and each marker becomes the state's consume-open marker, virtual
+// span and consume-close marker. `states` maps IDs to their tokens; a marker naming another ID is an error.
+llama_tokens tokenize_native_states(const llama_vocab * vocab, const std::string & prompt, bool add_special, bool parse_special,
+                                    const std::map<std::string, std::vector<llama_token>> & states);
 
 // used by /completions endpoint
 json oaicompat_completion_params_parse(const json & body);

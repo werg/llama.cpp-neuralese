@@ -242,6 +242,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-sps, --slot-prompt-similarity SIMILARITY` | how much the prompt of a request must match the prompt of a slot in order to use that slot (default: 0.10, 0.0 = disabled) |
 | `--lora-init-without-apply` | load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: disabled) |
 | `--lora-per-sequence` | apply LoRA adapters per sequence: each request's adapter scales affect only its own tokens, so requests with different adapters are batched together (implies `--lora-init-without-apply`; aLoRA adapters are not supported in this mode) (default: disabled) |
+| `--native-state FNAME` | load a natlang native state span (GGUF, `common/native-state.h`; can be repeated); a chat content part `{"type": "native_state", "id": ID}` consumes it exactly, between its consume markers |
 | `--sleep-idle-seconds SECONDS` | number of seconds of idleness after which the server will sleep (default: -1; -1 = disabled) |
 | `--log-prompts-dir PATH` | Log prompts to directory (auto-created if not present; only used for debugging, default: disabled) |
 | `--spec-draft-hf, -hfd, -hfrd, --hf-repo-draft <user>/<model>[:quant]` | Same as --hf-repo, but for the draft model (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_HF_REPO) |
@@ -1196,6 +1197,19 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
     "n_erased": 1745
 }
 ```
+
+### Native state spans (`--native-state`)
+
+A native state span is exact per-layer stored state for a run of positions, exported from natlang's native engine
+(tuned soft instructions and skills): attention keys after the key norm and before RoPE, values, and LFM2
+short-convolution gated inputs. `--native-state FILE` registers it with the context (`llama_state_span_register`) as
+a range of virtual token IDs after the vocabulary. In a chat request, the content part
+`{"type": "native_state", "id": ID}` is rendered as a marker and tokenized as the consume-open marker, the virtual
+span and the consume-close marker; the text around it is tokenized as separate segments. A decode stores the imported
+state for virtual tokens (RoPE applied at their positions) instead of computing it, so consumption is exact:
+on CPU with an F32 cache, logits match natlang's reference engine as closely as plain text does, a plain-text prompt
+is bitwise unchanged, and the prompt cache reuses spans like other tokens. An unloaded ID is a 400 error. Supported:
+LFM2; not combinable with speculative decoding or media in the same request.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 

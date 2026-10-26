@@ -5,6 +5,7 @@
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
+#include "llama-state-span.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
 
@@ -298,6 +299,15 @@ private:
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
     llama_adapter_loras_seq_ptr loras_seq; // null unless per-sequence adapters are registered
+
+public:
+    llama_state_spans state_spans; // registered native state spans (llama_state_span_register)
+
+    llama_token state_span_register(int32_t n_tokens, const llama_state_span_layer * layers, int32_t n_layers);
+    bool        state_span_unregister(llama_token first);
+    bool        ubatch_has_virtual(const llama_ubatch & ubatch) const;
+
+private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

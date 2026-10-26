@@ -1815,6 +1815,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // a token past the vocabulary must be a registered native state span token
+    for (const auto & t : batch_inp.tokens) {
+        int32_t row = 0;
+        if (t.id >= vocab.n_tokens() && !state_spans.find(t.id, row)) {
+            LLAMA_LOG_ERROR("%s: token %d is neither in the vocabulary nor a registered state span token\n", __func__, t.id);
+            return -1;
+        }
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -2640,6 +2649,69 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+bool llama_context::ubatch_has_virtual(const llama_ubatch & ubatch) const {
+    if (!ubatch.token || state_spans.spans.empty()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.token[i] >= state_spans.base) {
+            return true;
+        }
+    }
+    return false;
+}
+
+llama_token llama_context::state_span_register(int32_t n_tokens, const llama_state_span_layer * layers, int32_t n_layers) {
+    const auto & hp = model.hparams;
+    if (model.arch != LLM_ARCH_LFM2) {
+        LLAMA_LOG_ERROR("%s: native state spans are not supported for this architecture\n", __func__);
+        return LLAMA_TOKEN_NULL;
+    }
+    if (n_tokens <= 0 || n_layers != (int32_t) hp.n_layer() || !layers) {
+        LLAMA_LOG_ERROR("%s: a span needs tokens and one state per layer (%u)\n", __func__, hp.n_layer());
+        return LLAMA_TOKEN_NULL;
+    }
+    if (state_spans.base == 0) {
+        state_spans.base = state_spans.next = model.vocab.n_tokens();
+    }
+    if ((int64_t) state_spans.next + n_tokens > (int64_t) state_spans.base + LLAMA_STATE_SPAN_MAX_TOKENS) {
+        LLAMA_LOG_ERROR("%s: virtual token space exhausted\n", __func__);
+        return LLAMA_TOKEN_NULL;
+    }
+    auto span = std::make_unique<llama_state_span>();
+    span->first = state_spans.next;
+    span->n     = n_tokens;
+    span->k.resize(n_layers); span->v.resize(n_layers); span->conv.resize(n_layers); span->width_kv.assign(n_layers, 0);
+    span->width_conv = hp.n_embd;
+    for (int32_t il = 0; il < n_layers; ++il) {
+        if (hp.is_recr(il)) {
+            if (!layers[il].conv) {
+                LLAMA_LOG_ERROR("%s: layer %d is a short convolution and needs its gated inputs\n", __func__, il);
+                return LLAMA_TOKEN_NULL;
+            }
+            span->conv[il].assign(layers[il].conv, layers[il].conv + (size_t) n_tokens*hp.n_embd);
+        } else {
+            if (!layers[il].k || !layers[il].v) {
+                LLAMA_LOG_ERROR("%s: layer %d is attention and needs keys and values\n", __func__, il);
+                return LLAMA_TOKEN_NULL;
+            }
+            const int64_t w = hp.n_embd_k_gqa(il);
+            GGML_ASSERT(hp.n_embd_v_gqa(il) == (uint32_t) w);
+            span->width_kv[il] = w;
+            span->k[il].assign(layers[il].k, layers[il].k + (size_t) n_tokens*w);
+            span->v[il].assign(layers[il].v, layers[il].v + (size_t) n_tokens*w);
+        }
+    }
+    const llama_token first = span->first;
+    state_spans.next += n_tokens;
+    state_spans.spans[first] = std::move(span);
+    return first;
+}
+
+bool llama_context::state_span_unregister(llama_token first) {
+    return state_spans.spans.erase(first) > 0;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -2658,6 +2730,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras_seq   =*/ loras_seq.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.state_spans =*/ ubatch_has_virtual(ubatch) ? &state_spans : nullptr,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -4219,6 +4292,23 @@ int32_t llama_set_adapter_lora_seq_scales(
             const float * scales,
             size_t n_scales) {
     return ctx->set_adapter_lora_seq_scales(seq_id, scales, n_scales) ? 0 : -1;
+}
+
+llama_token llama_state_span_register(
+        llama_context * ctx,
+        int32_t n_tokens,
+        const llama_state_span_layer * layers,
+        int32_t n_layers) {
+    return ctx->state_span_register(n_tokens, layers, n_layers);
+}
+
+bool llama_state_span_unregister(llama_context * ctx, llama_token first) {
+    return ctx->state_span_unregister(first);
+}
+
+bool llama_state_span_is_virtual(const llama_context * ctx, llama_token token) {
+    int32_t row = 0;
+    return ctx->state_spans.find(token, row) != nullptr;
 }
 
 int32_t llama_set_adapters_lora(
