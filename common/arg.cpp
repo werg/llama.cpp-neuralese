@@ -3828,6 +3828,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--native-state"}, "FNAME",
+        "load a natlang native state span (GGUF, common/native-state.h; can be repeated); a chat content part "
+        "{\"type\": \"native_state\", \"id\": ID} consumes it exactly, between its consume markers",
+        [](common_params & params, const std::string & value) {
+            params.native_states.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--sleep-idle-seconds"}, "SECONDS",
         string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
         [](common_params & params, int value) {

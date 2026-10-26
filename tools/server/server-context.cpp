@@ -9,6 +9,7 @@
 #include "server-stream.h"
 
 #include "build-info.h"
+#include "native-state.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -952,6 +953,10 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
+    // natlang native state spans (--native-state), registered with ctx_tgt, by ID: the tokens that consume each
+    std::vector<common_native_state> native_states;
+    std::map<std::string, std::vector<llama_token>> native_state_tokens;
+
     server_decision_context decision;
 
     server_queue    queue_tasks;
@@ -999,6 +1004,7 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1231,6 +1237,19 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
+        native_states.clear();
+        native_state_tokens.clear();
+        for (const auto & path : params_base.native_states) {
+            common_native_state st;
+            if (!common_native_state_load(path, llama_model_n_layer(model_tgt), st) || !common_native_state_register(ctx_tgt, st)) {
+                SRV_ERR("failed to load native state '%s'\n", path.c_str());
+                return false;
+            }
+            native_state_tokens[st.id] = common_native_state_tokens(st);
+            SRV_INF("native state %s: %d positions\n", st.id.c_str(), st.n_tokens);
+            native_states.push_back(std::move(st));
+        }
+
         try {
             decision.init(model_tgt);
         } catch (const std::exception & e) {
@@ -1260,6 +1279,12 @@ private:
 
                 if (has_draft && model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
+
+                if (!native_states.empty()) {
+                    // a draft model cannot import the target's native state spans
+                    SRV_ERR("%s", "native states (--native-state) cannot be combined with speculative decoding\n");
                     return false;
                 }
 
@@ -1643,6 +1668,9 @@ private:
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
+            for (const auto & st : native_states) {
+                chat_params.native_states.insert(st.id);
+            }
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
@@ -2464,7 +2492,12 @@ private:
     bool tokenize_cli_input(server_task & task) {
         try {
             auto & prompt = task.cli_prompt;
-            if (mctx != nullptr) {
+            if (!native_state_tokens.empty() && prompt.find("<__natlang_native_state:") != std::string::npos) {
+                if (!task.cli_files.empty()) {
+                    throw std::invalid_argument("native states cannot be combined with media in one request");
+                }
+                task.tokens = server_tokens(tokenize_native_states(vocab, prompt, true, true, native_state_tokens), false);
+            } else if (mctx != nullptr) {
                 task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files, init_opt);
             } else {
                 task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true, init_opt)[0]);
@@ -4927,7 +4960,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (!ctx_server.native_state_tokens.empty() && prompt.is_string() &&
+                prompt.get<std::string>().find("<__natlang_native_state:") != std::string::npos) {
+            if (!files.empty()) {
+                throw std::invalid_argument("native states cannot be combined with media in one request");
+            }
+            inputs.emplace_back(tokenize_native_states(ctx_server.vocab, prompt.get<std::string>(), true, true,
+                                                       ctx_server.native_state_tokens), false);
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {

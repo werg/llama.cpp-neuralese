@@ -1,4 +1,5 @@
 #include "llama-batch.h"
+#include "llama-state-span.h"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -1161,7 +1162,8 @@ llama_batch_ext::llama_batch_ext(llama_context * ctx) :
         n_embd_state(llama_batch_ext_select_n_embd_state(ctx->get_cparams().ctx_type, llama_get_model(ctx)->hparams)),
         n_seq_max(llama_n_seq_max(ctx)),
         mem(llama_get_memory(ctx)),
-        n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))),
+        // virtual tokens of native state spans follow the vocabulary; decode rejects unregistered ones
+        n_vocab(llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))) + LLAMA_STATE_SPAN_MAX_TOKENS),
         n_pos_per_embd(llama_get_model(ctx)->hparams.n_pos_per_embd()) {
     clear();
 }

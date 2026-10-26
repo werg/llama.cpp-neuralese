@@ -734,8 +734,10 @@ void server_tokens::keep_first(size_t n) {
 std::string server_tokens::detokenize(const llama_context * ctx, bool special) const {
     llama_tokens text_tokens;
     text_tokens.reserve(tokens.size());
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
     for (const auto & t : tokens) {
-        if (t != LLAMA_TOKEN_NULL) {
+        // media chunks and native state spans have no text
+        if (t != LLAMA_TOKEN_NULL && t < n_vocab) {
             text_tokens.push_back(t);
         }
     }
@@ -829,7 +831,7 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
             } catch (const std::exception & e) {
                 return false;
             }
-        } else if (t < 0 || t >= n_vocab) {
+        } else if (t < 0 || (t >= n_vocab && !llama_state_span_is_virtual(ctx, t))) {
             return false;
         }
     }
@@ -1243,10 +1245,53 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             p.erase("input_video");
             p.erase("video_url");
 
+        } else if (type == "native_state") {
+            const std::string id = json_value(p, "id", std::string());
+            if (!opt.native_states.count(id)) {
+                throw std::invalid_argument("native state " + id + " is not loaded on this server (--native-state)");
+            }
+            p = json { { "type", "text" }, { "text", native_state_marker(id) } };
+
         } else if (type != "text") {
             throw std::invalid_argument("unsupported content[].type");
         }
     }
+}
+
+std::string native_state_marker(const std::string & id) {
+    return "<__natlang_native_state:" + id + "__>";
+}
+
+llama_tokens tokenize_native_states(const llama_vocab * vocab, const std::string & prompt, bool add_special, bool parse_special,
+                                    const std::map<std::string, std::vector<llama_token>> & states) {
+    static const std::string open = "<__natlang_native_state:", close = "__>";
+    llama_tokens out;
+    size_t pos = 0;
+    bool first = true;
+    while (true) {
+        const size_t at = prompt.find(open, pos);
+        const std::string text = prompt.substr(pos, at == std::string::npos ? std::string::npos : at - pos);
+        if (!text.empty() || first) {
+            const auto ids = common_tokenize(vocab, text, add_special && first, parse_special);
+            out.insert(out.end(), ids.begin(), ids.end());
+        }
+        first = false;
+        if (at == std::string::npos) {
+            break;
+        }
+        const size_t end = prompt.find(close, at + open.size());
+        if (end == std::string::npos) {
+            throw std::invalid_argument("unterminated native state marker");
+        }
+        const std::string id = prompt.substr(at + open.size(), end - at - open.size());
+        const auto found = states.find(id);
+        if (found == states.end()) {
+            throw std::invalid_argument("native state " + id + " is not loaded on this server (--native-state)");
+        }
+        out.insert(out.end(), found->second.begin(), found->second.end());
+        pos = end + close.size();
+    }
+    return out;
 }
 
 server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context * mctx, const server_chat_params & opt, json content, bool add_special, bool parse_special, const mtmd_helper_init_opt & init_opt) {

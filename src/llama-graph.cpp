@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-state-span.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -71,7 +72,22 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        bool has_virtual = false;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            has_virtual |= ubatch->token[i] >= n_vocab;
+        }
+        if (has_virtual) {
+            // a virtual token's stored state is imported (build_state_span); its embedding row only has to exist
+            std::vector<llama_token> ids(ubatch->token, ubatch->token + n_tokens);
+            for (auto & id : ids) {
+                if (id >= n_vocab) {
+                    id = 0;
+                }
+            }
+            ggml_backend_tensor_set(tokens, ids.data(), 0, n_tokens*ggml_element_size(tokens));
+        } else {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     }
 
     if (ubatch->embd && embd && !ubatch->is_mixed()) {
@@ -89,7 +105,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         std::vector<int64_t> slots;
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
             if (!ubatch->type[i]) {
-                ids.push_back(ubatch->token[i]);
+                ids.push_back(ubatch->token[i] >= n_vocab ? 0 : ubatch->token[i]);
                 slots.push_back(i);
             }
         }
@@ -123,6 +139,42 @@ static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
         n += !ubatch.type[i];
     }
     return n;
+}
+
+void llm_graph_input_state_span::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->token);
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    std::vector<const llama_state_span *> span(n_tokens, nullptr);
+    std::vector<int32_t> row(n_tokens, 0);
+    std::vector<float> m(n_tokens, 0.0f), k(n_tokens, 1.0f);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        span[i] = spans->find(ubatch->token[i], row[i]);
+        if (span[i]) {
+            m[i] = 1.0f;
+            k[i] = 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(mask, m.data(), 0, n_tokens*sizeof(float));
+    ggml_backend_tensor_set(keep, k.data(), 0, n_tokens*sizeof(float));
+
+    std::vector<float> data;
+    for (const auto & e : entries) {
+        data.assign((size_t) e.width*n_tokens, 0.0f);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            if (!span[i]) {
+                continue;
+            }
+            const auto & src = e.kind == KIND_K ? span[i]->k[e.il] : e.kind == KIND_V ? span[i]->v[e.il] : span[i]->conv[e.il];
+            GGML_ASSERT((int64_t) src.size() == (int64_t) span[i]->n*e.width);
+            std::copy(src.begin() + (size_t) row[i]*e.width, src.begin() + (size_t) (row[i] + 1)*e.width, data.begin() + (size_t) i*e.width);
+        }
+        ggml_backend_tensor_set(e.t, data.data(), 0, data.size()*sizeof(float));
+    }
+}
+
+bool llm_graph_input_state_span::can_reuse(const llm_graph_params & params) {
+    return params.state_spans == spans && mask && mask->ne[1] == params.ubatch.n_tokens;
 }
 
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
@@ -1571,6 +1623,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    state_spans      (params.state_spans),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
@@ -2571,6 +2624,34 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }
 
+ggml_tensor * llm_graph_context::build_state_span(ggml_tensor * cur, int il, llm_graph_input_state_span::kind_t kind) const {
+    if (!state_spans) {
+        return cur;
+    }
+    const int64_t n_tokens = ubatch.n_tokens;
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(cur) % n_tokens == 0);
+    const int64_t width = ggml_nelements(cur) / n_tokens;
+
+    if (!inp_state_span) {
+        auto inp = std::make_unique<llm_graph_input_state_span>(state_spans);
+        inp->mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp->mask);
+        inp->keep = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp->keep);
+        inp_state_span = static_cast<llm_graph_input_state_span *>(res->add_input(std::move(inp)));
+    }
+    ggml_tensor * value = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, width, n_tokens);
+    ggml_set_input(value);
+    cb(value, "state_span", il);
+    inp_state_span->entries.push_back({ value, il, kind, width });
+
+    // rows are in ubatch order and contiguous in a 2D view; exact: x*1 + y*0 and x*0 + y*1 for finite x, y
+    ggml_tensor * flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), width, n_tokens);
+    ggml_tensor * out  = ggml_add(ctx0, ggml_mul(ctx0, flat, inp_state_span->keep), ggml_mul(ctx0, value, inp_state_span->mask));
+    return ggml_reshape(ctx0, out, cur);
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
@@ -2579,6 +2660,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     assert(n_embd_inp >= n_embd);
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    inp->n_vocab = tok_embd->ne[1];
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it

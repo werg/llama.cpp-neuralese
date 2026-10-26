@@ -149,6 +149,9 @@ public:
     float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
+
+    // token IDs at or above this are virtual tokens of native state spans: their (unused) embedding row is row 0
+    int64_t n_vocab = INT64_MAX;
 };
 
 // similar to llm_graph_input_embd but with an additional hidden state input, fed from ubatch.embd_state
@@ -167,6 +170,33 @@ public:
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
+};
+
+struct llama_state_spans;
+
+// native state spans: the registered per-layer state of the ubatch's virtual tokens (llama-state-span.h)
+class llm_graph_input_state_span : public llm_graph_input_i {
+public:
+    llm_graph_input_state_span(const llama_state_spans * spans) : spans(spans) {}
+    virtual ~llm_graph_input_state_span() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    enum kind_t { KIND_K, KIND_V, KIND_CONV };
+    struct entry {
+        ggml_tensor * t;     // F32 [width, n_tokens]: the registered row for virtual tokens, 0 otherwise
+        int           il;
+        kind_t        kind;
+        int64_t       width;
+    };
+    std::vector<entry> entries;
+
+    ggml_tensor * mask = nullptr; // F32 [1, n_tokens]: 1 for virtual tokens, 0 otherwise
+    ggml_tensor * keep = nullptr; // F32 [1, n_tokens]: 1 - mask
+
+    const llama_state_spans * spans;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -806,6 +836,9 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    // non-null when the ubatch holds virtual tokens of native state spans
+    const llama_state_spans       * state_spans;
+
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
@@ -905,6 +938,7 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            state_spans == other.state_spans &&
             cross == other.cross;
     }
 };
@@ -1058,6 +1092,9 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+
+    const llama_state_spans       * state_spans;
+    mutable llm_graph_input_state_span * inp_state_span = nullptr;
 
     const llama_prec_policy * prec_policy;
 
@@ -1229,6 +1266,11 @@ struct llm_graph_context {
 
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+
+    // native state spans: cur with the rows of virtual tokens replaced by their registered state. cur holds one row of
+    // `width` floats per ubatch token in ubatch order (any shape whose first dimensions multiply to width); kind
+    // selects the layer's key, value or short-convolution gated input. Without virtual tokens, cur itself.
+    ggml_tensor * build_state_span(ggml_tensor * cur, int il, llm_graph_input_state_span::kind_t kind) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

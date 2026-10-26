@@ -193,6 +193,10 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         k = build_norm(k, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
         cb(k, "model.layers.{}.self_attn.k_layernorm", il);
 
+        // native state spans: virtual tokens store their imported key (pre-RoPE) and value
+        k = build_state_span(k, il, llm_graph_input_state_span::KIND_K);
+        v = build_state_span(v, il, llm_graph_input_state_span::KIND_V);
+
         // RoPE
         q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor,
                           attn_factor, beta_fast, beta_slow);
@@ -237,7 +241,8 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         auto *     x          = ggml_view_3d(ctx0, bcx, chunk_size, bcx->ne[1], bcx->ne[2], bcx->nb[1], bcx->nb[2],
                                              2 * chunk_size * ggml_element_size(bcx));
 
-        auto * bx = ggml_transpose(ctx0, ggml_mul(ctx0, b, x));
+        // native state spans: virtual tokens feed their imported gated input to the convolution and its state
+        auto * bx = ggml_transpose(ctx0, build_state_span(ggml_mul(ctx0, b, x), il, llm_graph_input_state_span::KIND_CONV));
 
         // read conv state
         auto * conv_state = mctx_cur->get_r_l(il);

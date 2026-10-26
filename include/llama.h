@@ -732,6 +732,32 @@ extern "C" {
             size_t n_adapters,
             float * scales);
 
+    // Native state spans: exact per-layer stored state imported from outside the model (Neuralese shared-state
+    // spans, e.g. tuned soft instructions). Registers n_tokens positions and returns the first of n_tokens
+    // consecutive virtual token IDs (>= llama_vocab_n_tokens) that stand for them in batches. For a virtual token,
+    // a decode stores the registered state instead of computing it: attention layers take layers[il].k (the key
+    // after the key norm and before RoPE; RoPE is applied at the token's batch position) and layers[il].v, float
+    // [n_tokens][n_embd_k_gqa(il)]; recurrent short-convolution layers take layers[il].conv (the gated input B*x),
+    // float [n_tokens][n_embd]. The data is copied. Supported architectures: LFM2. Returns LLAMA_TOKEN_NULL if the
+    // architecture is unsupported or a layer lacks its state.
+    struct llama_state_span_layer {
+        const float * k;
+        const float * v;
+        const float * conv;
+    };
+
+    LLAMA_API llama_token llama_state_span_register(
+            struct llama_context * ctx,
+            int32_t n_tokens,
+            const struct llama_state_span_layer * layers,
+            int32_t n_layers);
+
+    // Release a registered span by its first virtual token ID. Returns false if no span starts there.
+    LLAMA_API bool llama_state_span_unregister(struct llama_context * ctx, llama_token first);
+
+    // Whether token is a registered virtual token of this context.
+    LLAMA_API bool llama_state_span_is_virtual(const struct llama_context * ctx, llama_token token);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

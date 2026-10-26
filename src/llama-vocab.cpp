@@ -4411,6 +4411,9 @@ const std::string & llama_vocab::token_to_piece(llama_token token) const {
 }
 
 int32_t llama_vocab::token_to_piece(llama_token token, char * buf, int32_t length, int32_t lstrip, bool special) const {
+    if (token >= (llama_token) n_tokens()) {
+        return 0; // a virtual token of a native state span (llama_state_span_register) has no text
+    }
     return pimpl->token_to_piece(token, buf, length, lstrip, special);
 }
 
