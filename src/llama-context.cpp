@@ -1364,6 +1364,41 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     sched_need_reserve = true;
 }
 
+void llama_context::set_adapters_lora_per_seq(llama_adapter_lora ** adapters, size_t n_adapters) {
+    if (n_adapters == 0) {
+        if (loras_seq) {
+            loras_seq.reset();
+            sched_need_reserve = true;
+        }
+        return;
+    }
+
+    std::vector<llama_adapter_lora *> list(adapters, adapters + n_adapters);
+    if (loras_seq && loras_seq->adapters == list) {
+        return;
+    }
+
+    // a new object: graphs built for the previous adapter list are not reused
+    loras_seq.reset(new llama_adapter_loras_seq());
+    loras_seq->adapters = std::move(list);
+
+    sched_need_reserve = true;
+}
+
+bool llama_context::set_adapter_lora_seq_scales(llama_seq_id seq_id, const float * scales, size_t n_scales) {
+    if (!loras_seq || n_scales != loras_seq->adapters.size()) {
+        return false;
+    }
+
+    if (scales == nullptr) {
+        loras_seq->scales.erase(seq_id);
+    } else {
+        loras_seq->scales[seq_id].assign(scales, scales + n_scales);
+    }
+
+    return true;
+}
+
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -2444,6 +2479,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+        if (loras_seq) {
+            // per-sequence application adds a scale view and a mul per weight
+            for (const auto * lora : loras_seq->adapters) {
+                res += lora->get_n_nodes();
+            }
+        }
     }
 
     uint32_t n_sampling_nodes = 0;
@@ -2614,6 +2655,7 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.loras_seq   =*/ loras_seq.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
@@ -4157,6 +4199,27 @@ struct ggml_cgraph * llama_graph_reserve(
 }
 
 // llama adapter API
+
+int32_t llama_set_adapters_lora_per_seq(
+            llama_context * ctx,
+            llama_adapter_lora ** adapters,
+            size_t n_adapters) {
+    if (adapters == nullptr) {
+        GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora_per_seq call");
+    }
+
+    ctx->set_adapters_lora_per_seq(adapters, n_adapters);
+
+    return 0;
+}
+
+int32_t llama_set_adapter_lora_seq_scales(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            const float * scales,
+            size_t n_scales) {
+    return ctx->set_adapter_lora_seq_scales(seq_id, scales, n_scales) ? 0 : -1;
+}
 
 int32_t llama_set_adapters_lora(
             llama_context * ctx,

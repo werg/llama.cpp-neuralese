@@ -196,6 +196,50 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_lora_scales::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens   = ubatch->n_tokens;
+    const size_t  n_adapters = loras_seq->adapters.size();
+
+    // a token shared by several sequences uses its first sequence's scales; those sequences must agree
+    auto seq_of = [&](int64_t t) { return ubatch->seq_id[t][0]; };
+
+    if (scales) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(scales->buffer));
+        float * data = (float *) scales->data;
+        for (size_t a = 0; a < n_adapters; ++a) {
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                data[a*n_tokens + t] = loras_seq->get(seq_of(t), a);
+            }
+        }
+    }
+
+    if (scales_out) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(scales_out->buffer));
+        float * data = (float *) scales_out->data;
+        // output rows in token order, matching llm_graph_input_out_ids
+        std::vector<int64_t> rows;
+        rows.reserve(n_outputs);
+        for (int64_t t = 0; t < n_tokens && (int64_t) rows.size() < (int64_t) n_outputs; ++t) {
+            if ((int64_t) n_outputs == n_tokens || (ubatch->output && ubatch->output[t])) {
+                rows.push_back(t);
+            }
+        }
+        GGML_ASSERT(rows.size() == n_outputs);
+        for (size_t a = 0; a < n_adapters; ++a) {
+            for (size_t o = 0; o < rows.size(); ++o) {
+                data[a*n_outputs + o] = loras_seq->get(seq_of(rows[o]), a);
+            }
+        }
+    }
+}
+
+bool llm_graph_input_lora_scales::can_reuse(const llm_graph_params & params) {
+    bool res = loras_seq == params.loras_seq;
+    res &= !scales     || scales->ne[0]     == params.ubatch.n_tokens;
+    res &= !scales_out || scales_out->ne[0] == params.n_outputs;
+    return res;
+}
+
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
@@ -1488,6 +1532,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    loras_seq        (params.loras_seq),
     mctx             (params.mctx),
     cross            (params.cross),
     prec_policy      (params.prec_policy),
@@ -1511,6 +1556,34 @@ ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
     return cvec->apply_to(ctx0, cur, il);
+}
+
+ggml_tensor * llm_graph_context::build_lora_seq_scale(size_t i, int64_t n_cols) const {
+    if (!inp_lora_scales) {
+        auto inp = std::make_unique<llm_graph_input_lora_scales>(loras_seq, n_outputs);
+        inp_lora_scales = inp.get();
+        res->add_input(std::move(inp));
+    }
+
+    const int64_t n_adapters = (int64_t) loras_seq->adapters.size();
+
+    ggml_tensor ** src = nullptr;
+    if (n_cols == n_tokens) {
+        src = &inp_lora_scales->scales;
+    } else if (n_cols == n_outputs) {
+        src = &inp_lora_scales->scales_out;
+    } else {
+        GGML_ABORT("per-sequence LoRA: matmul over %lld columns matches neither the batch (%lld) nor its outputs (%lld)",
+                (long long) n_cols, (long long) n_tokens, (long long) n_outputs);
+    }
+
+    if (*src == nullptr) {
+        *src = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cols, n_adapters);
+        ggml_set_input(*src);
+        ggml_set_name(*src, n_cols == n_tokens ? "inp_lora_scales" : "inp_lora_scales_out");
+    }
+
+    return ggml_view_2d(ctx0, *src, 1, n_cols, ggml_element_size(*src), i*(*src)->nb[1]);
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(
@@ -1547,6 +1620,31 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
+    }
+
+    if (loras_seq) {
+        for (size_t i = 0; i < loras_seq->adapters.size(); ++i) {
+            llama_adapter_lora * adapter = loras_seq->adapters[i];
+            llama_adapter_lora_weight * lw = adapter->get_weight(w);
+            if (lw == nullptr) {
+                continue;
+            }
+
+            ggml_tensor * ab_cur = ggml_mul_mat(
+                    ctx0, lw->b,
+                    ggml_mul_mat(ctx0, lw->a, cur)
+                    );
+
+            // alpha/rank, then each token's scale for its sequence
+            ab_cur = ggml_scale(ctx0, ab_cur, lw->get_scale(adapter->alpha, 1.0f));
+
+            const int64_t n_cols = ggml_nrows(ab_cur);
+            ggml_tensor * ab_2d  = ggml_reshape_2d(ctx0, ab_cur, ab_cur->ne[0], n_cols);
+            ab_2d  = ggml_mul(ctx0, ab_2d, build_lora_seq_scale(i, n_cols));
+            ab_cur = ggml_reshape(ctx0, ab_2d, ab_cur);
+
+            res = ggml_add(ctx0, res, ab_cur);
+        }
     }
 
     return res;
@@ -1593,6 +1691,34 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
+    }
+
+    if (loras_seq) {
+        for (size_t i = 0; i < loras_seq->adapters.size(); ++i) {
+            llama_adapter_lora * adapter = loras_seq->adapters[i];
+            llama_adapter_lora_weight * lw = adapter->get_weight(w);
+            if (lw == nullptr) {
+                continue;
+            }
+
+            const float alpha = adapter->alpha;
+            const float rank  = (float) lw->b->ne[0];
+
+            ggml_tensor * ab_cur = ggml_mul_mat_id(
+                    ctx0, lw->b,
+                    ggml_mul_mat_id(ctx0, lw->a, cur, ids),
+                    ids
+                    ); // [n_out, n_expert_used, n_cols]
+
+            ab_cur = ggml_scale(ctx0, ab_cur, alpha ? alpha / rank : 1.0f);
+
+            const int64_t n_cols = ab_cur->ne[2];
+            ggml_tensor * s = build_lora_seq_scale(i, n_cols);
+            s = ggml_reshape_3d(ctx0, s, 1, 1, n_cols);
+            ab_cur = ggml_mul(ctx0, ab_cur, s);
+
+            res = ggml_add(ctx0, res, ab_cur);
+        }
     }
 
     return res;

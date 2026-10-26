@@ -1458,7 +1458,17 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
     }
 
-    if (!params.lora_init_without_apply) {
+    if (params.lora_per_sequence) {
+        std::vector<llama_adapter_lora *> adapters;
+        for (auto & la : params.lora_adapters) {
+            if (llama_adapter_get_alora_n_invocation_tokens(la.ptr) > 0) {
+                COM_ERR("%s: aLoRA adapter %s cannot be applied per sequence\n", __func__, la.path.c_str());
+                return res;
+            }
+            adapters.push_back(la.ptr);
+        }
+        llama_set_adapters_lora_per_seq(lctx, adapters.data(), adapters.size());
+    } else if (!params.lora_init_without_apply) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 

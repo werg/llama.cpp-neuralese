@@ -187,6 +187,26 @@ public:
     const float    f_attn_temp_offset;
 };
 
+// per-token scales of per-sequence LoRA adapters (llama_set_adapters_lora_per_seq)
+class llm_graph_input_lora_scales : public llm_graph_input_i {
+public:
+    llm_graph_input_lora_scales(const llama_adapter_loras_seq * loras_seq, uint32_t n_outputs)
+        : loras_seq(loras_seq), n_outputs(n_outputs) {}
+    virtual ~llm_graph_input_lora_scales() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // F32 [n_tokens, n_adapters]: row i holds adapter i's scale for every token of the ubatch
+    ggml_tensor * scales     = nullptr;
+    // F32 [n_outputs, n_adapters]: the same for output tokens only (rows selected by out_ids), when used
+    ggml_tensor * scales_out = nullptr;
+
+    const llama_adapter_loras_seq * loras_seq;
+    const uint32_t n_outputs;
+};
+
 class llm_graph_input_pos_bucket : public llm_graph_input_i {
 public:
     llm_graph_input_pos_bucket(const llama_hparams & hparams) : hparams(hparams) {}
@@ -783,10 +803,11 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
-    const llama_memory_context_i * mctx;
-    const llama_cross            * cross;
+    const llama_adapter_cvec      * cvec;
+    const llama_adapter_loras     * loras;
+    const llama_adapter_loras_seq * loras_seq;
+    const llama_memory_context_i  * mctx;
+    const llama_cross             * cross;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -887,6 +908,7 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            loras_seq == other.loras_seq &&
             cross == other.cross;
     }
 };
@@ -1029,12 +1051,16 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
-    const llama_adapter_cvec     * cvec;
-    const llama_adapter_loras    * loras;
-    const llama_memory_context_i * mctx;
-    const llama_cross            * cross;
+    const llama_adapter_cvec      * cvec;
+    const llama_adapter_loras     * loras;
+    const llama_adapter_loras_seq * loras_seq;
+    const llama_memory_context_i  * mctx;
+    const llama_cross             * cross;
 
     const llama_prec_policy * prec_policy;
+
+    // created by the first per-sequence LoRA application in this graph
+    mutable llm_graph_input_lora_scales * inp_lora_scales = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1057,6 +1083,9 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    // per-token scale [1, n_cols] of per-sequence adapter i for a matmul over n_cols tokens (all or outputs only)
+    ggml_tensor * build_lora_seq_scale(size_t i, int64_t n_cols) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(

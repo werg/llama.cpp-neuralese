@@ -89,3 +89,19 @@ struct llama_adapter_lora {
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
 using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
+
+// Adapters applied with per-sequence scales: each token of a batch uses the scales of its sequence, so sequences
+// with different adapter mixtures can be decoded in one batch. The adapter list is part of the graph topology;
+// the scales are graph inputs and can change between batches without rebuilding the graph.
+struct llama_adapter_loras_seq {
+    std::vector<llama_adapter_lora *> adapters;
+    std::unordered_map<llama_seq_id, std::vector<float>> scales; // [seq_id] -> one scale per adapter
+
+    // scale of adapter i for seq_id; sequences without scales use 0 (base model)
+    float get(llama_seq_id seq_id, size_t i) const {
+        const auto it = scales.find(seq_id);
+        return it == scales.end() ? 0.0f : it->second[i];
+    }
+};
+
+using llama_adapter_loras_seq_ptr = std::unique_ptr<llama_adapter_loras_seq>;

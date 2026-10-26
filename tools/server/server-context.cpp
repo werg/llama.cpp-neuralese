@@ -335,6 +335,7 @@ struct server_slot {
     }
 
     std::vector<common_adapter_lora_info> lora;
+    bool lora_per_seq = false; // adapters are applied with per-sequence scales (--lora-per-sequence)
     int32_t alora_invocation_start = -1;
 
     // sampling
@@ -464,9 +465,10 @@ struct server_slot {
             return false;
         }
 
+        // with per-sequence adapters, each slot's tokens use its own adapter scales
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
-            && are_lora_equal(lora, other_slot.lora);
+            && (lora_per_seq || are_lora_equal(lora, other_slot.lora));
     }
 
     // returns -1 if the generation is limitless
@@ -1356,6 +1358,7 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
+            slot.lora_per_seq = params_base.lora_per_sequence;
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
@@ -2988,9 +2991,25 @@ private:
             auto & alora_scale       = batch.alora_scale;
             auto & alora_disabled_id = batch.alora_disabled_id;
 
+            if (params_base.lora_per_sequence) {
+                // every slot's sequence carries its own adapter scales; slots of this batch may differ
+                for (auto & slot : slots) {
+                    std::vector<float> scales;
+                    scales.reserve(slot.lora.size());
+                    for (const auto & la : slot.lora) {
+                        scales.push_back(la.scale);
+                    }
+                    if (scales.size() == params_base.lora_adapters.size()) {
+                        llama_set_adapter_lora_seq_scales(ctx_tgt, slot.id, scales.data(), scales.size());
+                    } else {
+                        llama_set_adapter_lora_seq_scales(ctx_tgt, slot.id, nullptr, params_base.lora_adapters.size());
+                    }
+                }
+            } else {
             // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
             // apply lora, only need to do it once per batch
             common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+            }
 
             // if the lora is temporarily disabled for an alora, re-enable it
             // for next time

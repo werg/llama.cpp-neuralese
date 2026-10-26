@@ -3807,6 +3807,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lora-per-sequence"},
+        string_format("apply LoRA adapters per sequence: each request's adapter scales affect only its own tokens, so "
+            "requests with different adapters are batched together (implies --lora-init-without-apply; aLoRA adapters "
+            "are not supported in this mode) (default: %s)", params.lora_per_sequence ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.lora_per_sequence       = true;
+            params.lora_init_without_apply = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--sleep-idle-seconds"}, "SECONDS",
         string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
         [](common_params & params, int value) {

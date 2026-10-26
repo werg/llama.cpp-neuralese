@@ -729,6 +729,25 @@ extern "C" {
             size_t n_adapters,
             float * scales);
 
+    // Register adapters for per-sequence application. Afterwards each token uses the scales set for its sequence
+    // with llama_set_adapter_lora_seq_scales (default 0 for every adapter), so sequences with different adapter
+    // mixtures can share a batch. This is independent of, and additive to, llama_set_adapters_lora.
+    // Pass n_adapters = 0 to disable per-sequence application. Changing the adapter list rebuilds the graph;
+    // changing scales does not.
+    LLAMA_API int32_t llama_set_adapters_lora_per_seq(
+            struct llama_context * ctx,
+            struct llama_adapter_lora ** adapters,
+            size_t n_adapters);
+
+    // Set the per-sequence scales of the adapters registered with llama_set_adapters_lora_per_seq.
+    // n_scales must equal the number of registered adapters; scales == NULL resets the sequence to 0 (base model).
+    // Returns -1 if no adapters are registered or n_scales does not match.
+    LLAMA_API int32_t llama_set_adapter_lora_seq_scales(
+            struct llama_context * ctx,
+            llama_seq_id seq_id,
+            const float * scales,
+            size_t n_scales);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

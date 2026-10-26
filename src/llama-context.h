@@ -127,6 +127,9 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
+    void set_adapters_lora_per_seq(llama_adapter_lora ** adapters, size_t n_adapters);
+    bool set_adapter_lora_seq_scales(llama_seq_id seq_id, const float * scales, size_t n_scales);
+
     bool set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -294,6 +297,7 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+    llama_adapter_loras_seq_ptr loras_seq; // null unless per-sequence adapters are registered
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
