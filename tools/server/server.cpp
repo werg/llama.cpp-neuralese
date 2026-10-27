@@ -240,6 +240,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         routes.post_rerank                 = models_routes->proxy_post;
         routes.post_systemone              = models_routes->proxy_post;
         routes.post_natlang_score          = models_routes->proxy_post;
+        routes.post_guidance_check         = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -289,6 +290,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
     ctx_http.post("/v1/natlang/score",         ex_wrapper(routes.post_natlang_score));
+    ctx_http.post("/v1/neuralese/guidance/check", ex_wrapper(routes.post_guidance_check));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

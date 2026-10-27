@@ -1868,6 +1868,14 @@ Scores candidate replies to a conversation. For each item, each continuation is 
 
 One entry per item: `log_probs[k]` and `tokens[k]` for its `k`-th continuation, or the `error` of an item that could not be rendered (the other items are still scored). The continuations of an item share its prompt prefix: it is computed once and continued in several slots.
 
+### `guidance` in `/v1/chat/completions` and `/completion`: guided generation
+
+`"guidance": true` or an object `{require_call?, tools?, repeat? (3), run? (4), syntax? (true), retries? (4)}` checks the reply while it is generated, as natlang's reference server does. `require_call` (default: `tool_choice` is `"required"`) forces a tool call; call names must be in `tools` (default: the offered tools). Inside `eval(code=...)`, every completed line is checked for repetition (`repeat` occurrences), redeclaration and TypeScript syntax (tree-sitter), and the unfinished line for a run of one chunk repeated `run` times. On a rejection the slot rolls back to the token where the line or name starts (from a context checkpoint if the memory cannot be cut there), bans that token there and samples again, at most `retries` times per point; then the line stands. The response carries `"x_natlang_guidance": {"rejections": [{"reason", "offset", "accepted"?}]}`. A streamed guided reply is sent with the final chunk, because text can still be rolled back. Speculative decoding is off for guided requests.
+
+### POST `/v1/neuralese/guidance/check`
+
+`{"reply", "guidance": {"tools"?, "repeat"?, "syntax"?, "run"?}}` -> the first rejection when `reply` is checked prefix by prefix, as during generation: `{"reason", "offset", "end"}`, or `{"reason": null}`. Reasons: `unknown-tool`, `repetition`, `redeclaration`, `syntax`.
+
 ## Server tools
 
 The server exposes a REST API under `/tools` that allows the Web UI to call server tools. This endpoint is intended to be used internally by the Web UI and subject to change or to be removed in the future.

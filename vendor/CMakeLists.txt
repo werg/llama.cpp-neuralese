@@ -8,4 +8,5 @@ add_subdirectory(stb)
 # only used by common
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(cpp-httplib)
+    add_subdirectory(tree-sitter)
 endif()

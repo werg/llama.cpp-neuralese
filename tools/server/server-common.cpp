@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-guidance.h"
 
 #include <random>
 #include <sstream>
@@ -1327,6 +1328,23 @@ json oaicompat_chat_params_parse(
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
+
+    // natlang guided generation: the settings with the offered tool names; require_call forces a tool call
+    if (body.contains("guidance") && !body.at("guidance").is_null() && body.at("guidance") != false) {
+        std::vector<std::string> offered;
+        for (const auto & tool : has_tools ? tools : json::array()) {
+            const json & fn = tool.contains("function") ? tool.at("function") : tool;
+            offered.push_back(json_value(fn, "name", std::string()));
+        }
+        const auto settings = server_guide_settings::from_json(body.at("guidance"), offered, tool_choice == "required");
+        if (settings.require_call) {
+            if (!has_tools) {
+                throw std::invalid_argument("guidance require_call needs tools");
+            }
+            tool_choice = "required";
+        }
+        llama_params["guidance"] = settings.to_json();
+    }
 
     if (!opt.use_jinja) {
         if (has_tools) {

@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
+#include "server-guidance.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -291,6 +292,19 @@ struct server_slot {
     double  score_log_prob = 0.0;
     int32_t score_n        = 0;
 
+    // natlang guided generation (server-guidance.h)
+    struct guide_state {
+        server_guide guide;
+        std::string  reply;                           // the generated text, special tokens included
+        std::vector<size_t> starts;                   // reply offset of each generated token
+        std::vector<completion_token_output> outputs; // each generated token as sampled
+        std::map<size_t, std::set<llama_token>> bans; // generated index -> tokens banned there
+        std::map<size_t, int32_t> retries;            // reply offset -> rejections there
+        json rejections = json::array();
+        llama_tokens replay;                          // tokens to decode again after a rollback
+    };
+    std::unique_ptr<guide_state> guided;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -394,6 +408,7 @@ struct server_slot {
         last_nl_pos    = 0;
         score_log_prob = 0.0;
         score_n        = 0;
+        guided.reset();
         generated      = {};
         has_new_line   = false;
         truncated      = false;
@@ -514,7 +529,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && !guided;
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -1989,6 +2004,9 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // guided generation bans tokens in the logits
+            use_backend_sampling &= !task.params.guidance;
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
@@ -2011,6 +2029,15 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        if (task.params.guidance) {
+            if (task.tokens.has_mtmd) {
+                send_error(task, "guidance cannot be combined with media", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            slot.guided = std::make_unique<server_slot::guide_state>();
+            slot.guided->guide.settings = *task.params.guidance;
+        }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2066,7 +2093,8 @@ private:
             }
 
             slot.add_token(result);
-            if (slot.task->params.stream) {
+            // a guided reply can still be rolled back: it is sent with the final response
+            if (slot.task->params.stream && !slot.guided) {
                 send_partial_response(slot, result, false);
             }
         }
@@ -2152,6 +2180,131 @@ private:
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
+    }
+
+    // guided generation: tokens rejected before at this point of the reply get no probability
+    void guide_ban(server_slot & slot, int tok_idx) {
+        const auto it = slot.guided->bans.find(slot.guided->outputs.size());
+        if (it == slot.guided->bans.end()) {
+            return;
+        }
+        float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+        if (logits == nullptr) {
+            return;
+        }
+        for (const llama_token token : it->second) {
+            logits[token] = -INFINITY;
+        }
+    }
+
+    // guided generation: check the reply after the token `sampled`; on a rejection, roll the slot back to the token
+    // where the offending line or name starts and ban that token there. returns true if the slot was rolled back
+    bool guide_step(server_slot & slot, const completion_token_output & sampled) {
+        auto & g = *slot.guided;
+        g.starts.push_back(g.reply.size());
+        g.outputs.push_back(sampled);
+        g.reply += common_token_to_piece(slot.ctx_tgt, sampled.tok, true);
+
+        const auto verdict = g.guide.check(g.reply);
+        if (!verdict) {
+            return false;
+        }
+
+        // the first token that reaches the rejected offset
+        size_t target = 0;
+        while (target + 1 < g.starts.size() && g.starts[target + 1] <= verdict->at) {
+            target++;
+        }
+        while (target > 0 && g.starts[target - 1] == g.starts[target]) {
+            target--;
+        }
+
+        // the rest of the prompt and reply must still be in the slot, without a context shift
+        const int32_t n_prompt = slot.task->n_tokens();
+        const bool can_roll_back = slot.prompt.n_tokens() == n_prompt + (int32_t) g.outputs.size() - 1;
+
+        int32_t & tries = g.retries[verdict->at];
+        if (tries >= g.guide.settings.retries || !can_roll_back) {
+            g.guide.accept(verdict->at);
+            g.rejections.push_back({ { "reason", verdict->reason }, { "offset", verdict->at }, { "accepted", true } });
+            return false;
+        }
+        tries++;
+        g.rejections.push_back({ { "reason", verdict->reason }, { "offset", verdict->at } });
+        SLT_DBG(slot, "guidance: %s at reply offset %zu, rolling back to generated token %zu\n", verdict->reason.c_str(), verdict->at, target);
+
+        g.bans[target].insert(g.outputs[target].tok);
+        g.bans.erase(g.bans.upper_bound(target), g.bans.end());
+        g.reply.resize(g.starts[target]);
+        g.starts.resize(target);
+        g.guide.rewind(verdict->at);
+
+        std::vector<completion_token_output> kept(g.outputs.begin(), g.outputs.begin() + target);
+
+        // a fresh sampler: a reset keeps the grammar state
+        common_params_sampling sampling = slot.task->params.sampling;
+        slot.smpl.reset(common_sampler_init(model_tgt, sampling));
+        llama_tokens tokens = slot.task->tokens.get_text_tokens();
+        for (const llama_token token : tokens) {
+            common_sampler_accept(slot.smpl.get(), token, false);
+        }
+        for (const auto & out : kept) {
+            common_sampler_accept(slot.smpl.get(), out.tok, true);
+            tokens.push_back(out.tok);
+        }
+
+        // keep the memory before the last kept token and decode from there again, for the logits of the next one
+        const int32_t n_keep = guide_restore(slot, (int32_t) tokens.size() - 1);
+        g.replay.assign(tokens.begin() + n_keep, tokens.end());
+        slot.i_batch = -1;
+
+        // the generation state of the kept tokens, as if the rest was never sampled
+        g.outputs.clear();
+        slot.generated = {};
+        slot.generated_tokens.clear();
+        slot.generated_token_probs.clear();
+        slot.n_sent_text    = 0;
+        slot.has_new_line   = false;
+        slot.last_nl_pos    = 0;
+        slot.truncated      = false;
+        slot.stop           = STOP_TYPE_NONE;
+        slot.stopping_word  = "";
+        slot.stats.n_gen    = (int32_t) target;
+        for (auto out : kept) {
+            g.outputs.push_back(out);
+            process_token(out, slot);
+        }
+        slot.has_next_token = true;
+        slot.stop           = STOP_TYPE_NONE;
+        return true;
+    }
+
+    // restore the slot memory to its first n_keep tokens, from a context checkpoint if the memory cannot be cut there
+    // (as when a prompt is reused); returns the number of tokens kept
+    int32_t guide_restore(server_slot & slot, int32_t n_keep) {
+        llama_pos pos_next = slot.prompt.tokens.pos_next(n_keep);
+        const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_next - n_swa + 2 : pos_next);
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        if (n_keep > 0 && pos_min >= pos_min_thold) {
+            const auto it = std::find_if(slot.prompt.checkpoints.rbegin(), slot.prompt.checkpoints.rend(), [&](const auto & cur) {
+                return cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+            });
+            if (it != slot.prompt.checkpoints.rend() &&
+                    it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+                    it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                n_keep   = std::min((int32_t) slot.prompt.tokens.size_up_to_pos(pos_next), (int32_t) it->n_tokens);
+            } else {
+                n_keep = 0;
+            }
+        }
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+            it = it->pos_max > pos_next ? slot.prompt.checkpoints.erase(it) : std::next(it);
+        }
+        slot.prompt.tokens.keep_first(n_keep);
+        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+        SLT_DBG(slot, "guidance: restored the memory to %d tokens\n", n_keep);
+        return n_keep;
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
@@ -2292,8 +2445,8 @@ private:
             slot.debug_generated_text = slot.generated.text;
         }
 
-        // in stream mode, content and tokens are already in last partial chunk
-        if (slot.task->params.stream) {
+        // in stream mode, content and tokens are already in last partial chunk, except for a guided reply
+        if (slot.task->params.stream && !slot.guided) {
             res->content     = {};
             res->tokens      = llama_tokens{};
         } else {
@@ -2338,6 +2491,10 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        if (slot.guided) {
+            res->guidance = { { "rejections", slot.guided->rejections } };
+        }
 
         queue_results.send(std::move(res));
     }
@@ -3681,7 +3838,29 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
+            if (slot.guided && !slot.guided->replay.empty()) {
+                return;
+            }
             slot.handle_last_sampled_token(batch);
+        });
+
+        // guided generation: decode the kept reply again after a rollback, as far as the batch has room
+        iterate(generating, [&](server_slot & slot) {
+            if (!slot.guided || slot.guided->replay.empty()) {
+                return;
+            }
+            auto & replay = slot.guided->replay;
+            const size_t n_room = (size_t) std::max<int64_t>(0, (int64_t) llama_n_batch(ctx_tgt) - (int64_t) batch.size());
+            const size_t n = std::min(replay.size(), n_room);
+            for (size_t i = 0; i < n; ++i) {
+                const bool last = i + 1 == replay.size();
+                GGML_ASSERT(batch.add(slot.id, replay[i], slot.prompt.tokens.pos_next(), last, false));
+                slot.prompt.tokens.push_back(replay[i]);
+                if (last) {
+                    slot.i_batch = batch.size() - 1;
+                }
+            }
+            replay.erase(replay.begin(), replay.begin() + n);
         });
 
         // process in chunks of params.n_batch
@@ -4605,6 +4784,10 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
+            if (slot.guided) {
+                guide_ban(slot, tok_idx);
+            }
+
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
@@ -4637,7 +4820,14 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
+            const completion_token_output sampled = result;
+            const bool has_next = process_token(result, slot);
+
+            if (slot.guided && guide_step(slot, sampled)) {
+                return; // rolled back: the kept reply is decoded again in the next batch
+            }
+
+            if (!has_next) {
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -6131,6 +6321,24 @@ void server_routes::init_routes() {
             batch.n_scored[i]  = result->n_scored;
         }
         res->ok(server_score_response(batch));
+        return res;
+    };
+
+    // the first rejection of `reply` when it is checked prefix by prefix, as during generation
+    this->post_guidance_check = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const json body = json::parse(req.body);
+        server_guide guide;
+        guide.settings = server_guide_settings::from_json(json_value(body, "guidance", json::object()), {}, false);
+        const std::string reply = json_value(body, "reply", std::string());
+        for (size_t end = 1; end <= reply.size(); ++end) {
+            const auto verdict = guide.check(reply.substr(0, end));
+            if (verdict) {
+                res->ok({ { "reason", verdict->reason }, { "offset", verdict->at }, { "end", end } });
+                return res;
+            }
+        }
+        res->ok({ { "reason", nullptr } });
         return res;
     };
 
