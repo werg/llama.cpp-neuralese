@@ -13,7 +13,6 @@ llama_add_compile_flags()
 # tools
 
 if (EMSCRIPTEN)
-    add_subdirectory(neuralese) # the Neuralese service as WebAssembly (natlang's browser runtime)
 else()
     add_subdirectory(batched-bench)
     add_subdirectory(gguf-split)
@@ -37,7 +36,6 @@ else()
         # these tools use backends directly (no dynamic loading) and depend on CPU backend symbols
         add_subdirectory(cvector-generator)
         add_subdirectory(export-lora)
-        add_subdirectory(neuralese)
     endif()
     add_subdirectory(fit-params)
     if (GGML_METAL)

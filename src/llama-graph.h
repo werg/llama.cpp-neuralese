@@ -199,33 +199,6 @@ public:
     const llama_state_spans * spans;
 };
 
-struct llama_state_spans;
-
-// native state spans: the registered per-layer state of the ubatch's virtual tokens (llama-state-span.h)
-class llm_graph_input_state_span : public llm_graph_input_i {
-public:
-    llm_graph_input_state_span(const llama_state_spans * spans) : spans(spans) {}
-    virtual ~llm_graph_input_state_span() = default;
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-    bool can_reuse(const llm_graph_params & params) override;
-
-    enum kind_t { KIND_K, KIND_V, KIND_CONV };
-    struct entry {
-        ggml_tensor * t;     // F32 [width, n_tokens]: the registered row for virtual tokens, 0 otherwise
-        int           il;
-        kind_t        kind;
-        int64_t       width;
-    };
-    std::vector<entry> entries;
-
-    ggml_tensor * mask = nullptr; // F32 [1, n_tokens]: 1 for virtual tokens, 0 otherwise
-    ggml_tensor * keep = nullptr; // F32 [1, n_tokens]: 1 - mask
-
-    const llama_state_spans * spans;
-};
-
 struct llama_state_production;
 
 // native state production: which ubatch tokens belong to producing sequences (llama_set_seq_producing)
@@ -994,10 +967,6 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
-            return false;
-        }
-
-        if (cparams.layer_start != other.cparams.layer_start || cparams.layer_end != other.cparams.layer_end) {
             return false;
         }
 

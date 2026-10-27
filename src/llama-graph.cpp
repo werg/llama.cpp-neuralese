@@ -173,42 +173,6 @@ void llm_graph_input_state_span::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-bool llm_graph_input_state_span::can_reuse(const llm_graph_params & params) {
-    return params.state_spans == spans && mask && mask->ne[1] == params.ubatch.n_tokens;
-}
-
-void llm_graph_input_state_span::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(ubatch->token);
-    const int64_t n_tokens = ubatch->n_tokens;
-
-    std::vector<const llama_state_span *> span(n_tokens, nullptr);
-    std::vector<int32_t> row(n_tokens, 0);
-    std::vector<float> m(n_tokens, 0.0f), k(n_tokens, 1.0f);
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        span[i] = spans->find(ubatch->token[i], row[i]);
-        if (span[i]) {
-            m[i] = 1.0f;
-            k[i] = 0.0f;
-        }
-    }
-    ggml_backend_tensor_set(mask, m.data(), 0, n_tokens*sizeof(float));
-    ggml_backend_tensor_set(keep, k.data(), 0, n_tokens*sizeof(float));
-
-    std::vector<float> data;
-    for (const auto & e : entries) {
-        data.assign((size_t) e.width*n_tokens, 0.0f);
-        for (int64_t i = 0; i < n_tokens; ++i) {
-            if (!span[i]) {
-                continue;
-            }
-            const auto & src = e.kind == KIND_K ? span[i]->k[e.il] : e.kind == KIND_V ? span[i]->v[e.il] : span[i]->conv[e.il];
-            GGML_ASSERT((int64_t) src.size() == (int64_t) span[i]->n*e.width);
-            std::copy(src.begin() + (size_t) row[i]*e.width, src.begin() + (size_t) (row[i] + 1)*e.width, data.begin() + (size_t) i*e.width);
-        }
-        ggml_backend_tensor_set(e.t, data.data(), 0, data.size()*sizeof(float));
-    }
-}
-
 void llm_graph_input_producing::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
     std::vector<float> m(n_tokens, 0.0f);
@@ -1771,6 +1735,8 @@ ggml_tensor * llm_graph_context::build_lora_seq_scale(size_t i, int64_t n_cols) 
     }
 
     return ggml_view_2d(ctx0, *src, 1, n_cols, ggml_element_size(*src), i*(*src)->nb[1]);
+}
+
 ggml_tensor * llm_graph_context::build_hadamard_input(
           ggml_tensor * w,
           ggml_tensor * cur) const {

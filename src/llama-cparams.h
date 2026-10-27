@@ -21,11 +21,6 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
-    // layer range [layer_start, layer_end) run by the decoder graph; layer_end < 0 means all layers
-    // a partial range takes the batch embeddings as the residual stream entering layer_start,
-    // skips the output norm and head, and exposes the residual after the range as layer input layer_end
-    int32_t  layer_start = 0;
-    int32_t  layer_end   = -1;
 
     float rope_freq_base;
     float rope_freq_scale;

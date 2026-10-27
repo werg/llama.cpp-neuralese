@@ -301,12 +301,6 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         return y;
     };
 
-    // a partial layer range (llama_set_layer_range) runs layers [il_start, il_end) on the residual
-    // stream given as batch embeddings, and exposes the residual after the range instead of logits
-    const int  il_start = cparams.layer_start;
-    const int  il_end   = cparams.layer_end < 0 ? (int) n_layer : cparams.layer_end;
-    const bool partial  = il_start != 0 || il_end != (int) n_layer;
-
     // actual graph construction starts here
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     cb(cur, "model.embed_tokens", -1);
@@ -325,9 +319,9 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = partial ? nullptr : build_inp_out_ids();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = il_start; il < il_end; ++il) {
+    for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = cur;
 
         const bool is_moe_layer = il >= static_cast<int>(hparams.n_layer_dense_lead);
@@ -357,13 +351,6 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-    }
-
-    if (partial) {
-        // the residual after the range, for every token of the batch
-        res->t_layer_inp[il_end] = cur;
-        ggml_build_forward_expand(gf, cur);
-        return;
     }
 
     // the final residual before the output norm, for the output rows (llama_set_embeddings_layer_inp(ctx, n_layer))

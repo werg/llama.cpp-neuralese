@@ -129,18 +129,6 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
-// Run only the decoder layers [il_start, il_end) on subsequent decodes (il_end < 0: to the last layer).
-// Use (0, -1) to restore full-depth decoding. With a partial range:
-//   - batch embeddings (batch.embd) are the residual stream entering layer il_start
-//   - the output norm and head are skipped (no logits)
-//   - the residual after the range is available as layer input il_end for every token in the batch
-//     (enable it with llama_set_embeddings_layer_inp(ctx, il_end, true))
-//   - memory (KV cells, recurrent states) is written only for layers inside the range
-// Only architectures for which llama_model_supports_layer_range() returns true honour the range.
-LLAMA_API void llama_set_layer_range(struct llama_context * ctx, int32_t il_start, int32_t il_end);
-
-LLAMA_API bool llama_model_supports_layer_range(const struct llama_model * model);
-
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
