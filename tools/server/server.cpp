@@ -241,6 +241,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         routes.post_systemone              = models_routes->proxy_post;
         routes.post_natlang_score          = models_routes->proxy_post;
         routes.post_guidance_check         = models_routes->proxy_post;
+        routes.get_neuralese_info          = nullptr; // native states are per model; not routed
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
@@ -291,6 +292,12 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
     ctx_http.post("/v1/natlang/score",         ex_wrapper(routes.post_natlang_score));
     ctx_http.post("/v1/neuralese/guidance/check", ex_wrapper(routes.post_guidance_check));
+    if (routes.get_neuralese_info) {
+        ctx_http.get("/v1/neuralese/info",                 ex_wrapper(routes.get_neuralese_info));
+        ctx_http.get("/v1/neuralese/native-states/:id",    ex_wrapper(routes.get_native_state));
+        ctx_http.get("/v1/neuralese/native-states/:id/meta", ex_wrapper(routes.get_native_state));
+        ctx_http.put("/v1/neuralese/native-states/:id",    ex_wrapper(routes.put_native_state));
+    }
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

@@ -401,6 +401,14 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    // natlang native state production: inside a producer span (after a sampled produce-open marker, until the
+    // produce-close marker), its tokens and first position, and the states produced so far
+    bool                     native_producing = false;
+    std::vector<llama_token> native_span;
+    llama_pos                native_span_pos0 = -1;
+    std::vector<std::string> native_block_ids;
+    json                     native_blocks = json::array();
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -411,6 +419,11 @@ struct server_slot {
         score_n        = 0;
         guided.reset();
         generated      = {};
+        native_producing = false;
+        native_span.clear();
+        native_span_pos0 = -1;
+        native_block_ids.clear();
+        native_blocks = json::array();
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -984,9 +997,14 @@ public:
 
     // natlang native state spans (--native-state), registered with ctx_tgt, by ID: the tokens that consume each
     std::vector<common_native_state> native_states;
-    std::map<std::string, std::vector<llama_token>> native_state_tokens;
+    std::shared_ptr<native_state_registry> native_registry = std::make_shared<native_state_registry>();
 
     server_decision_context decision;
+
+    // natlang native state production: on when the model has the producer adapter, its role markers and its native
+    // identity (a natlang GGUF export), and no draft model decodes alongside
+    bool native_produces = false;
+    struct { llama_token produce_open = LLAMA_TOKEN_NULL, produce_close = LLAMA_TOKEN_NULL; } native_markers;
 
     // scored positions in the current batch, at most SERVER_N_SCORE_OUTPUTS
     int32_t n_score_outputs = 0;
@@ -1270,16 +1288,36 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         native_states.clear();
-        native_state_tokens.clear();
+        native_registry = std::make_shared<native_state_registry>();
+        native_registry->identity = native_identity_from_model(model_tgt);
+        native_registry->vocab    = vocab;
         for (const auto & path : params_base.native_states) {
             common_native_state st;
             if (!common_native_state_load(path, llama_model_n_layer(model_tgt), st) || !common_native_state_register(ctx_tgt, st)) {
                 SRV_ERR("failed to load native state '%s'\n", path.c_str());
                 return false;
             }
-            native_state_tokens[st.id] = common_native_state_tokens(st);
+            native_registry->add_static(st.id, common_native_state_tokens(st));
             SRV_INF("native state %s: %d positions\n", st.id.c_str(), st.n_tokens);
             native_states.push_back(std::move(st));
+        }
+
+        {
+            auto marker = [&](const char * key) {
+                char buf[32];
+                return llama_model_meta_val_str(model_tgt, key, buf, sizeof(buf)) > 0 ? (llama_token) std::atoi(buf) : LLAMA_TOKEN_NULL;
+            };
+            native_markers.produce_open    = marker("natlang.produce_open");
+            native_markers.produce_close   = marker("natlang.produce_close");
+            native_registry->consume_open  = marker("natlang.consume_open");
+            native_registry->consume_close = marker("natlang.consume_close");
+            native_produces = llama_model_has_producer_adapter(model_tgt) && !native_registry->identity.empty() &&
+                native_markers.produce_open != LLAMA_TOKEN_NULL && native_markers.produce_close != LLAMA_TOKEN_NULL &&
+                !has_spec;
+            if (!native_registry->identity.empty()) {
+                SRV_INF("native states: identity %s, production %s\n", native_registry->identity.checkpoint_sha256.substr(0, 12).c_str(),
+                        native_produces ? "on" : "off");
+            }
         }
 
         try {
@@ -1448,6 +1486,8 @@ private:
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+
+        native_registry->context = n_ctx_slot();
 
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1701,9 +1741,7 @@ private:
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
-            for (const auto & st : native_states) {
-                chat_params.native_states.insert(st.id);
-            }
+            chat_params.native_states = native_registry;
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
@@ -1919,6 +1957,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // a slot starts outside any producer span
+        llama_set_seq_producing(ctx_tgt, slot.id, false);
+        llama_state_capture_clear(ctx_tgt, slot.id);
+
         // process per-request lora adapters; a request without them uses the defaults, and the cache is cleared
         // whenever the effective adapters change either way
         {
@@ -2055,7 +2097,155 @@ private:
         return true;
     }
 
+    // natlang native state production (llama_set_seq_producing): a sampled produce-open marker starts a producer span,
+    // whose tokens decode with the producer adapter and have their state captured; the produce-close marker turns the
+    // span into a stored native state, which the reply carries as a placeholder (then a native_state part). The markers
+    // themselves decode as ordinary tokens. Rewrites the token's text: empty inside a span, the placeholder at its end.
+    void native_production(completion_token_output & result, server_slot & slot) {
+        if (!native_produces) {
+            return;
+        }
+        const llama_token tok = result.tok;
+        if (!slot.native_producing) {
+            if (tok == native_markers.produce_open) {
+                slot.native_producing = true;
+                slot.native_span.clear();
+                slot.native_span_pos0 = -1;
+                llama_set_seq_producing(ctx_tgt, slot.id, false);
+                llama_state_capture_clear(ctx_tgt, slot.id);
+                result.text_to_send = "";
+            }
+            return;
+        }
+        if (tok == native_markers.produce_close) {
+            llama_set_seq_producing(ctx_tgt, slot.id, false);
+            slot.native_producing = false;
+            try {
+                const std::string id = native_store_produced(slot);
+                result.text_to_send = native_state_placeholder(slot.native_block_ids.size());
+                slot.native_block_ids.push_back(id);
+            } catch (const std::exception & e) {
+                // an unusable span stays text, so nothing the model wrote is lost
+                SLT_WRN(slot, "native state production failed: %s\n", e.what());
+                result.text_to_send = common_detokenize(ctx_tgt, slot.native_span, false);
+            }
+            llama_state_capture_clear(ctx_tgt, slot.id);
+            slot.native_span.clear();
+            return;
+        }
+        // this token decodes next, producing, at the next position
+        if (slot.native_span.empty()) {
+            slot.native_span_pos0 = slot.prompt.tokens.pos_next();
+        }
+        slot.native_span.push_back(tok);
+        llama_set_seq_producing(ctx_tgt, slot.id, true);
+        result.text_to_send = "";
+    }
+
+    // the captured state of a slot's finished producer span as a stored, registered native state; returns its ID
+    std::string native_store_produced(server_slot & slot) {
+        const int32_t n = (int32_t) slot.native_span.size();
+        if (n == 0 || llama_state_capture_n_tokens(ctx_tgt, slot.id) != n) {
+            throw std::runtime_error("the producer span's capture does not cover its tokens");
+        }
+        const int32_t n_layer = llama_model_n_layer(model_tgt);
+        // per-layer head counts are not public (and layer 0 may be a convolution); the head width is n_embd / n_head
+        const int32_t n_head = llama_model_n_head(model_tgt);
+        const int64_t head_dim = n_head > 0 ? llama_model_n_embd(model_tgt) / n_head : 0;
+        native_state_block block;
+        auto put = [&](const std::string & name, const std::string & dtype, std::vector<int64_t> shape, const void * data, size_t bytes) {
+            native_state_tensor t;
+            t.dtype = dtype;
+            t.shape = std::move(shape);
+            t.data.assign((const char *) data, bytes);
+            block.tensors[name] = std::move(t);
+        };
+        std::vector<int64_t> ids(slot.native_span.begin(), slot.native_span.end()), pos(n);
+        for (int32_t i = 0; i < n; ++i) {
+            pos[i] = slot.native_span_pos0 + i;
+        }
+        put("token_ids", "I64", { n }, ids.data(), ids.size() * sizeof(int64_t));
+        put("positions", "I64", { n }, pos.data(), pos.size() * sizeof(int64_t));
+        std::vector<float> rows;
+        auto capture = [&](int32_t il, llama_state_capture_kind kind) {
+            const int64_t width = llama_state_capture_get(ctx_tgt, slot.id, il, kind, nullptr, 0);
+            if (width > 0) {
+                rows.resize((size_t) width * n);
+                llama_state_capture_get(ctx_tgt, slot.id, il, kind, rows.data(), (int64_t) rows.size());
+            }
+            return width;
+        };
+        const int64_t n_embd = capture(-1, LLAMA_STATE_CAPTURE_EMBD);
+        if (n_embd <= 0) {
+            throw std::runtime_error("no captured embeddings");
+        }
+        put("embeddings", "F32", { n, n_embd }, rows.data(), rows.size() * sizeof(float));
+        nlohmann::json kinds = nlohmann::json::array();
+        for (int32_t il = 0; il < n_layer; ++il) {
+            const std::string prefix = "layers." + std::to_string(il) + ".";
+            const int64_t wk = capture(il, LLAMA_STATE_CAPTURE_K);
+            if (wk > 0) {
+                if (head_dim <= 0 || wk % head_dim != 0) {
+                    throw std::runtime_error("captured key width does not divide into heads");
+                }
+                const int64_t n_head_kv = wk / head_dim;
+                put(prefix + "raw_k", "F32", { n, n_head_kv, head_dim }, rows.data(), rows.size() * sizeof(float));
+                const int64_t wv = capture(il, LLAMA_STATE_CAPTURE_V);
+                if (wv != wk) {
+                    throw std::runtime_error("captured keys and values differ in width");
+                }
+                put(prefix + "v", "F32", { n, n_head_kv, head_dim }, rows.data(), rows.size() * sizeof(float));
+                kinds.push_back("attention");
+                continue;
+            }
+            const int64_t wc = capture(il, LLAMA_STATE_CAPTURE_CONV);
+            if (wc <= 0) {
+                throw std::runtime_error("layer " + std::to_string(il) + " captured no state");
+            }
+            put(prefix + "gated_inputs", "F32", { n, wc }, rows.data(), rows.size() * sizeof(float));
+            kinds.push_back("finite_convolution");
+        }
+        // the text as the model wrote it; invalid UTF-8 (a span ending inside a character) becomes U+FFFD
+        const std::string raw_text = common_detokenize(ctx_tgt, slot.native_span, false);
+        const std::string text = nlohmann::json::parse(
+            nlohmann::json(raw_text).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)).get<std::string>();
+        const native_identity & identity = native_registry->identity;
+        block.metadata = { { "schema", "neuralese.native-state/1" }, { "text", text },
+            { "architecture", identity.architecture }, { "tokenizer_fingerprint", identity.tokenizer_fingerprint },
+            { "checkpoint_sha256", identity.checkpoint_sha256 }, { "embedding_weight_sha256", identity.embedding_weight_sha256 },
+            { "layer_kinds", kinds } };
+        const std::string id = native_state_id(block);
+        const std::string body = native_state_encode(block, id);
+        const nlohmann::json meta = native_state_meta(id, block);
+        native_register(id, block);
+        native_registry->store.put(id, body, std::move(block));
+        slot.native_blocks.push_back(json::parse(meta.dump()));
+        return id;
+    }
+
+    // register a stored state of this server's identity as a virtual span (main thread)
+    void native_register(const std::string & id, const native_state_block & block) {
+        if (native_registry->store.span(id) != LLAMA_TOKEN_NULL) {
+            return;
+        }
+        const int32_t n_layer = llama_model_n_layer(model_tgt);
+        const native_state_rows rows = native_state_to_rows(block, n_layer);
+        std::vector<llama_state_span_layer> layers(n_layer);
+        for (int32_t il = 0; il < n_layer; ++il) {
+            layers[il].k    = rows.k[il].empty()    ? nullptr : rows.k[il].data();
+            layers[il].v    = rows.v[il].empty()    ? nullptr : rows.v[il].data();
+            layers[il].conv = rows.conv[il].empty() ? nullptr : rows.conv[il].data();
+        }
+        const llama_token first = llama_state_span_register(ctx_tgt, rows.n_tokens, layers.data(), n_layer);
+        if (first == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error("the context refused the native state span");
+        }
+        native_registry->store.set_span(id, first);
+    }
+
     bool process_token(completion_token_output & result, server_slot & slot) {
+        native_production(result, slot);
+
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -2448,6 +2638,21 @@ private:
             slot.debug_generated_text = slot.generated.text;
         }
 
+        // a producer span the reply ended inside stays text
+        if (slot.native_producing) {
+            llama_set_seq_producing(ctx_tgt, slot.id, false);
+            llama_state_capture_clear(ctx_tgt, slot.id);
+            slot.generated.append(common_chat_input(common_detokenize(ctx_tgt, slot.native_span, false)));
+            slot.native_producing = false;
+            slot.native_span.clear();
+        }
+        if (!slot.native_block_ids.empty() || (slot.task->params.native_imports.is_array() && !slot.task->params.native_imports.empty())) {
+            res->native_state = json::object();
+            res->native_state["blocks"]  = slot.native_blocks;
+            res->native_state["imports"] = slot.task->params.native_imports.is_array() ? slot.task->params.native_imports : json::array();
+            res->native_block_ids = slot.native_block_ids;
+        }
+
         // in stream mode, content and tokens are already in last partial chunk, except for a guided reply
         if (slot.task->params.stream && !slot.guided) {
             res->content     = {};
@@ -2723,11 +2928,11 @@ private:
     bool tokenize_cli_input(server_task & task) {
         try {
             auto & prompt = task.cli_prompt;
-            if (!native_state_tokens.empty() && prompt.find("<__natlang_native_state:") != std::string::npos) {
+            if (prompt.find("<__natlang_native_state:") != std::string::npos) {
                 if (!task.cli_files.empty()) {
                     throw std::invalid_argument("native states cannot be combined with media in one request");
                 }
-                task.tokens = server_tokens(tokenize_native_states(vocab, prompt, true, true, native_state_tokens), false);
+                task.tokens = server_tokens(tokenize_native_states(vocab, prompt, true, true, *native_registry), false);
             } else if (mctx != nullptr) {
                 task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files, init_opt);
             } else {
@@ -3445,6 +3650,25 @@ private:
                         });
                     }
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_NATIVE_STATE_REGISTER:
+                {
+                    auto res = std::make_unique<server_task_result_native_register>();
+                    res->id = task.id;
+                    const auto found = native_registry->store.get(task.native_state_id);
+                    try {
+                        if (!found) {
+                            throw std::invalid_argument("neuralese-unknown-native-state: " + task.native_state_id);
+                        }
+                        if (found->block.identity() == native_registry->identity) {
+                            native_register(task.native_state_id, found->block);
+                        }
+                        res->mode = native_registry->store.span(task.native_state_id) != LLAMA_TOKEN_NULL ?
+                            "exact-native-state" : "best-effort-text-retokenization";
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & e) {
+                        send_error(task, std::string("neuralese-bad-native-state: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    }
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
@@ -5180,7 +5404,7 @@ server_context_meta server_context::get_meta() const {
 
         /* chat_params             */ impl->chat_params,
         /* chat_template_caps      */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
-        /* native_state_tokens     */ impl->native_state_tokens,
+        /* native_states           */ *impl->native_registry,
 
         /* bos_token_str           */ bos_token_str,
         /* eos_token_str           */ eos_token_str,
@@ -5271,13 +5495,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (!ctx_server.native_state_tokens.empty() && prompt.is_string() &&
-                prompt.get<std::string>().find("<__natlang_native_state:") != std::string::npos) {
+        json native_imports = json::array();
+        if (prompt.is_string() && prompt.get<std::string>().find("<__natlang_native_state:") != std::string::npos) {
             if (!files.empty()) {
                 throw std::invalid_argument("native states cannot be combined with media in one request");
             }
             inputs.emplace_back(tokenize_native_states(ctx_server.vocab, prompt.get<std::string>(), true, true,
-                                                       ctx_server.native_state_tokens), false);
+                                                       *ctx_server.native_registry, &native_imports), false);
         } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
@@ -5301,6 +5525,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.apply_chat_session(chat_session);
+            task.params.native_imports = native_imports;
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -6389,6 +6614,94 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // natlang native states (server-native-state.h): what this server declares, and the content-addressed store
+    this->get_neuralese_info = [this](const server_http_req &) {
+        auto res = create_response(true);
+        const auto & reg = *ctx_server.native_registry;
+        json native = json::object();
+        native["enabled"] = !reg.identity.empty();
+        if (!reg.identity.empty()) {
+            native["format"]            = "neuralese.native-state/1";
+            native["consumption_modes"] = json::array({ "exact-native-state", "best-effort-text-retokenization" });
+            native["architecture"]            = reg.identity.architecture;
+            native["checkpoint_sha256"]       = reg.identity.checkpoint_sha256;
+            native["tokenizer_fingerprint"]   = reg.identity.tokenizer_fingerprint;
+            native["embedding_weight_sha256"] = reg.identity.embedding_weight_sha256;
+            native["production"]              = ctx_server.native_produces;
+            native["role_marker_ids"] = json::array({ ctx_server.native_markers.produce_open, ctx_server.native_markers.produce_close,
+                                                      reg.consume_open, reg.consume_close });
+        }
+        json caps = json::array({ "chat", "guidance", "guidance.check", "score", "store", "store.native-state" });
+        json info = json::object();
+        info["dialects"]     = json::array({ "native-state/" + (reg.identity.empty() ? std::string("none") : reg.identity.architecture) });
+        info["width"]        = llama_model_n_embd(ctx_server.model_tgt);
+        info["context"]      = reg.context;
+        info["stream"]       = false;
+        info["grad"]         = false;
+        info["server"]       = "llama.cpp";
+        info["native_state"] = native;
+        info["capabilities"] = caps;
+        res->ok(info);
+        return res;
+    };
+
+    this->get_native_state = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const std::string id = req.get_param("id");
+        const bool meta = req.path.size() > 5 && req.path.compare(req.path.size() - 5, 5, "/meta") == 0;
+        const auto found = ctx_server.native_registry->store.get(id);
+        if (!found) {
+            res->error(format_error_response("neuralese-unknown-native-state: " + id, ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        if (meta) {
+            res->ok(json::parse(native_state_meta(id, found->block).dump()));
+        } else {
+            res->status = 200;
+            res->content_type = "application/octet-stream";
+            res->data = found->body;
+        }
+        return res;
+    };
+
+    this->put_native_state = [this](const server_http_req & req) {
+        auto res = create_response();
+        const std::string expected = req.get_param("id");
+        std::string id;
+        native_state_block block;
+        try {
+            block = native_state_decode(req.body, id);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("neuralese-bad-native-state: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (id != expected) {
+            res->error(format_error_response("neuralese-id-mismatch: content hashes to " + id, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const json meta = json::parse(native_state_meta(id, block).dump());
+        ctx_server.native_registry->store.put(id, req.body, std::move(block));
+        // a state of this server's identity becomes a virtual span (on the main loop, which owns the context)
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_NATIVE_STATE_REGISTER);
+            task.id = rd.get_new_id();
+            task.native_state_id = id;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(meta);
+        res->status = 201;
+        return res;
+    };
+
     this->post_lora_adapters = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);
@@ -6743,8 +7056,8 @@ std::vector<server_task> server_score_tasks(
             throw std::invalid_argument("a scored item cannot carry media");
         }
         const std::string prompt = parsed.at("prompt").get<std::string>();
-        if (!meta.native_state_tokens.empty() && prompt.find("<__natlang_native_state:") != std::string::npos) {
-            return server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_state_tokens), false);
+        if (prompt.find("<__natlang_native_state:") != std::string::npos) {
+            return server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_states), false);
         }
         return std::move(tokenize_input_prompts(vocab, nullptr, prompt, true, true, mtmd_helper_init_opt_default())[0]);
     };

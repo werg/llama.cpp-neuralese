@@ -30,6 +30,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_NATIVE_STATE_REGISTER, // register a stored native state's span with the context
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -49,6 +50,9 @@ enum stop_type {
     STOP_TYPE_WORD,
     STOP_TYPE_LIMIT,
 };
+
+// a produced native state in generated text (U+E010 <index> U+E011, as the reference server's placeholder)
+std::string native_state_placeholder(size_t index);
 
 struct task_params {
     bool stream          = false;
@@ -74,6 +78,9 @@ struct task_params {
 
     // natlang guided generation (server-guidance.h), if the request asks for it
     std::optional<server_guide_settings> guidance;
+
+    // natlang native states: the receipts of the states the prompt consumed, in order
+    json native_imports;
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
@@ -216,6 +223,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_NATIVE_STATE_REGISTER
+    std::string native_state_id;
 
     server_task() = default;
 
@@ -401,6 +411,11 @@ struct server_task_result_cmpl_final : server_task_result {
 
     // natlang guided generation: {"rejections": [...]}, null when off
     json guidance;
+
+    // natlang native states: {"blocks": [meta, ...], "imports": [...]} (null when the request named none and produced
+    // none); generated text holds one placeholder per produced block, in order
+    json native_state;
+    std::vector<std::string> native_block_ids;
 
     // response formatting
     bool               verbose  = false;
@@ -639,6 +654,11 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+struct server_task_result_native_register : server_task_result {
+    std::string mode; // the consumption mode the state now has
     virtual json to_json() override;
 };
 

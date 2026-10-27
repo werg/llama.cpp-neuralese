@@ -1248,8 +1248,8 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
 
         } else if (type == "native_state") {
             const std::string id = json_value(p, "id", std::string());
-            if (!opt.native_states.count(id)) {
-                throw std::invalid_argument("native state " + id + " is not loaded on this server (--native-state)");
+            if (!opt.native_states || !opt.native_states->known(id)) {
+                throw std::invalid_argument("neuralese-unknown-native-state: " + id);
             }
             p = json { { "type", "text" }, { "text", native_state_marker(id) } };
 
@@ -1264,7 +1264,7 @@ std::string native_state_marker(const std::string & id) {
 }
 
 llama_tokens tokenize_native_states(const llama_vocab * vocab, const std::string & prompt, bool add_special, bool parse_special,
-                                    const std::map<std::string, std::vector<llama_token>> & states) {
+                                    const native_state_registry & states, json * imports) {
     static const std::string open = "<__natlang_native_state:", close = "__>";
     llama_tokens out;
     size_t pos = 0;
@@ -1285,11 +1285,15 @@ llama_tokens tokenize_native_states(const llama_vocab * vocab, const std::string
             throw std::invalid_argument("unterminated native state marker");
         }
         const std::string id = prompt.substr(at + open.size(), end - at - open.size());
-        const auto found = states.find(id);
-        if (found == states.end()) {
-            throw std::invalid_argument("native state " + id + " is not loaded on this server (--native-state)");
+        const native_state_use use = states.resolve(id);
+        out.insert(out.end(), use.tokens.begin(), use.tokens.end());
+        if (imports) {
+            json receipt = json::object();
+            receipt["id"] = id;
+            receipt["mode"] = use.mode;
+            receipt["observed_native_state_id"] = id;
+            imports->push_back(receipt);
         }
-        out.insert(out.end(), found->second.begin(), found->second.end());
         pos = end + close.size();
     }
     return out;

@@ -406,6 +406,95 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     return res;
 }
 
+// a produced native state in generated text: U+E010 <index> U+E011, as the reference server's serve/chat.py placeholder
+std::string native_state_placeholder(size_t index) {
+    return "\xee\x80\x90" + std::to_string(index) + "\xee\x80\x91";
+}
+
+// a string with placeholders -> content parts; without them it stays a string (serve/chat.py _to_parts)
+static json native_parts(const std::string & text, const std::vector<std::string> & ids) {
+    static const std::string open = "\xee\x80\x90", close = "\xee\x80\x91";
+    json parts = json::array();
+    size_t last = 0, pos = 0;
+    bool any = false;
+    while ((pos = text.find(open, pos)) != std::string::npos) {
+        const size_t end = text.find(close, pos + open.size());
+        if (end == std::string::npos) {
+            break;
+        }
+        const std::string digits = text.substr(pos + open.size(), end - pos - open.size());
+        const bool numeric = !digits.empty() && digits.size() < 9 && digits.find_first_not_of("0123456789") == std::string::npos;
+        if (!numeric || std::stoul(digits) >= ids.size()) {
+            pos = end + close.size(); // literal private-use text is not a block reference
+            continue;
+        }
+        if (pos > last) {
+            json part = json::object(); part["type"] = "text"; part["text"] = text.substr(last, pos - last);
+            parts.push_back(part);
+        }
+        json part = json::object(); part["type"] = "native_state"; part["id"] = ids[std::stoul(digits)];
+        parts.push_back(part);
+        any = true;
+        last = pos = end + close.size();
+    }
+    if (!any) {
+        return json(text);
+    }
+    if (last < text.size()) {
+        json part = json::object(); part["type"] = "text"; part["text"] = text.substr(last);
+        parts.push_back(part);
+    }
+    return parts;
+}
+
+static json native_restore(const json & value, const std::vector<std::string> & ids) {
+    if (value.is_string()) {
+        return native_parts(value.get<std::string>(), ids);
+    }
+    if (value.is_array()) {
+        json out = json::array();
+        for (const auto & item : value) {
+            out.push_back(native_restore(item, ids));
+        }
+        return out;
+    }
+    if (value.is_object()) {
+        json out = json::object();
+        for (const auto & [key, item] : value.items()) {
+            out[key] = native_restore(item, ids);
+        }
+        return out;
+    }
+    return value;
+}
+
+// an assistant message with its produced native states as parts: in the content and in tool-call arguments
+static json native_message(json message, const std::vector<std::string> & ids) {
+    if (ids.empty()) {
+        return message;
+    }
+    if (message.contains("content") && message.at("content").is_string()) {
+        message["content"] = native_parts(message.at("content").get<std::string>(), ids);
+    }
+    if (message.contains("tool_calls") && message.at("tool_calls").is_array()) {
+        json calls = json::array();
+        for (auto call : message.at("tool_calls")) {
+            if (call.contains("function") && call.at("function").contains("arguments") &&
+                    call.at("function").at("arguments").is_string()) {
+                const json args = json::parse_no_throw(call.at("function").at("arguments").get<std::string>());
+                if (!args.is_discarded()) {
+                    json function = call.at("function");
+                    function["arguments"] = native_restore(args, ids).dump();
+                    call["function"] = function;
+                }
+            }
+            calls.push_back(call);
+        }
+        message["tool_calls"] = calls;
+    }
+    return message;
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     std::string finish_reason = "length";
     common_chat_msg msg;
@@ -422,7 +511,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     json choice {
         {"finish_reason", finish_reason},
         {"index", index},
-        {"message", msg.to_json_oaicompat()},
+        {"message", native_message(msg.to_json_oaicompat(), native_block_ids)},
     };
 
     if (!stream && probs_output.size() > 0) {
@@ -452,6 +541,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
     if (!guidance.is_null()) {
         res["x_natlang_guidance"] = guidance;
+    }
+    if (!native_state.is_null()) {
+        res["native_state"] = native_state;
     }
 
     return res;
@@ -1922,4 +2014,10 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+json server_task_result_native_register::to_json() {
+    json out = json::object();
+    out["mode"] = mode;
+    return out;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "server-native-state.h"
 #include "log.h"
 #include "llama.h"
 #include "chat.h"
@@ -350,7 +351,7 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
-    std::set<std::string> native_states; // IDs of loaded native state spans (--native-state)
+    std::shared_ptr<const native_state_registry> native_states; // the states native_state parts may name
 };
 
 // the prompt text a native_state content part renders to; tokenize_native_states() expands it
@@ -358,9 +359,10 @@ std::string native_state_marker(const std::string & id);
 
 // tokenize a prompt whose text may hold native state markers: text runs are tokenized separately (as the reference
 // engine tokenizes the segments around a state) and each marker becomes the state's consume-open marker, virtual
-// span and consume-close marker. `states` maps IDs to their tokens; a marker naming another ID is an error.
+// span (or its re-encoded text, for another model's state) and consume-close marker. A marker naming an unknown state
+// is an error. With `imports`, each consumed state appends its receipt {id, mode, observed_native_state_id} in order.
 llama_tokens tokenize_native_states(const llama_vocab * vocab, const std::string & prompt, bool add_special, bool parse_special,
-                                    const std::map<std::string, std::vector<llama_token>> & states);
+                                    const native_state_registry & states, json * imports = nullptr);
 
 // used by /completions endpoint
 json oaicompat_completion_params_parse(const json & body);

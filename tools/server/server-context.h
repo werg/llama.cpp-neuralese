@@ -32,8 +32,8 @@ struct server_context_meta {
     server_chat_params & chat_params;
     std::map<std::string, bool> chat_template_caps;
 
-    // natlang native state spans (--native-state), by ID: the tokens that consume each
-    const std::map<std::string, std::vector<llama_token>> & native_state_tokens;
+    // natlang native states (--native-state files and stored artifacts)
+    const native_state_registry & native_states;
 
     // tokens
     std::string bos_token_str;
@@ -181,6 +181,9 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t post_natlang_score;
     server_http_context::handler_t post_guidance_check;
+    server_http_context::handler_t get_neuralese_info;
+    server_http_context::handler_t get_native_state;
+    server_http_context::handler_t put_native_state;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
 
