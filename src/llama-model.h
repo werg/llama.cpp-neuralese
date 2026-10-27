@@ -728,6 +728,10 @@ struct llama_model {
     struct ggml_tensor * dense_2_out_layers_b = nullptr;
     struct ggml_tensor * dense_3_out_layers   = nullptr;
 
+    // natlang Neuralese producer adapter (optional): input embeddings of producing tokens get e + up(down(e))
+    struct ggml_tensor * natlang_producer_down = nullptr; // {n_embd, rank}
+    struct ggml_tensor * natlang_producer_up   = nullptr; // {rank, n_embd}
+
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 

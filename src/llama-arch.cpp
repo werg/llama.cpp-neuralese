@@ -598,6 +598,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_LAUREL_POST_NORM,                       "blk.%d.laurel_post_norm" },
     { LLM_TENSOR_DENSE_2_OUT,                            "dense_2" },
     { LLM_TENSOR_DENSE_3_OUT,                            "dense_3" },
+    { LLM_TENSOR_NATLANG_PRODUCER_DOWN,                  "natlang_producer_down" },
+    { LLM_TENSOR_NATLANG_PRODUCER_UP,                    "natlang_producer_up" },
     { LLM_TENSOR_FFN_NORM_EXPS,                          "blk.%d.ffn_norm_exps" },
     { LLM_TENSOR_ATTN_K_B,                               "blk.%d.attn_k_b" },
     { LLM_TENSOR_ATTN_V_B,                               "blk.%d.attn_v_b" },
@@ -771,6 +773,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DECISION_SCORER_OUT,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DENSE_2_OUT,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // Dense layer output
     {LLM_TENSOR_DENSE_3_OUT,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // Dense layer output
+    {LLM_TENSOR_NATLANG_PRODUCER_DOWN,      {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}}, // Neuralese producer adapter
+    {LLM_TENSOR_NATLANG_PRODUCER_UP,        {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
     {LLM_TENSOR_OUTPUT_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_OUTPUT_NORM_LFM2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DEC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},

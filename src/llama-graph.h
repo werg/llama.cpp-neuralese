@@ -187,6 +187,23 @@ public:
     const llama_state_spans * spans;
 };
 
+struct llama_state_production;
+
+// native state production: which ubatch tokens belong to producing sequences (llama_set_seq_producing)
+class llm_graph_input_producing : public llm_graph_input_i {
+public:
+    llm_graph_input_producing(const llama_state_production * production) : production(production) {}
+    virtual ~llm_graph_input_producing() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * mask = nullptr; // F32 [1, n_tokens]: 1 for tokens of producing sequences, 0 otherwise
+
+    const llama_state_production * production;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -842,6 +859,9 @@ struct llm_graph_params {
     // non-null when the ubatch holds virtual tokens of native state spans
     const llama_state_spans       * state_spans;
 
+    // non-null when the ubatch holds tokens of producing sequences
+    const llama_state_production  * production = nullptr;
+
     const llama_prec_policy * prec_policy = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -943,6 +963,7 @@ struct llm_graph_params {
             loras == other.loras &&
             loras_seq == other.loras_seq &&
             state_spans == other.state_spans &&
+            production == other.production &&
             cross == other.cross;
     }
 };
@@ -1001,6 +1022,15 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // native state production: graph outputs whose rows of producing tokens are captured after compute
+    struct capture_entry {
+        ggml_tensor * t; // F32 [width, n_tokens], rows in ubatch order
+        int           il;
+        int           kind; // llama_state_capture_kind
+        int64_t       width;
+    };
+    std::vector<capture_entry> t_captures;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1093,6 +1123,9 @@ struct llm_graph_context {
 
     const llama_state_spans       * state_spans;
     mutable llm_graph_input_state_span * inp_state_span = nullptr;
+
+    const llama_state_production  * production;
+    mutable llm_graph_input_producing * inp_producing = nullptr;
 
     const llama_prec_policy * prec_policy;
 
@@ -1242,6 +1275,12 @@ struct llm_graph_context {
     // `width` floats per ubatch token in ubatch order (any shape whose first dimensions multiply to width); kind
     // selects the layer's key, value or short-convolution gated input. Without virtual tokens, cur itself.
     ggml_tensor * build_state_span(ggml_tensor * cur, int il, llm_graph_input_state_span::kind_t kind) const;
+
+    // native state production, when the ubatch holds tokens of producing sequences (otherwise both are no-ops):
+    // build_producer returns cur (input embeddings [n_embd, n_tokens]) with up(down(e)) added to producing tokens' rows;
+    // build_capture marks cur (one row of width floats per ubatch token) to be captured for producing tokens.
+    ggml_tensor * build_producer(ggml_tensor * cur, ggml_tensor * down, ggml_tensor * up) const;
+    void          build_capture(ggml_tensor * cur, int il, int kind) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

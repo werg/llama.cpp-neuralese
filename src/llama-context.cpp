@@ -1980,6 +1980,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        // native state production: keep the producing tokens' stored state
+        capture_rows(*res, ubatch);
+
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2712,6 +2715,55 @@ bool llama_context::state_span_unregister(llama_token first) {
     return state_spans.spans.erase(first) > 0;
 }
 
+bool llama_context::ubatch_has_producing(const llama_ubatch & ubatch) const {
+    if (production.producing.empty() || model.arch != LLM_ARCH_LFM2) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (production.is_producing(ubatch.seq_id[i][0])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_context::capture_rows(const llm_graph_result & result, const llama_ubatch & ubatch) {
+    if (result.t_captures.empty()) {
+        return;
+    }
+    const auto & hp = model.hparams;
+    const int32_t n_layer = hp.n_layer();
+    // the producing tokens of this ubatch, in order, with their sequences
+    std::vector<int32_t> rows;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (production.is_producing(ubatch.seq_id[i][0])) {
+            rows.push_back((int32_t) i);
+        }
+    }
+    for (const int32_t i : rows) {
+        auto & cap = production.captures[ubatch.seq_id[i][0]];
+        if (cap.k.empty()) {
+            cap.k.resize(n_layer); cap.v.resize(n_layer); cap.conv.resize(n_layer);
+        }
+        cap.n += 1;
+    }
+    std::vector<float> row;
+    for (const auto & e : result.t_captures) {
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), e.t);
+        GGML_ASSERT(backend != nullptr);
+        row.resize(e.width);
+        for (const int32_t i : rows) {
+            auto & cap = production.captures[ubatch.seq_id[i][0]];
+            ggml_backend_tensor_get_async(backend, e.t, row.data(), (size_t) i*e.width*sizeof(float), e.width*sizeof(float));
+            ggml_backend_synchronize(backend);
+            std::vector<float> & dst = e.kind == LLAMA_STATE_CAPTURE_EMBD ? cap.embd :
+                                       e.kind == LLAMA_STATE_CAPTURE_K    ? cap.k[e.il] :
+                                       e.kind == LLAMA_STATE_CAPTURE_V    ? cap.v[e.il] : cap.conv[e.il];
+            dst.insert(dst.end(), row.begin(), row.end());
+        }
+    }
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -2731,6 +2783,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.state_spans =*/ ubatch_has_virtual(ubatch) ? &state_spans : nullptr,
+        /*.production  =*/ ubatch_has_producing(ubatch) ? &production : nullptr,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -4309,6 +4362,53 @@ bool llama_state_span_unregister(llama_context * ctx, llama_token first) {
 bool llama_state_span_is_virtual(const llama_context * ctx, llama_token token) {
     int32_t row = 0;
     return ctx->state_spans.find(token, row) != nullptr;
+}
+
+void llama_set_seq_producing(llama_context * ctx, llama_seq_id seq_id, bool producing) {
+    ctx->production.producing[seq_id] = producing;
+}
+
+bool llama_model_has_producer_adapter(const llama_model * model) {
+    return model->natlang_producer_down != nullptr && model->natlang_producer_up != nullptr;
+}
+
+int32_t llama_state_capture_n_tokens(const llama_context * ctx, llama_seq_id seq_id) {
+    auto it = ctx->production.captures.find(seq_id);
+    return it == ctx->production.captures.end() ? 0 : it->second.n;
+}
+
+int64_t llama_state_capture_get(const llama_context * ctx, llama_seq_id seq_id, int32_t il, llama_state_capture_kind kind,
+                                float * dst, int64_t capacity) {
+    auto it = ctx->production.captures.find(seq_id);
+    if (it == ctx->production.captures.end() || it->second.n == 0) {
+        return 0;
+    }
+    const auto & cap = it->second;
+    const std::vector<float> * src = nullptr;
+    if (kind == LLAMA_STATE_CAPTURE_EMBD) {
+        src = &cap.embd;
+    } else {
+        if (il < 0 || il >= (int32_t) cap.k.size()) {
+            return -1;
+        }
+        src = kind == LLAMA_STATE_CAPTURE_K ? &cap.k[il] : kind == LLAMA_STATE_CAPTURE_V ? &cap.v[il] :
+              kind == LLAMA_STATE_CAPTURE_CONV ? &cap.conv[il] : nullptr;
+    }
+    if (!src) {
+        return -1;
+    }
+    if (src->empty()) {
+        return 0;
+    }
+    const int64_t width = (int64_t) src->size() / cap.n;
+    if (dst && capacity >= (int64_t) src->size()) {
+        std::copy(src->begin(), src->end(), dst);
+    }
+    return width;
+}
+
+void llama_state_capture_clear(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->production.captures.erase(seq_id);
 }
 
 int32_t llama_set_adapters_lora(

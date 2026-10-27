@@ -27,6 +27,24 @@ struct llama_state_span {
     int64_t width_conv = 0;        // n_embd for short-convolution layers
 };
 
+// Native state production (llama_set_seq_producing): which sequences produce, and what their tokens stored.
+struct llama_state_capture {
+    int32_t n = 0;
+    // per layer, row-major [n][width]; empty where the layer stores no such state
+    std::vector<std::vector<float>> k, v, conv;
+    std::vector<float> embd; // [n][n_embd]
+};
+
+struct llama_state_production {
+    std::map<llama_seq_id, bool> producing;
+    std::map<llama_seq_id, llama_state_capture> captures;
+
+    bool is_producing(llama_seq_id seq) const {
+        auto it = producing.find(seq);
+        return it != producing.end() && it->second;
+    }
+};
+
 struct llama_state_spans {
     llama_token base = 0; // n_vocab: the first virtual token ID
     llama_token next = 0; // the first unallocated virtual token ID

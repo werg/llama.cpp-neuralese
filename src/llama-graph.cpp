@@ -130,6 +130,19 @@ void llm_graph_input_state_span::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_producing::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens = ubatch->n_tokens;
+    std::vector<float> m(n_tokens, 0.0f);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        m[i] = production->is_producing(ubatch->seq_id[i][0]) ? 1.0f : 0.0f;
+    }
+    ggml_backend_tensor_set(mask, m.data(), 0, n_tokens*sizeof(float));
+}
+
+bool llm_graph_input_producing::can_reuse(const llm_graph_params & params) {
+    return params.production == production && mask && mask->ne[1] == params.ubatch.n_tokens;
+}
+
 bool llm_graph_input_state_span::can_reuse(const llm_graph_params & params) {
     return params.state_spans == spans && mask && mask->ne[1] == params.ubatch.n_tokens;
 }
@@ -1427,6 +1440,8 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_captures.clear();
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1588,6 +1603,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     state_spans      (params.state_spans),
+    production       (params.production),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2582,6 +2598,39 @@ ggml_tensor * llm_graph_context::build_state_span(ggml_tensor * cur, int il, llm
     ggml_tensor * flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), width, n_tokens);
     ggml_tensor * out  = ggml_add(ctx0, ggml_mul(ctx0, flat, inp_state_span->keep), ggml_mul(ctx0, value, inp_state_span->mask));
     return ggml_reshape(ctx0, out, cur);
+}
+
+ggml_tensor * llm_graph_context::build_producer(ggml_tensor * cur, ggml_tensor * down, ggml_tensor * up) const {
+    if (!production || !down || !up) {
+        return cur;
+    }
+    const int64_t n_tokens = ubatch.n_tokens;
+    if (!inp_producing) {
+        auto inp = std::make_unique<llm_graph_input_producing>(production);
+        inp->mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp->mask);
+        inp_producing = static_cast<llm_graph_input_producing *>(res->add_input(std::move(inp)));
+    }
+    // the native producer adapter: e + up(down(e)) for producing tokens, e otherwise (x + 0*y is exact for finite y)
+    ggml_tensor * update = ggml_mul_mat(ctx0, up, ggml_mul_mat(ctx0, down, cur));
+    cb(update, "natlang_producer", -1);
+    return ggml_add(ctx0, cur, ggml_mul(ctx0, update, inp_producing->mask));
+}
+
+void llm_graph_context::build_capture(ggml_tensor * cur, int il, int kind) const {
+    if (!production) {
+        return;
+    }
+    const int64_t n_tokens = ubatch.n_tokens;
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(cur) % n_tokens == 0);
+    const int64_t width = ggml_nelements(cur) / n_tokens;
+    ggml_tensor * t = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), width, n_tokens);
+    t = ggml_cont(ctx0, t); // its own buffer, kept until extraction
+    cb(t, "natlang_capture", il);
+    ggml_set_output(t);
+    ggml_build_forward_expand(gf, t);
+    res->t_captures.push_back({ t, il, kind, width });
 }
 
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {

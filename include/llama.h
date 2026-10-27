@@ -774,6 +774,40 @@ extern "C" {
     // Whether token is a registered virtual token of this context.
     LLAMA_API bool llama_state_span_is_virtual(const struct llama_context * ctx, llama_token token);
 
+    // Native state production (Neuralese producer spans). While a sequence is producing, every token of it a decode
+    // processes gets the model's producer adapter on its input embedding (e + up(down(e)), when the model has one) and
+    // its stored state is captured, in the same quantities a span import takes: the input embedding before the adapter,
+    // attention keys after the key norm and before RoPE, values, and short-convolution gated inputs B*x. The caller
+    // decides which tokens produce: natlang marks the tokens between a produce-open and a produce-close marker, the
+    // markers themselves excluded. Supported architectures: LFM2.
+    LLAMA_API void llama_set_seq_producing(struct llama_context * ctx, llama_seq_id seq_id, bool producing);
+
+    // Whether the model has a producer adapter (GGUF tensors natlang_producer_down / natlang_producer_up).
+    LLAMA_API bool llama_model_has_producer_adapter(const struct llama_model * model);
+
+    enum llama_state_capture_kind {
+        LLAMA_STATE_CAPTURE_K    = 0, // [n_tokens][n_embd_k_gqa(il)]
+        LLAMA_STATE_CAPTURE_V    = 1, // [n_tokens][n_embd_v_gqa(il)]
+        LLAMA_STATE_CAPTURE_CONV = 2, // [n_tokens][n_embd]
+        LLAMA_STATE_CAPTURE_EMBD = 3, // [n_tokens][n_embd]; il is ignored
+    };
+
+    // The number of tokens captured for seq_id since its last clear.
+    LLAMA_API int32_t llama_state_capture_n_tokens(const struct llama_context * ctx, llama_seq_id seq_id);
+
+    // The captured rows of one layer and kind: returns the row width (0 when the layer stores no such state) and,
+    // when dst is non-null and capacity >= n_tokens*width, copies n_tokens*width floats there; -1 on a bad argument.
+    LLAMA_API int64_t llama_state_capture_get(
+            const struct llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t il,
+            enum llama_state_capture_kind kind,
+            float * dst,
+            int64_t capacity);
+
+    // Drop what was captured for seq_id.
+    LLAMA_API void llama_state_capture_clear(struct llama_context * ctx, llama_seq_id seq_id);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

@@ -307,6 +307,11 @@ public:
     bool        state_span_unregister(llama_token first);
     bool        ubatch_has_virtual(const llama_ubatch & ubatch) const;
 
+    llama_state_production production; // native state production (llama_set_seq_producing)
+
+    bool ubatch_has_producing(const llama_ubatch & ubatch) const;
+    void capture_rows(const llm_graph_result & result, const llama_ubatch & ubatch);
+
 private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably

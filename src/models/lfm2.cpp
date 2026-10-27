@@ -31,8 +31,15 @@ void llama_model_lfm2::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_lfm2::load_arch_tensors(llama_model_loader &) {
+void llama_model_lfm2::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    // natlang Neuralese producer adapter (optional): its rank is the shape the export wrote
+    if (const ggml_tensor * meta = ml.get_tensor_meta(tn(LLM_TENSOR_NATLANG_PRODUCER_DOWN, "weight").str().c_str())) {
+        const int64_t rank = meta->ne[1];
+        natlang_producer_down = create_tensor(tn(LLM_TENSOR_NATLANG_PRODUCER_DOWN, "weight"), {n_embd, rank}, 0);
+        natlang_producer_up   = create_tensor(tn(LLM_TENSOR_NATLANG_PRODUCER_UP,   "weight"), {rank, n_embd}, 0);
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -142,6 +149,10 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         k = build_norm(k, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
         cb(k, "model.layers.{}.self_attn.k_layernorm", il);
 
+        // native state production: producing tokens store this key (pre-RoPE) and value
+        build_capture(k, il, LLAMA_STATE_CAPTURE_K);
+        build_capture(v, il, LLAMA_STATE_CAPTURE_V);
+
         // native state spans: virtual tokens store their imported key (pre-RoPE) and value
         k = build_state_span(k, il, llm_graph_input_state_span::KIND_K);
         v = build_state_span(v, il, llm_graph_input_state_span::KIND_V);
@@ -191,7 +202,9 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
                                              2 * chunk_size * ggml_element_size(bcx));
 
         // native state spans: virtual tokens feed their imported gated input to the convolution and its state
-        auto * bx = ggml_transpose(ctx0, build_state_span(ggml_mul(ctx0, b, x), il, llm_graph_input_state_span::KIND_CONV));
+        auto * gated = ggml_mul(ctx0, b, x);
+        build_capture(gated, il, LLAMA_STATE_CAPTURE_CONV); // native state production: producing tokens store B*x
+        auto * bx = ggml_transpose(ctx0, build_state_span(gated, il, llm_graph_input_state_span::KIND_CONV));
 
         // read conv state
         auto * conv_state = mctx_cur->get_r_l(il);
@@ -246,6 +259,10 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
     // actual graph construction starts here
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     cb(cur, "model.embed_tokens", -1);
+
+    // native state production: producing tokens' embeddings are captured, then get the producer adapter
+    build_capture(cur, -1, LLAMA_STATE_CAPTURE_EMBD);
+    cur = build_producer(cur, model.natlang_producer_down, model.natlang_producer_up);
 
     ggml_build_forward_expand(gf, cur);
 
