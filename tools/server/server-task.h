@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-guidance.h"
 
 
 enum server_task_type {
@@ -70,6 +71,9 @@ struct task_params {
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
     std::map<int, float> lora; // mapping adapter ID -> scale
+
+    // natlang guided generation (server-guidance.h), if the request asks for it
+    std::optional<server_guide_settings> guidance;
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
@@ -378,6 +382,9 @@ struct server_task_result_cmpl_final : server_task_result {
     std::vector<std::string>  response_fields;
 
     task_params generation_params;
+
+    // natlang guided generation: {"rejections": [...]}, null when off
+    json guidance;
 
     // response formatting
     bool               verbose  = false;

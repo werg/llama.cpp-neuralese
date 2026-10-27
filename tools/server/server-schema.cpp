@@ -226,6 +226,16 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
 #endif
 
+    add((new field_json("guidance"))
+        ->set_desc("natlang guided generation: true or an object of settings (server-guidance.h), off when absent, null or false")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & guidance = data.at("guidance");
+            if (guidance.is_null() || (guidance.is_boolean() && !guidance.get<bool>())) {
+                return;
+            }
+            ctx.params.guidance = server_guide_settings::from_json(guidance, {}, false);
+        }));
+
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

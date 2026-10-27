@@ -359,6 +359,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    if (!guidance.is_null()) {
+        res["x_natlang_guidance"] = guidance;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -455,6 +458,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
     }
+    if (!guidance.is_null()) {
+        res["x_natlang_guidance"] = guidance;
+    }
 
     return res;
 }
@@ -515,6 +521,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
     if (stats.is_set()) {
         deltas.back()["timings"] = stats.to_json();
+    }
+    if (!guidance.is_null()) {
+        deltas.back()["x_natlang_guidance"] = guidance;
     }
 
     // extra fields for debugging purposes
