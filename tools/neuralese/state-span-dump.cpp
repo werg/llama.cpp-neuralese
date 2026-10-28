@@ -6,7 +6,7 @@
 // >= --from to --out, and with --capture PREFIX the captured state: PREFIX.json (token count and per-kind widths) and
 // PREFIX.f32 (the embeddings, then per layer key, value and gated input where present, each [n][width]).
 //
-//   llama-state-span-dump -m model.gguf --input seq.json --from N --out logits.f32 [--chunk K] [--f32-cache]
+//   llama-state-span-dump -m model.gguf --input seq.json --from N --out logits.f32 [--chunk K] [--f32-cache] [--fa on|off|auto]
 //                         [--capture PREFIX] [-ngl N]
 
 #include "llama.h"
@@ -24,6 +24,7 @@ int main(int argc, char ** argv) {
     std::string model_path, input_path, out_path, capture_prefix;
     int32_t from = 0, chunk = 0, threads = 8, n_gpu_layers = 0;
     bool f32_cache = false;
+    std::string fa = "auto";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -34,6 +35,7 @@ int main(int argc, char ** argv) {
         else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "-t") threads = std::stoi(next());
         else if (a == "--f32-cache") f32_cache = true;
+        else if (a == "--fa") fa = next();
         else if (a == "--capture") capture_prefix = next();
         else if (a == "-ngl") n_gpu_layers = std::stoi(next());
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
@@ -47,6 +49,9 @@ int main(int argc, char ** argv) {
     cparams.n_ctx = 4096; cparams.n_batch = 4096; cparams.n_ubatch = 4096;
     cparams.n_threads = cparams.n_threads_batch = threads;
     if (f32_cache) { cparams.type_k = GGML_TYPE_F32; cparams.type_v = GGML_TYPE_F32; }
+    if (fa == "on") cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    else if (fa == "off") cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    else if (fa != "auto") { fprintf(stderr, "--fa takes on, off or auto\n"); return 2; }
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) return 1;
 
