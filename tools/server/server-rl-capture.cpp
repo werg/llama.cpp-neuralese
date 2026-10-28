@@ -234,6 +234,16 @@ json rl_prompt_segments(const llama_tokens & tokens, const json & imports, const
     };
     for (size_t i = 0; i < tokens.size();) {
         const llama_token t = tokens[i];
+        // an exact import of an empty state: its markers with nothing between them
+        if (i > 0 && tokens[i - 1] == registry.consume_open && t == registry.consume_close && next_import < exact.size()) {
+            const auto stored = registry.store.get(exact[next_import]);
+            if (stored && stored->block.n_tokens() == 0) {
+                flush();
+                json segment = { { "kind", "native_state" }, { "id", exact[next_import++] },
+                                 { "native_identity", json::parse(stored->block.identity().to_json().dump()) } };
+                segments.push_back(segment);
+            }
+        }
         if (t >= n_vocab) {
             flush();
             size_t end = i;

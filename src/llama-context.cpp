@@ -4608,7 +4608,21 @@ int64_t llama_state_capture_get(const llama_context * ctx, llama_seq_id seq_id, 
                                 float * dst, int64_t capacity) {
     auto it = ctx->production.captures.find(seq_id);
     if (it == ctx->production.captures.end() || it->second.n == 0) {
-        return 0;
+        // nothing captured (an empty producer span): the layer's row width, from the layout
+        const auto & hp = ctx->get_model().hparams;
+        if (kind == LLAMA_STATE_CAPTURE_EMBD) {
+            return hp.n_embd;
+        }
+        if (il < 0 || il >= (int32_t) hp.n_layer()) {
+            return -1;
+        }
+        if (kind == LLAMA_STATE_CAPTURE_CONV) {
+            return hp.is_recr(il) ? hp.n_embd : 0;
+        }
+        if (kind == LLAMA_STATE_CAPTURE_K || kind == LLAMA_STATE_CAPTURE_V) {
+            return hp.is_recr(il) ? 0 : (kind == LLAMA_STATE_CAPTURE_K ? hp.n_embd_k_gqa(il) : hp.n_embd_v_gqa(il));
+        }
+        return -1;
     }
     const auto & cap = it->second;
     const std::vector<float> * src = nullptr;

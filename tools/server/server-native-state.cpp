@@ -416,7 +416,9 @@ native_state_use native_state_registry::resolve(const std::string & id) const {
     native_state_use use;
     use.tokens.push_back(consume_open);
     const llama_token first = store.span(id);
-    if (first != LLAMA_TOKEN_NULL) {
+    if (found->block.n_tokens() == 0 && found->block.identity() == identity) {
+        use.mode = "exact-native-state"; // an empty state of this model: nothing between its markers
+    } else if (first != LLAMA_TOKEN_NULL) {
         for (int64_t i = 0; i < found->block.n_tokens(); ++i) {
             use.tokens.push_back(first + (llama_token) i);
         }

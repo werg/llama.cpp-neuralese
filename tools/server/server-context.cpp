@@ -2318,8 +2318,9 @@ private:
 
     // the captured state of a slot's finished producer span as a stored, registered native state; returns its ID
     std::string native_store_produced(server_slot & slot) {
+        // an empty span (produce-close right after produce-open) is an empty state, as the reference engine stores it
         const int32_t n = (int32_t) slot.native_span.size();
-        if (n == 0 || llama_state_capture_n_tokens(ctx_tgt, slot.id) != n) {
+        if (llama_state_capture_n_tokens(ctx_tgt, slot.id) != n) {
             throw std::runtime_error("the producer span's capture does not cover its tokens");
         }
         const int32_t n_layer = llama_model_n_layer(model_tgt);
@@ -2399,8 +2400,8 @@ private:
 
     // register a stored state of this server's identity as a virtual span (main thread)
     void native_register(const std::string & id, const native_state_block & block) {
-        if (native_registry->store.span(id) != LLAMA_TOKEN_NULL) {
-            return;
+        if (native_registry->store.span(id) != LLAMA_TOKEN_NULL || block.n_tokens() == 0) {
+            return; // an empty state has no positions: it is consumed as its two markers
         }
         const int32_t n_layer = llama_model_n_layer(model_tgt);
         const native_state_rows rows = native_state_to_rows(block, n_layer);
@@ -4066,8 +4067,7 @@ private:
                         if (found->block.identity() == native_registry->identity) {
                             native_register(task.native_state_id, found->block);
                         }
-                        res->mode = native_registry->store.span(task.native_state_id) != LLAMA_TOKEN_NULL ?
-                            "exact-native-state" : "best-effort-text-retokenization";
+                        res->mode = native_registry->resolve(task.native_state_id).mode;
                         queue_results.send(std::move(res));
                     } catch (const std::exception & e) {
                         send_error(task, std::string("neuralese-bad-native-state: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);

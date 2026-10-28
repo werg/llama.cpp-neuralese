@@ -798,8 +798,9 @@ extern "C" {
     // The number of tokens captured for seq_id since its last clear.
     LLAMA_API int32_t llama_state_capture_n_tokens(const struct llama_context * ctx, llama_seq_id seq_id);
 
-    // The captured rows of one layer and kind: returns the row width (0 when the layer stores no such state) and,
-    // when dst is non-null and capacity >= n_tokens*width, copies n_tokens*width floats there; -1 on a bad argument.
+    // The captured rows of one layer and kind: returns the row width (0 when the layer stores no such state; the
+    // layout's width when nothing was captured) and, when dst is non-null and capacity >= n_tokens*width, copies
+    // n_tokens*width floats there; -1 on a bad argument.
     LLAMA_API int64_t llama_state_capture_get(
             const struct llama_context * ctx,
             llama_seq_id seq_id,
