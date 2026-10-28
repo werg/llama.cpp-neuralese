@@ -158,7 +158,7 @@ static int64_t read_i64(const std::string & data, size_t i) {
     return v;
 }
 
-// the block's layout against state_block.py NativeStateBlock.validate (for the layer kinds an LFM2 server reads)
+// the block's layout against state_block.py NativeStateBlock.validate (for the layer kinds an LFM2/LFM3 server reads; sliding and full attention are both "attention")
 static void validate(const native_state_block & block) {
     const ojson & m = block.metadata;
     static const std::vector<std::string> allowed = { "schema", "text", "architecture", "tokenizer_fingerprint",

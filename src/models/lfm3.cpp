@@ -30,8 +30,10 @@ void llama_model_lfm3::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_lfm3::load_arch_tensors(llama_model_loader &) {
+void llama_model_lfm3::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    load_natlang_producer(ml);
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -119,6 +121,15 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         k = build_norm(k, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
         cb(k, "model.layers.{}.self_attn.k_layernorm", il);
 
+        // native state production: producing tokens store this key (after the key norm, before RoPE) and value;
+        // the layout is HF's (no row permutation in the converter), RoPE rotates dims i and i + n_embd_head/2
+        build_capture(k, il, LLAMA_STATE_CAPTURE_K);
+        build_capture(v, il, LLAMA_STATE_CAPTURE_V);
+
+        // native state spans: virtual tokens store their imported key (pre-RoPE) and value, in full and sliding layers
+        k = build_state_span(k, il, llm_graph_input_state_span::KIND_K);
+        v = build_state_span(v, il, llm_graph_input_state_span::KIND_V);
+
         q = ggml_rope_ext(ctx0, q, inp_pos, rope_factors, n_rot_l, rope_type, n_ctx_orig,
                           freq_base_l, freq_scale_l, ext_factor, attn_factor, beta_fast, beta_slow);
         k = ggml_rope_ext(ctx0, k, inp_pos, rope_factors, n_rot_l, rope_type, n_ctx_orig,
@@ -147,6 +158,10 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     cb(cur, "model.embed_tokens", -1);
 
+    // native state production: producing tokens' embeddings are captured, then get the producer adapter
+    build_capture(cur, -1, LLAMA_STATE_CAPTURE_EMBD);
+    cur = build_producer(cur, model.natlang_producer_down, model.natlang_producer_up);
+
     ggml_build_forward_expand(gf, cur);
 
     // decision: no memory, the whole prompt is read in one batch
@@ -157,6 +172,8 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = cur;
+
         auto * prev_cur = cur;
 
         cur = build_norm(cur, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
@@ -186,6 +203,7 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         }
 
         cur = ggml_add(ctx0, prev_cur, cur);
+        cb(cur, "ffn_inp", il);
 
         auto * ffn_norm_out = build_norm(cur, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(ffn_norm_out, "model.layers.{}.ffn_norm", il);
@@ -202,6 +220,9 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
     }
+
+    // the final residual before the output norm, for the output rows (llama_set_embeddings_layer_inp(ctx, n_layer))
+    res->t_layer_inp[n_layer] = cur;
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

@@ -1248,6 +1248,16 @@ bool llm_arch_is_recurrent(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_has_native_state(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_LFM2:
+        case LLM_ARCH_LFM3:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_is_hybrid(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_JAMBA:

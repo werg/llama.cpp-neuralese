@@ -2782,7 +2782,7 @@ bool llama_context::ubatch_has_virtual(const llama_ubatch & ubatch) const {
 
 llama_token llama_context::state_span_register(int32_t n_tokens, const llama_state_span_layer * layers, int32_t n_layers) {
     const auto & hp = model.hparams;
-    if (model.arch != LLM_ARCH_LFM2) {
+    if (!llm_arch_has_native_state(model.arch)) {
         LLAMA_LOG_ERROR("%s: native state spans are not supported for this architecture\n", __func__);
         return LLAMA_TOKEN_NULL;
     }
@@ -2832,7 +2832,7 @@ bool llama_context::state_span_unregister(llama_token first) {
 }
 
 bool llama_context::ubatch_has_producing(const llama_ubatch & ubatch) const {
-    if (production.producing.empty() || model.arch != LLM_ARCH_LFM2) {
+    if (production.producing.empty() || !llm_arch_has_native_state(model.arch)) {
         return false;
     }
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
