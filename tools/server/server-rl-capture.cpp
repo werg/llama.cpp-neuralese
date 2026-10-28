@@ -331,7 +331,6 @@ json rl_actor_runtime_from_process() {
         if (name.compare(0, 8, "libllama") == 0 || name.compare(0, 7, "libggml") == 0 ||
             name.compare(0, 7, "libmtmd") == 0) paths.insert(path);
     }
-    if (paths.empty()) throw std::runtime_error("no loaded llama/ggml libraries found");
     json libraries = json::object();
     for (const auto & path : paths) {
         const auto name = path.substr(path.find_last_of('/') + 1);
@@ -341,7 +340,8 @@ json rl_actor_runtime_from_process() {
         libraries[name] = hash;
     }
     return {{"schema", "natlang.actor-process-runtime/1"}, {"executable_sha256", executable},
-            {"libraries_sha256", libraries}, {"source_commit", llama_commit()}, {"build_info", llama_build_info()}};
+            {"libraries_sha256", libraries}, {"linkage", paths.empty() ? "static" : "dynamic"},
+            {"source_commit", llama_commit()}, {"build_info", llama_build_info()}};
 }
 
 rl_actor_export rl_actor_export_from_model(const llama_model * model, const std::string & path) {
