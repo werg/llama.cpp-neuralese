@@ -446,8 +446,21 @@ struct server_slot {
     bool                     native_producing = false;
     std::vector<llama_token> native_span;
     llama_pos                native_span_pos0 = -1;
+    bool                     native_produced = false; // a token of this task decoded inside a producer span
     std::vector<std::string> native_block_ids;
     json                     native_blocks = json::array();
+
+    // natlang RL actor capture of the current task (server-rl-capture.h): the sampled tokens with their behaviour
+    // log-probabilities, the fed inputs, the producer writes and a native marker failure
+    struct rl_trace_state {
+        json    samples = json::array();
+        json    inputs  = json::array();
+        json    writes  = json::array();
+        int32_t open_sample = -1; // sample index of the open producer span's produce-open marker
+        int32_t open_own    = -1; // its own-input position
+        json    failure;          // natlang.native-marker-failure/1, null when none
+    };
+    std::unique_ptr<rl_trace_state> rl;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -462,8 +475,10 @@ struct server_slot {
         native_producing = false;
         native_span.clear();
         native_span_pos0 = -1;
+        native_produced  = false;
         native_block_ids.clear();
         native_blocks = json::array();
+        rl.reset();
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -597,7 +612,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec && !guided;
+        return !!spec && !guided && !rl;
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -709,6 +724,12 @@ struct server_slot {
 
             // mtmd_helper always re-eval the whole prompt
             if (task->type == SERVER_TASK_TYPE_TTS) {
+                prompt_clear();
+            }
+
+            // tokens decoded inside a producer span carry the producer adapter's state: a later prompt with the same
+            // token IDs reads them as ordinary text, so that context is not reused
+            if (native_produced) {
                 prompt_clear();
             }
 
@@ -1085,6 +1106,10 @@ public:
     bool native_produces = false;
     struct { llama_token produce_open = LLAMA_TOKEN_NULL, produce_close = LLAMA_TOKEN_NULL; } native_markers;
 
+    // natlang RL actor: how this GGUF relates to the checkpoint its identity names, and the stop tokens (EOG)
+    rl_actor_export rl_export;
+    std::vector<llama_token> rl_stop_tokens;
+
     // scored positions in the current batch, at most SERVER_N_SCORE_OUTPUTS
     int32_t n_score_outputs = 0;
 
@@ -1397,6 +1422,15 @@ private:
             if (!native_registry->identity.empty()) {
                 SRV_INF("native states: identity %s, production %s\n", native_registry->identity.checkpoint_sha256.substr(0, 12).c_str(),
                         native_produces ? "on" : "off");
+                rl_export = rl_actor_export_from_model(model_tgt, params_base.model.path);
+                rl_stop_tokens.clear();
+                for (llama_token t = 0; t < llama_vocab_n_tokens(vocab); ++t) {
+                    if (llama_vocab_is_eog(vocab, t)) {
+                        rl_stop_tokens.push_back(t);
+                    }
+                }
+                SRV_INF("RL actor: %s export %s, sha256 %s\n", rl_export.kind.c_str(), rl_export.format.c_str(),
+                        rl_export.sha256.substr(0, 12).c_str());
             }
         }
 
@@ -2063,6 +2097,22 @@ private:
             }
         }
 
+        if (task.params.rl.trace()) {
+            if (!native_produces) {
+                send_error(task, "native-rl-policy-unavailable: captured rollouts need a natlang GGUF with its native identity "
+                           "and producer adapter", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            for (const auto & lora : slot.lora) {
+                if (lora.scale != 0.0f) {
+                    send_error(task, "native-rl-adapter-unsupported: a captured rollout runs the exported policy without LoRA "
+                               "adapters", ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+            }
+            slot.rl = std::make_unique<server_slot::rl_trace_state>();
+        }
+
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
         if (lora_all_alora(slot.lora)) {
@@ -2261,6 +2311,7 @@ private:
             slot.native_span_pos0 = slot.prompt.tokens.pos_next();
         }
         slot.native_span.push_back(tok);
+        slot.native_produced = true;
         llama_set_seq_producing(ctx_tgt, slot.id, true);
         result.text_to_send = "";
     }
@@ -2364,6 +2415,180 @@ private:
             throw std::runtime_error("the context refused the native state span");
         }
         native_registry->store.set_span(id, first);
+    }
+
+    // natlang RL actor capture (server-rl-capture.h): record a sampled token as the native engine does
+    // (serve/engine.py _native_sequence_step): its log-probability and behaviour top-k under the sampling law, its
+    // embedding role, whether it ends the reply, and the fed input it becomes. Returns the native marker failure the
+    // draw causes (serve/native_protocol.py), or an empty string.
+    std::string rl_trace_sample(server_slot & slot, llama_token tok, int tok_idx) {
+        auto & rl = *slot.rl;
+        const auto & p = slot.task->params;
+        const int32_t index = (int32_t) rl.samples.size();
+        json sample = json::object();
+        sample["index"]    = index;
+        sample["token_id"] = tok;
+        if (p.sampling.temp > 0.0f) {
+            const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+            json top_k;
+            sample["logp"] = rl_law_logp(logits, llama_vocab_n_tokens(vocab), p.sampling.temp, p.rl_banned, tok, p.rl.top_k,
+                                         p.rl.top_k > 0 ? &top_k : nullptr);
+            if (p.rl.top_k > 0) {
+                sample["top_k"] = top_k;
+            }
+        } else {
+            sample["logp"] = nullptr;
+        }
+        if (!p.rl_banned.empty()) {
+            sample["banned_token_ids"] = p.rl_banned;
+        }
+        const bool open     = slot.native_producing;
+        const bool terminal = llama_vocab_is_eog(vocab, tok);
+        const bool marker   = tok == native_markers.produce_open || tok == native_markers.produce_close;
+        std::string code, message;
+        bool fed = !terminal;
+        if (terminal && open) {
+            code = "neuralese-native-state-open"; message = "generation stopped inside a produce span";
+        } else if (!terminal && tok == native_markers.produce_close && !open) {
+            code = "neuralese-native-state-close"; message = "generation emitted a produce end marker without an open span";
+            fed  = false;
+        } else if (!terminal && (tok == native_registry->consume_open || tok == native_registry->consume_close)) {
+            code = "neuralese-native-state-consume-marker";
+            message = "consume markers are inserted only around an imported native-state part";
+            fed  = false;
+        } else if (tok == native_markers.produce_open && open) {
+            code = "neuralese-native-state-nested"; message = "produce spans cannot nest";
+        }
+        const std::string role = open && !marker ? "produce" : "ordinary";
+        sample["input_role"]         = role;
+        sample["terminal"]           = terminal;
+        sample["query_own_position"] = p.rl.prompt_own + (int32_t) rl.inputs.size() - 1;
+        rl.samples.push_back(sample);
+        if (fed) {
+            if (tok == native_markers.produce_open && !open) {
+                rl.open_sample = index;
+                rl.open_own    = p.rl.prompt_own + (int32_t) rl.inputs.size();
+            }
+            rl.inputs.push_back({ { "token_id", tok }, { "input_role", role }, { "sample_index", index } });
+        }
+        if (!code.empty()) {
+            rl_trace_fail(slot, code, message, index, fed);
+        }
+        return code;
+    }
+
+    // the producer write a sampled produce-close marker ended (after native_production stored its state), and a reply
+    // that a limit ends inside a producer span. Returns a failure code, or an empty string.
+    std::string rl_trace_after(server_slot & slot, llama_token tok, size_t n_blocks_before, bool has_next) {
+        auto & rl = *slot.rl;
+        if (!rl.failure.is_null()) {
+            return rl.failure.at("code").get<std::string>();
+        }
+        if (tok == native_markers.produce_close && rl.open_sample >= 0) {
+            if (slot.native_block_ids.size() != n_blocks_before + 1) {
+                throw std::runtime_error("native-rl-production-failed: the producer span's state was not stored");
+            }
+            const int32_t own_end = slot.task->params.rl.prompt_own + (int32_t) rl.inputs.size();
+            rl.writes.push_back({
+                { "state_id",          slot.native_block_ids.back() },
+                { "begin_sample",      rl.open_sample },
+                { "end_sample",        (int32_t) rl.samples.size() },
+                { "own_begin",         rl.open_own },
+                { "own_end",           own_end },
+                { "payload_own_begin", rl.open_own + 1 },
+                { "payload_own_end",   own_end - 1 },
+                { "native_identity",   json::parse(native_registry->identity.to_json().dump()) },
+            });
+            rl.open_sample = -1;
+            rl.open_own    = -1;
+        }
+        if (!has_next && slot.native_producing) {
+            rl_trace_fail(slot, "neuralese-native-state-open", "generation ended inside a produce span", -1, false);
+            return "neuralese-native-state-open";
+        }
+        return "";
+    }
+
+    void rl_trace_fail(server_slot & slot, const std::string & code, const std::string & message, int32_t sample_index, bool fed) {
+        auto & rl = *slot.rl;
+        const int32_t n_inputs = (int32_t) rl.inputs.size();
+        const bool length = sample_index < 0;
+        const int32_t max_tokens = (length && slot.truncated) || slot.n_predict_max <= 0 ? std::max(1, n_inputs) : slot.n_predict_max;
+        rl.failure = {
+            { "schema", "natlang.native-marker-failure/1" },
+            { "code", code },
+            { "message", code + ": " + message },
+            { "trigger", length ? "length" : "sample" },
+            { "sample_index", length ? json(nullptr) : json(sample_index) },
+            { "fed", fed },
+            { "own_input_count", slot.task->params.rl.prompt_own + n_inputs },
+            { "generated_input_count", n_inputs },
+            { "max_tokens", max_tokens },
+            { "stop_token_ids", rl_stop_tokens },
+        };
+    }
+
+    // nothing of a failed turn is produced: leave an open span without storing a state
+    void rl_leave_span(server_slot & slot) {
+        llama_set_seq_producing(ctx_tgt, slot.id, false);
+        llama_state_capture_clear(ctx_tgt, slot.id);
+        slot.native_producing = false;
+        slot.native_span.clear();
+    }
+
+    // the x_natlang_rl_capture of a finished traced slot (serve/engine.py _native_response)
+    json rl_capture_json(const server_slot & slot) const {
+        const auto & rl = *slot.rl;
+        const auto & p  = slot.task->params;
+        const bool greedy  = p.sampling.temp <= 0.0f;
+        const bool failure = !rl.failure.is_null();
+        const char * schema = failure ? (greedy ? "natlang.native-structural-capture/2" : "natlang.native-rl-sampling/4")
+                                      : (greedy ? "natlang.native-structural-capture/1" : "natlang.native-rl-sampling/2");
+        const char * finish = failure ? "error" : (slot.stop == STOP_TYPE_LIMIT ? "length" : "stop");
+        json capture = {
+            { "schema", schema },
+            { "policy", json::parse(native_registry->identity.to_json().dump()) },
+            { "prompt", p.rl.prompt },
+            { "samples", rl.samples },
+            { "generated_inputs", rl.inputs },
+            { "writes", rl.writes },
+            { "finish_reason", finish },
+            { "sample_range_convention", "half-open" },
+            { "sampling_law", {
+                { "temperature", greedy ? 0.0 : (double) p.sampling.temp },
+                { "seed", p.sampling.seed },
+                { "guidance", false },
+                { "probabilities", greedy ? "greedy-argmax" : "post-processing-normalized" },
+            } },
+            { "actor_export", rl_export.to_json() },
+        };
+        if (!greedy && p.rl.top_k > 0) {
+            capture["behavior_top_k"] = rl_top_k_declaration(p.rl.top_k);
+        }
+        if (failure) {
+            capture["protocol_failure"] = rl.failure;
+        }
+        return capture;
+    }
+
+    // the exact tokens of a failed turn: every fed input and a final unfed draw (serve/native_protocol.py generated_tokens)
+    llama_tokens rl_failure_tokens(const server_slot & slot) const {
+        llama_tokens out;
+        for (const auto & input : slot.rl->inputs) {
+            out.push_back(input.at("token_id").get<llama_token>());
+        }
+        const auto & samples = slot.rl->samples;
+        if (!samples.empty()) {
+            const int32_t last = (int32_t) samples.size() - 1;
+            bool fed = false;
+            for (const auto & input : slot.rl->inputs) {
+                fed = fed || input.at("sample_index").get<int32_t>() == last;
+            }
+            if (!fed) {
+                out.push_back(samples.back().at("token_id").get<llama_token>());
+            }
+        }
+        return out;
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
@@ -2837,6 +3062,15 @@ private:
 
         if (slot.guided) {
             res->guidance = { { "rejections", slot.guided->rejections } };
+        }
+
+        if (slot.rl && (slot.task->params.rl.emits() || !slot.rl->failure.is_null())) {
+            res->rl_capture = rl_capture_json(slot);
+            if (!slot.rl->failure.is_null()) {
+                res->native_failure      = slot.rl->failure;
+                res->native_failure_text = common_detokenize(ctx_tgt, rl_failure_tokens(slot), false);
+                res->native_block_ids.clear();
+            }
         }
 
         queue_results.send(std::move(res));
@@ -4207,6 +4441,12 @@ private:
                     GGML_ABORT("not supported by multimodal");
                 }
 
+                if (slot.rl) {
+                    send_error(slot, "native-rl-context-shift: a captured rollout cannot shift its context", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+
                 if (slot.task->is_parent() || slot.task->is_child()) {
                     send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
                     slot.release();
@@ -5383,8 +5623,33 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
+            const size_t n_blocks_before = slot.native_block_ids.size();
+            std::string rl_failure;
+            if (slot.rl) {
+                rl_failure = rl_trace_sample(slot, id, tok_idx);
+            }
+
             const completion_token_output sampled = result;
-            const bool has_next = process_token(result, slot);
+            bool has_next = process_token(result, slot);
+
+            if (slot.rl) {
+                try {
+                    rl_failure = rl_trace_after(slot, id, n_blocks_before, has_next);
+                } catch (const std::exception & e) {
+                    send_error(slot, e.what(), ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+                if (!rl_failure.empty()) {
+                    rl_leave_span(slot);
+                    if (!slot.task->params.rl.recovery) {
+                        send_error(slot, slot.rl->failure.at("message").get<std::string>(), ERROR_TYPE_INVALID_REQUEST);
+                        slot.release();
+                        return;
+                    }
+                    has_next = false;
+                }
+            }
 
             if (slot.guided && guide_step(slot, sampled)) {
                 return; // rolled back: the kept reply is decoded again in the next batch
@@ -5860,6 +6125,26 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.apply_chat_session(chat_session);
             task.params.native_imports = native_imports;
+
+            // natlang RL actor capture: the privileged block of a JOLT+ teacher attempt and the prompt segments
+            if (task.params.rl.trace()) {
+                if (task.tokens.has_mtmd) {
+                    throw std::invalid_argument("native-rl-capture: a captured rollout cannot carry media");
+                }
+                const int32_t n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
+                llama_tokens tokens = task.tokens.get_text_tokens();
+                size_t privileged_begin = 0, privileged_end = 0;
+                if (!task.params.rl.privileged.is_null()) {
+                    privileged_begin = rl_insert_privileged(tokens, task.params.rl.privileged, n_vocab);
+                    privileged_end   = privileged_begin + task.params.rl.privileged.at("token_ids").size();
+                    task.tokens      = server_tokens(tokens, false);
+                }
+                task.params.rl.prompt = rl_prompt_segments(tokens, native_imports, *ctx_server.native_registry, n_vocab,
+                                                           privileged_begin, privileged_end, task.params.rl.prompt_own);
+                if (task.params.rl.prompt_own == 0 || tokens.back() >= n_vocab) {
+                    throw std::invalid_argument("native-rl-capture: the prompt must end in its own consumer query token");
+                }
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -7271,6 +7556,18 @@ void server_routes::init_routes() {
         }
         json caps = json::array({ "chat", "guidance", "guidance.check", "score", "store", "store.native-state" });
         json info = json::object();
+        if (ctx_server.native_produces) {
+            // an RL actor (server-rl-capture.h): captured rollouts, structural recording and marker-failure recovery
+            caps.push_back("rl.capture");
+            caps.push_back("native.protocol-recovery");
+            info["rl_policy_binding"] = {
+                { "schema", "natlang.rl-policy-binding/2" },
+                { "checkpoint_sha256", reg.identity.checkpoint_sha256 },
+                { "communication", "native-state" },
+                { "native_identity", json::parse(reg.identity.to_json().dump()) },
+                { "actor_export", ctx_server.rl_export.to_json() },
+            };
+        }
         info["dialects"]     = json::array({ "native-state/" + (reg.identity.empty() ? std::string("none") : reg.identity.architecture) });
         info["width"]        = llama_model_n_embd(ctx_server.model_tgt);
         info["context"]      = reg.context;
@@ -7835,7 +8132,7 @@ std::vector<server_task> server_score_tasks(
     const size_t n_slots = std::max(params.n_parallel, 1);
 
     // the rendered chat prompt, tokenized as the chat completions endpoint does
-    auto render = [&](json chat) {
+    auto render = [&](json chat, json * imports = nullptr) {
         std::vector<raw_buffer> files;
         common_chat_session session;
         const json parsed = oaicompat_chat_params_parse(vocab, chat, meta.chat_params, files, session);
@@ -7844,15 +8141,18 @@ std::vector<server_task> server_score_tasks(
         }
         const std::string prompt = parsed.at("prompt").get<std::string>();
         if (prompt.find("<__natlang_native_state:") != std::string::npos) {
-            return server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_states), false);
+            return server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_states, imports), false);
         }
         return std::move(tokenize_input_prompts(vocab, nullptr, prompt, true, true, mtmd_helper_init_opt_default())[0]);
     };
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
     std::vector<server_task> tasks;
     size_t n_results = 0;
     out.errors.assign(items.size(), "");
     out.results.assign(items.size(), {});
+    out.imports.assign(items.size(), json::array());
+    out.captures.assign(items.size(), json());
     for (size_t i_item = 0; i_item < items.size(); i_item++) {
         const json & item = items[i_item];
         std::vector<server_task> own;
@@ -7874,7 +8174,14 @@ std::vector<server_task> server_score_tasks(
             }
             json prompt_chat = chat;
             prompt_chat["add_generation_prompt"] = true;
-            const server_tokens prompt = render(prompt_chat);
+            json imports = json::array();
+            const server_tokens prompt = render(prompt_chat, &imports);
+            out.imports[i_item] = imports;
+            const json recording = item.contains("native_recording") ? item.at("native_recording")
+                                                                       : json_value(body, "native_recording", json(false));
+            if (!recording.is_boolean()) {
+                throw std::invalid_argument("native_recording must be boolean");
+            }
 
             std::vector<server_tokens> full;
             size_t n_from = prompt.size();
@@ -7892,6 +8199,32 @@ std::vector<server_task> server_score_tasks(
             // the reply starts where the rendered reply leaves the prompt (a tokenizer may merge across the boundary)
             if (n_from == 0) {
                 throw std::invalid_argument("the reply does not continue the rendered prompt");
+            }
+            // the decision capture (serve/native_learning.py): the exact scored prompt, imports and continuations
+            if (recording.get<bool>()) {
+                if (meta.native_states.identity.empty()) {
+                    throw std::invalid_argument("native-rl-policy-unavailable: native recording needs a natlang GGUF with its native identity");
+                }
+                const llama_tokens all = prompt.get_text_tokens();
+                const llama_tokens scored(all.begin(), all.begin() + n_from);
+                int32_t n_own = 0;
+                json segments = rl_prompt_segments(scored, imports, meta.native_states, n_vocab, 0, 0, n_own);
+                if (n_own == 0 || scored.back() >= n_vocab) {
+                    throw std::invalid_argument("native-rl-capture: the scored prompt must end in its own consumer query token");
+                }
+                json continuations = json::array();
+                for (const auto & tokens : full) {
+                    const llama_tokens own = tokens.get_text_tokens();
+                    continuations.push_back(llama_tokens(own.begin() + n_from, own.end()));
+                }
+                out.captures[i_item] = {
+                    { "schema", "natlang.native-decision-capture/1" },
+                    { "policy", json::parse(meta.native_states.identity.to_json().dump()) },
+                    { "adapter_binding", nullptr },
+                    { "prompt", segments },
+                    { "continuations", continuations },
+                    { "native_state_imports", imports },
+                };
             }
 
             json params_json = json::object();
@@ -7962,7 +8295,11 @@ json server_score_response(const server_score_batch & batch) {
             log_probs.push_back(batch.log_probs.at(idx));
             tokens.push_back(batch.n_scored.at(idx));
         }
-        results.push_back({ { "log_probs", log_probs }, { "tokens", tokens } });
+        json result = { { "log_probs", log_probs }, { "tokens", tokens }, { "native_state_imports", batch.imports.at(i) } };
+        if (!batch.captures.at(i).is_null()) {
+            result["native_decision_capture"] = batch.captures.at(i);
+        }
+        results.push_back(result);
     }
     return json { { "results", results } };
 }

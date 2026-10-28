@@ -11,6 +11,7 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 #include "server-guidance.h"
+#include "server-rl-capture.h"
 #include "mtmd-helper.h"
 
 
@@ -92,6 +93,10 @@ struct task_params {
 
     // natlang native states: the receipts of the states the prompt consumed, in order
     json native_imports;
+
+    // natlang RL actor capture (server-rl-capture.h) and the tokens its sampling law bans
+    rl_request rl;
+    std::vector<llama_token> rl_banned;
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
@@ -439,6 +444,12 @@ struct server_task_result_cmpl_final : server_task_result {
     // none); generated text holds one placeholder per produced block, in order
     json native_state;
     std::vector<std::string> native_block_ids;
+
+    // natlang RL actor capture (x_natlang_rl_capture) and a native marker failure (x_natlang_native_failure); null
+    // when absent. A failure answers finish_reason "error" and the exact generated text without tool calls.
+    json rl_capture;
+    json native_failure;
+    std::string native_failure_text;
 
     // response formatting
     bool               verbose  = false;

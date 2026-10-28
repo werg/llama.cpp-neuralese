@@ -19,6 +19,8 @@ add_library(${TARGET} STATIC
     server-guidance.h
     server-native-state.cpp
     server-native-state.h
+    server-rl-capture.cpp
+    server-rl-capture.h
     server-context.cpp
     server-context.h
     server-stream.cpp

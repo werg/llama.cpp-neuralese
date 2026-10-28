@@ -354,6 +354,13 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!guidance.is_null()) {
         res["x_natlang_guidance"] = guidance;
     }
+    if (!rl_capture.is_null()) {
+        res["x_natlang_rl_capture"] = rl_capture;
+    }
+    if (!native_failure.is_null()) {
+        res["content"]                 = native_failure_text;
+        res["x_natlang_native_failure"] = native_failure;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -513,6 +520,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"index", index},
         {"message", native_message(msg.to_json_oaicompat(), native_block_ids)},
     };
+    // a native marker failure executes no action of the turn: its exact text, no tool calls
+    if (!native_failure.is_null()) {
+        choice["finish_reason"] = "error";
+        choice["message"]       = { { "role", "assistant" }, { "content", native_failure_text } };
+    }
 
     if (!stream && probs_output.size() > 0) {
         choice["logprobs"] = json{
@@ -544,6 +556,12 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     }
     if (!native_state.is_null()) {
         res["native_state"] = native_state;
+    }
+    if (!rl_capture.is_null()) {
+        res["x_natlang_rl_capture"] = rl_capture;
+    }
+    if (!native_failure.is_null()) {
+        res["x_natlang_native_failure"] = native_failure;
     }
 
     return res;
@@ -608,6 +626,20 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     }
     if (!guidance.is_null()) {
         deltas.back()["x_natlang_guidance"] = guidance;
+    }
+    if (!rl_capture.is_null()) {
+        deltas.back()["x_natlang_rl_capture"] = rl_capture;
+    }
+    if (!native_failure.is_null()) {
+        deltas.back()["x_natlang_native_failure"] = native_failure;
+        deltas.back()["x_natlang_message"] = { { "role", "assistant" }, { "content", native_failure_text } };
+        for (auto & delta : deltas) {
+            for (auto & choice : delta["choices"]) {
+                if (!choice["finish_reason"].is_null()) {
+                    choice["finish_reason"] = "error";
+                }
+            }
+        }
     }
 
     // extra fields for debugging purposes

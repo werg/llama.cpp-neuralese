@@ -97,14 +97,18 @@ struct server_context {
 
 // natlang decision readout (POST /v1/natlang/score): for each item, the log-probability of each reply as the closed
 // final assistant message after the item's messages, summed over the reply tokens after the rendered prompt
-//   { items: [{ messages, continuations: [string], tools?, lora? }], lora? }
-//   -> { results: [{ log_probs: [number], tokens: [int] } | { error: string }] }
+//   { items: [{ messages, continuations: [string], tools?, lora?, native_recording? }], lora?, native_recording? }
+//   -> { results: [{ log_probs: [number], tokens: [int], native_state_imports: [receipt],
+//                    native_decision_capture?: natlang.native-decision-capture/1 } | { error: string }] }
 // the replies of an item share its prompt prefix (one parent task, the others its children)
 struct server_score_batch {
     std::vector<std::string>         errors;  // per item, empty if its tasks were made
     std::vector<std::vector<size_t>> results; // per item, the result index of each reply
     std::vector<double>              log_probs; // per result index, filled by the caller
     std::vector<int32_t>             n_scored;  // per result index, filled by the caller
+    std::vector<json>                imports;   // per item, the native-state import receipts of its prompt
+    std::vector<json>                captures;  // per item, natlang.native-decision-capture/1 when it asked for
+                                                // native_recording, else null
 };
 
 std::vector<server_task> server_score_tasks(

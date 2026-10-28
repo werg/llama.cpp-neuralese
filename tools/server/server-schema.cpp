@@ -2,6 +2,7 @@
 
 #include "json-schema-to-grammar.h"
 
+#include <random>
 #include <unordered_set>
 
 namespace server_schema {
@@ -525,6 +526,35 @@ task_params eval_llama_cmpl_schema(
     // eval all fields in the schema
     for (const auto & f : schema) {
         f->eval(ctx, data);
+    }
+
+    // natlang RL actor capture: the request records its exact inputs and samples under the native sampling law
+    rl_request_parse(data, params.rl);
+    if (params.rl.trace() && params.guidance) {
+        if (params.rl.capture) {
+            throw std::invalid_argument("native-rl-guidance-unsupported: this server does not capture guided rollouts; send guidance: false");
+        }
+        // structural recording and marker-failure recovery of guided replies are the reference server's
+        params.rl = rl_request();
+    }
+    if (params.rl.trace()) {
+        if (params.rl.capture && !params.rl.recording && params.sampling.temp <= 0.0f) {
+            throw std::invalid_argument("native-rl-sampling-law: native rollout capture requires positive temperature");
+        }
+        if (params.n_cmpl > 1) {
+            throw std::invalid_argument("native-rl-capture: request one completion per captured rollout");
+        }
+        params.rl_banned = rl_sampling_law(vocab, params.sampling);
+        if (params.sampling.temp > 0.0f) {
+            params.rl.top_k = params.rl.top_k < 0 ? (params.rl.capture ? RL_DEFAULT_TOP_K : 0) : params.rl.top_k;
+        } else {
+            params.rl.top_k = 0;
+        }
+        if (params.sampling.seed == LLAMA_DEFAULT_SEED) {
+            params.sampling.seed = std::random_device{}() & 0x7fffffffu;
+        }
+        // KV shifting reuse moves cached positions; the learner replays contiguous positions
+        params.n_cache_reuse = 0;
     }
 
     // debugging
