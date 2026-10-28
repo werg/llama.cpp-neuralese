@@ -145,7 +145,7 @@ static std::vector<guide_code> guide_code_strings(const std::string & reply) {
 // calls, raw, with the value boundary described in server-guidance.h
 static const std::string GUIDE_XML_FUNCTION = "<function=";
 static const std::string GUIDE_XML_PARAM    = "<parameter=";
-static const std::string GUIDE_XML_VALUE_END = "\n</parameter>";
+static const std::string GUIDE_XML_VALUE_END = "\n</parameter>\n"; // upstream qwen3-coder.cpp until("\n</parameter>\n")
 static const std::string GUIDE_XML_FUNCTION_END = "</function>";
 
 // the length of the longest proper prefix of `marker` that `s` ends with
@@ -202,24 +202,9 @@ static void guide_xml_scan(const std::string & reply, std::vector<std::pair<std:
             if (value_start == reply.size()) {
                 return; // the newline that opens the value has not arrived
             }
-            if (reply.compare(value_start, GUIDE_XML_VALUE_END.size() - 1, GUIDE_XML_VALUE_END, 1, std::string::npos) == 0) {
-                // `<parameter=K></parameter>` without newlines: an empty value
-                if (is_code) {
-                    codes.push_back({ "", { value_start }, true });
-                }
-                i = value_start + GUIDE_XML_VALUE_END.size() - 1;
-                continue;
-            }
+            // the value starts after `<parameter=K>\n`; an empty value renders as `<parameter=K>\n\n</parameter>\n`
             if (reply[value_start] == '\n') {
                 value_start++;
-            }
-            // `<parameter=K>\n</parameter>`: an empty value
-            if (reply.compare(value_start, GUIDE_XML_VALUE_END.size() - 1, GUIDE_XML_VALUE_END, 1, std::string::npos) == 0) {
-                if (is_code) {
-                    codes.push_back({ "", { value_start }, true });
-                }
-                i = value_start + GUIDE_XML_VALUE_END.size() - 1;
-                continue;
             }
             const size_t close = reply.find(GUIDE_XML_VALUE_END, value_start);
             const size_t value_end = close != std::string::npos ? close :

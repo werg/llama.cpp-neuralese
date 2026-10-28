@@ -16,8 +16,10 @@
 //   "pythonic" (LFM2): `[name(code='...')]`, string values quoted and backslash-escaped
 //   "xml" (LFM3, Qwen3-Coder family): `<tool_call>\n<function=NAME>\n<parameter=K>\nVALUE\n</parameter>\n</function>\n</tool_call>`,
 //     values raw. The value boundary is the template's exact one: VALUE starts after `<parameter=K>\n` and ends at the
-//     first `\n</parameter>` (an empty value is also accepted as `<parameter=K>\n</parameter>`); a reply that ends in a
-//     proper prefix of `\n</parameter>` holds that suffix back until it resolves. No escapes are decoded.
+//     first `\n</parameter>\n`, as upstream's qwen3-coder parser and natlang's serve/chat.py (an empty value is
+//     `<parameter=K>\n\n</parameter>\n`, as the template renders ""); a `\n</parameter>` not followed by `\n` stays in the
+//     value; a reply that ends in a proper prefix of `\n</parameter>\n` holds that suffix back until it resolves. No
+//     escapes are decoded.
 // tool calls: call names must be offered tools, checked when the `(` (pythonic) or the `>` of `<function=NAME>` (xml)
 // arrives
 // eval code: inside an `eval(code=...)` string or an eval call's `code` parameter, each completed line is checked for
