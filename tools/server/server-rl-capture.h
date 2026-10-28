@@ -78,6 +78,10 @@ struct rl_actor_export {
     json to_json() const { return { { "kind", kind }, { "format", format }, { "sha256", sha256 } }; }
 };
 
+// Bind the running executable and loaded llama/ggml libraries; the image and
+// system/CUDA libraries require their own independently verified custody.
+json rl_actor_runtime_from_process();
+
 rl_actor_export rl_actor_export_from_model(const llama_model * model, const std::string & path);
 
 // the hex sha256 of a file's bytes; empty when it cannot be read

@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "build-info.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
 }
@@ -10,6 +11,7 @@ extern "C" {
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -312,6 +314,34 @@ std::string rl_file_sha256(const std::string & path) {
         out += hex[c & 15];
     }
     return out;
+}
+
+json rl_actor_runtime_from_process() {
+    const std::string executable = rl_file_sha256("/proc/self/exe");
+    if (executable.empty()) throw std::runtime_error("cannot hash actor executable");
+    std::ifstream maps("/proc/self/maps");
+    if (!maps) throw std::runtime_error("cannot inspect actor loaded libraries");
+    std::set<std::string> paths;
+    std::string line;
+    while (std::getline(maps, line)) {
+        const auto slash = line.find('/');
+        if (slash == std::string::npos) continue;
+        const std::string path = line.substr(slash);
+        const auto name = path.substr(path.find_last_of('/') + 1);
+        if (name.compare(0, 8, "libllama") == 0 || name.compare(0, 7, "libggml") == 0 ||
+            name.compare(0, 7, "libmtmd") == 0) paths.insert(path);
+    }
+    if (paths.empty()) throw std::runtime_error("no loaded llama/ggml libraries found");
+    json libraries = json::object();
+    for (const auto & path : paths) {
+        const auto name = path.substr(path.find_last_of('/') + 1);
+        const auto hash = rl_file_sha256(path);
+        if (hash.empty() || (libraries.contains(name) && libraries.at(name) != hash))
+            throw std::runtime_error("cannot uniquely bind actor library " + name);
+        libraries[name] = hash;
+    }
+    return {{"schema", "natlang.actor-process-runtime/1"}, {"executable_sha256", executable},
+            {"libraries_sha256", libraries}, {"source_commit", llama_commit()}, {"build_info", llama_build_info()}};
 }
 
 rl_actor_export rl_actor_export_from_model(const llama_model * model, const std::string & path) {

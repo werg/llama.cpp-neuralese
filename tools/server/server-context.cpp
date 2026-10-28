@@ -1108,6 +1108,7 @@ public:
 
     // natlang RL actor: how this GGUF relates to the checkpoint its identity names, and the stop tokens (EOG)
     rl_actor_export rl_export;
+    json rl_runtime;
     std::vector<llama_token> rl_stop_tokens;
 
     // scored positions in the current batch, at most SERVER_N_SCORE_OUTPUTS
@@ -1423,6 +1424,7 @@ private:
                 SRV_INF("native states: identity %s, production %s\n", native_registry->identity.checkpoint_sha256.substr(0, 12).c_str(),
                         native_produces ? "on" : "off");
                 rl_export = rl_actor_export_from_model(model_tgt, params_base.model.path);
+                rl_runtime = rl_actor_runtime_from_process();
                 rl_stop_tokens.clear();
                 for (llama_token t = 0; t < llama_vocab_n_tokens(vocab); ++t) {
                     if (llama_vocab_is_eog(vocab, t)) {
@@ -7566,6 +7568,7 @@ void server_routes::init_routes() {
                 { "communication", "native-state" },
                 { "native_identity", json::parse(reg.identity.to_json().dump()) },
                 { "actor_export", ctx_server.rl_export.to_json() },
+                { "actor_runtime", ctx_server.rl_runtime },
             };
         }
         info["dialects"]     = json::array({ "native-state/" + (reg.identity.empty() ? std::string("none") : reg.identity.architecture) });
