@@ -12,7 +12,15 @@ static const size_t GUIDE_MIN_REPEAT_CHARS = 8;
 static const size_t GUIDE_RUN_MIN          = 3;
 static const size_t GUIDE_RUN_MAX          = 60;
 
-server_guide_settings server_guide_settings::from_json(const json & value, const std::vector<std::string> & offered, bool require_call) {
+std::string server_guide_call_format(const std::string & template_source) {
+    const bool xml = template_source.find("<tool_call>") != std::string::npos &&
+                     template_source.find("<function=") != std::string::npos &&
+                     template_source.find("<parameter=") != std::string::npos;
+    return xml ? "xml" : "pythonic";
+}
+
+server_guide_settings server_guide_settings::from_json(const json & value, const std::vector<std::string> & offered, bool require_call,
+                                                       const std::string & default_format) {
     if (!value.is_boolean() && !value.is_object()) {
         throw std::invalid_argument("\"guidance\" must be true or an object");
     }
@@ -28,6 +36,10 @@ server_guide_settings server_guide_settings::from_json(const json & value, const
     s.run     = json_value(body, "run", 4);
     s.syntax  = json_value(body, "syntax", true);
     s.retries = json_value(body, "retries", 4);
+    s.call_format = json_value(body, "call_format", default_format);
+    if (s.call_format != "pythonic" && s.call_format != "xml") {
+        throw std::invalid_argument("\"guidance\": call_format must be \"pythonic\" or \"xml\"");
+    }
     if (s.repeat < 0 || s.run < 0 || s.retries < 0 || s.retries > 64) {
         throw std::invalid_argument("\"guidance\": repeat and run must be >= 0, retries in [0, 64]");
     }
@@ -42,6 +54,7 @@ json server_guide_settings::to_json() const {
         {"run",          run},
         {"syntax",       syntax},
         {"retries",      retries},
+        {"call_format",  call_format},
     };
 }
 
@@ -128,6 +141,106 @@ static std::vector<guide_code> guide_code_strings(const std::string & reply) {
     return out;
 }
 
+// the xml form: called names (with the offset where each starts, once its `>` arrived) and the `code` values of eval
+// calls, raw, with the value boundary described in server-guidance.h
+static const std::string GUIDE_XML_FUNCTION = "<function=";
+static const std::string GUIDE_XML_PARAM    = "<parameter=";
+static const std::string GUIDE_XML_VALUE_END = "\n</parameter>";
+static const std::string GUIDE_XML_FUNCTION_END = "</function>";
+
+// the length of the longest proper prefix of `marker` that `s` ends with
+static size_t guide_held_prefix(const std::string & s, const std::string & marker) {
+    for (size_t n = std::min(s.size(), marker.size() - 1); n > 0; --n) {
+        if (s.compare(s.size() - n, n, marker, 0, n) == 0) {
+            return n;
+        }
+    }
+    return 0;
+}
+
+static void guide_xml_scan(const std::string & reply, std::vector<std::pair<std::string, size_t>> & names, std::vector<guide_code> & codes) {
+    size_t i = 0;
+    while (true) {
+        const size_t open = reply.find(GUIDE_XML_FUNCTION, i);
+        if (open == std::string::npos) {
+            return;
+        }
+        const size_t name_start = open + GUIDE_XML_FUNCTION.size();
+        const size_t name_end = reply.find('>', name_start);
+        if (name_end == std::string::npos) {
+            return; // the name is not complete yet
+        }
+        const std::string function = reply.substr(name_start, name_end - name_start);
+        names.emplace_back(function, name_start);
+        i = name_end + 1;
+        // the parameters of this function
+        while (true) {
+            const size_t at = reply.find_first_not_of(" \t\r\n", i);
+            if (at == std::string::npos) {
+                return;
+            }
+            const std::string rest = reply.substr(at, std::max(GUIDE_XML_PARAM.size(), GUIDE_XML_FUNCTION_END.size()));
+            if (reply.compare(at, GUIDE_XML_FUNCTION_END.size(), GUIDE_XML_FUNCTION_END) == 0) {
+                i = at + GUIDE_XML_FUNCTION_END.size();
+                break;
+            }
+            if (reply.compare(at, GUIDE_XML_PARAM.size(), GUIDE_XML_PARAM) != 0) {
+                if (GUIDE_XML_PARAM.compare(0, rest.size(), rest) == 0 || GUIDE_XML_FUNCTION_END.compare(0, rest.size(), rest) == 0) {
+                    return; // a marker that is still arriving
+                }
+                i = at; // not a parameter: look for the next function from here
+                break;
+            }
+            const size_t key_start = at + GUIDE_XML_PARAM.size();
+            const size_t key_end = reply.find('>', key_start);
+            if (key_end == std::string::npos) {
+                return;
+            }
+            const std::string key = reply.substr(key_start, key_end - key_start);
+            size_t value_start = key_end + 1;
+            const bool is_code = function == "eval" && key == "code";
+            if (value_start == reply.size()) {
+                return; // the newline that opens the value has not arrived
+            }
+            if (reply.compare(value_start, GUIDE_XML_VALUE_END.size() - 1, GUIDE_XML_VALUE_END, 1, std::string::npos) == 0) {
+                // `<parameter=K></parameter>` without newlines: an empty value
+                if (is_code) {
+                    codes.push_back({ "", { value_start }, true });
+                }
+                i = value_start + GUIDE_XML_VALUE_END.size() - 1;
+                continue;
+            }
+            if (reply[value_start] == '\n') {
+                value_start++;
+            }
+            // `<parameter=K>\n</parameter>`: an empty value
+            if (reply.compare(value_start, GUIDE_XML_VALUE_END.size() - 1, GUIDE_XML_VALUE_END, 1, std::string::npos) == 0) {
+                if (is_code) {
+                    codes.push_back({ "", { value_start }, true });
+                }
+                i = value_start + GUIDE_XML_VALUE_END.size() - 1;
+                continue;
+            }
+            const size_t close = reply.find(GUIDE_XML_VALUE_END, value_start);
+            const size_t value_end = close != std::string::npos ? close :
+                reply.size() - guide_held_prefix(reply.substr(value_start), GUIDE_XML_VALUE_END);
+            if (is_code) {
+                guide_code code { reply.substr(value_start, value_end - value_start), { value_start }, close != std::string::npos };
+                for (size_t k = value_start; k < value_end; ++k) {
+                    if (reply[k] == '\n') {
+                        code.raw_lines.push_back(k + 1);
+                    }
+                }
+                codes.push_back(std::move(code));
+            }
+            if (close == std::string::npos) {
+                return;
+            }
+            i = close + GUIDE_XML_VALUE_END.size();
+        }
+    }
+}
+
 static std::string guide_strip(const std::string & s) {
     const size_t a = s.find_first_not_of(" \t\r\n\f\v");
     if (a == std::string::npos) {
@@ -194,7 +307,26 @@ void server_guide::accept(size_t at) {
 std::optional<server_guide_verdict> server_guide::check(const std::string & reply) {
     auto accepted = [&](size_t at) { return checked.count({ "at", at, false }) > 0; };
 
-    if (!settings.tools.empty()) {
+    const bool xml = settings.call_format == "xml";
+    std::vector<std::pair<std::string, size_t>> xml_names;
+    std::vector<guide_code> codes;
+    if (xml) {
+        guide_xml_scan(reply, xml_names, codes);
+    } else {
+        codes = guide_code_strings(reply);
+    }
+
+    if (!settings.tools.empty() && xml) {
+        for (const auto & [called, start] : xml_names) {
+            if (names_checked.count(start)) {
+                continue;
+            }
+            names_checked.insert(start);
+            if (std::find(settings.tools.begin(), settings.tools.end(), called) == settings.tools.end() && !accepted(start)) {
+                return server_guide_verdict { "unknown-tool", start };
+            }
+        }
+    } else if (!settings.tools.empty()) {
         // call names outside quoted arguments, at the same byte offsets
         static const std::regex name(R"((?:\[|,\s*)([A-Za-z_][\w.]*)\()");
         std::string visible = reply;
@@ -229,7 +361,7 @@ std::optional<server_guide_verdict> server_guide::check(const std::string & repl
         }
     }
 
-    for (const auto & code : guide_code_strings(reply)) {
+    for (const auto & code : codes) {
         const std::vector<std::string> lines = guide_split_lines(code.text);
         const size_t complete = code.closed ? lines.size() : lines.size() - 1;
         if (!code.closed && settings.run > 0 && !accepted(code.raw_lines.back()) && guide_ends_in_run(lines.back(), settings.run)) {

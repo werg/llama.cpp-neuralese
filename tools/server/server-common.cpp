@@ -1416,7 +1416,8 @@ json oaicompat_chat_params_parse(
             const json & fn = tool.contains("function") ? tool.at("function") : tool;
             offered.push_back(json_value(fn, "name", std::string()));
         }
-        const auto settings = server_guide_settings::from_json(body.at("guidance"), offered, tool_choice == "required");
+        const std::string call_format = opt.tmpls ? server_guide_call_format(common_chat_templates_source(opt.tmpls.get())) : "pythonic";
+        const auto settings = server_guide_settings::from_json(body.at("guidance"), offered, tool_choice == "required", call_format);
         if (settings.require_call) {
             if (!has_tools) {
                 throw std::invalid_argument("guidance require_call needs tools");

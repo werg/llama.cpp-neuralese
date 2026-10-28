@@ -7209,7 +7209,9 @@ void server_routes::init_routes() {
         auto res = create_response(true);
         const json body = json::parse(req.body);
         server_guide guide;
-        guide.settings = server_guide_settings::from_json(json_value(body, "guidance", json::object()), {}, false);
+        const std::string call_format = meta && meta->chat_params.tmpls ?
+            server_guide_call_format(common_chat_templates_source(meta->chat_params.tmpls.get())) : "pythonic";
+        guide.settings = server_guide_settings::from_json(json_value(body, "guidance", json::object()), {}, false, call_format);
         const std::string reply = json_value(body, "reply", std::string());
         for (size_t end = 1; end <= reply.size(); ++end) {
             const auto verdict = guide.check(reply.substr(0, end));
