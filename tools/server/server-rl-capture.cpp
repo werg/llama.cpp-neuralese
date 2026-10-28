@@ -1,6 +1,7 @@
 #include "server-rl-capture.h"
 
 #include "ggml.h"
+#include "gguf.h"
 extern "C" {
 #include "hash/sha256/sha256.h"
 }
@@ -328,9 +329,21 @@ rl_actor_export rl_actor_export_from_model(const llama_model * model, const std:
     for (auto & c : name) {
         c = c == ' ' ? '_' : (char) std::tolower((unsigned char) c);
     }
-    out.format = "gguf-" + name;
-    // F32 and BF16 files carry the identity's own embedding-path dtype (export/native_gguf.py); others round weights
-    out.kind   = (name == "f32" || name == "bf16") ? "exact" : "quantized";
+    // An ftype is only the default tensor type: a mixed GGUF can declare BF16
+    // while holding manually selected NVFP4 tensors. Inspect the real file.
+    gguf_context * metadata = gguf_init_from_file(path.c_str(), { true, nullptr });
+    if (!metadata) {
+        throw std::runtime_error("native-rl-capture: cannot inspect actor GGUF tensor types");
+    }
+    bool quantized = false, nvfp4 = false;
+    for (int64_t i = 0; i < gguf_get_n_tensors(metadata); ++i) {
+        const ggml_type type = gguf_get_tensor_type(metadata, i);
+        quantized = quantized || ggml_is_quantized(type);
+        nvfp4 = nvfp4 || type == GGML_TYPE_NVFP4;
+    }
+    gguf_free(metadata);
+    out.format = "gguf-" + name + (nvfp4 && name != "nvfp4" ? "-with-nvfp4" : "");
+    out.kind = quantized || (name != "f32" && name != "bf16") ? "quantized" : "exact";
     out.sha256 = rl_file_sha256(path);
     return out;
 }
