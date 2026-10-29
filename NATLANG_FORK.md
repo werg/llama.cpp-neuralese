@@ -24,7 +24,9 @@ Detailed API documentation for the server additions is in `tools/server/README.m
 - **Decision readout** (`POST /v1/natlang/score`): scores continuations of chat prompts.
 - **Guided generation** (`guidance` request field, `POST /v1/neuralese/guidance/check`): checks natlang `eval` tool
   calls while they are generated (repetition, redeclaration, TypeScript syntax via vendored tree-sitter in `vendor/`)
-  and rolls back and resamples on a rejection. It supports pythonic (LFM2) and XML (LFM3) tool-call formats.
+  and rolls back and resamples on a rejection. It supports pythonic (LFM2) and XML (LFM3) tool-call formats. Reasoning
+  the generation prompt opened (`<think>` for LFM3) is not an action: guidance neither checks nor rolls it back, so a
+  streamed guided reply sends its reasoning as it is generated and holds back only the rest until it is final.
 - **RL actor capture** (`x_natlang_rl_capture`): exact sampled-token log-probabilities, behaviour top-k, prompt and
   native-state segments, producer writes and an actor-export attestation (including mixed quantized actors, tensor
   overrides and the running executable and library hashes) for natlang's whole-graph RL learner.

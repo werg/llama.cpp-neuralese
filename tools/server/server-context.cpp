@@ -337,6 +337,11 @@ struct server_slot {
         std::map<size_t, int32_t> retries;            // reply offset -> rejections there
         json rejections = json::array();
         llama_tokens replay;                          // tokens to decode again after a rollback
+        // the open reasoning at the start of the reply cannot be rolled back (server_guide::action_start), so it
+        // streams: the tokens and text bytes already sent, which the final response leaves out
+        size_t n_streamed      = 0;
+        size_t n_streamed_text = 0;
+        bool   replaying       = false; // the kept tokens are processed again after a rollback
     };
     std::unique_ptr<guide_state> guided;
 
@@ -2689,9 +2694,14 @@ private:
             }
 
             slot.add_token(result);
-            // a guided reply can still be rolled back: it is sent with the final response
+            // a guided reply can still be rolled back, so it is sent with the final response, except for its open
+            // reasoning, which streams; tokens decoded again after a rollback were sent already
             if (slot.task->params.stream && !slot.guided) {
                 send_partial_response(slot, result, false);
+            } else if (slot.task->params.stream && guide_streams(slot, result)) {
+                send_partial_response(slot, result, false);
+                slot.guided->n_streamed++;
+                slot.guided->n_streamed_text += result.text_to_send.size();
             }
         }
 
@@ -2776,6 +2786,15 @@ private:
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
+    }
+
+    // guided generation: whether the token being processed is new and still inside the reply's open reasoning
+    bool guide_streams(server_slot & slot, const completion_token_output & token) {
+        auto & g = *slot.guided;
+        if (!g.guide.settings.reasoning_open || g.replaying || g.outputs.size() != g.n_streamed || g.n_streamed_text != slot.n_sent_text - token.text_to_send.size()) {
+            return false;
+        }
+        return g.guide.action_start(g.reply + common_token_to_piece(slot.ctx_tgt, token.tok, true)) == std::string::npos;
     }
 
     // guided generation: tokens rejected before at this point of the reply get no probability
@@ -2872,10 +2891,12 @@ private:
         slot.stop           = STOP_TYPE_NONE;
         slot.stopping_word  = "";
         slot.stats.n_gen    = (int32_t) target;
+        g.replaying = true;
         for (auto out : kept) {
             g.outputs.push_back(out);
             process_token(out, slot);
         }
+        g.replaying = false;
         slot.has_next_token = true;
         slot.stop           = STOP_TYPE_NONE;
         return true;
@@ -3074,10 +3095,15 @@ private:
             res->native_block_ids = slot.native_block_ids;
         }
 
-        // in stream mode, content and tokens are already in last partial chunk, except for a guided reply
+        // in stream mode, content and tokens are already in last partial chunk, except for a guided reply, which
+        // sends what its streamed reasoning did not
         if (slot.task->params.stream && !slot.guided) {
             res->content     = {};
             res->tokens      = llama_tokens{};
+        } else if (slot.task->params.stream && slot.guided->n_streamed > 0) {
+            res->content     = slot.generated.substr(slot.guided->n_streamed_text);
+            res->tokens      = llama_tokens(slot.generated_tokens.begin() + std::min(slot.guided->n_streamed, slot.generated_tokens.size()),
+                                            slot.generated_tokens.end());
         } else {
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);

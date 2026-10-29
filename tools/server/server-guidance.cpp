@@ -37,6 +37,8 @@ server_guide_settings server_guide_settings::from_json(const json & value, const
     s.syntax  = json_value(body, "syntax", true);
     s.retries = json_value(body, "retries", 4);
     s.call_format = json_value(body, "call_format", default_format);
+    s.reasoning_open = json_value(body, "reasoning_open", false);
+    s.reasoning_end  = json_value(body, "reasoning_end", std::vector<std::string>());
     if (s.call_format != "pythonic" && s.call_format != "xml") {
         throw std::invalid_argument("\"guidance\": call_format must be \"pythonic\" or \"xml\"");
     }
@@ -55,6 +57,8 @@ json server_guide_settings::to_json() const {
         {"syntax",       syntax},
         {"retries",      retries},
         {"call_format",  call_format},
+        {"reasoning_open", reasoning_open},
+        {"reasoning_end",  reasoning_end},
     };
 }
 
@@ -289,7 +293,36 @@ void server_guide::accept(size_t at) {
     checked.insert({ "at", at, false });
 }
 
-std::optional<server_guide_verdict> server_guide::check(const std::string & reply) {
+size_t server_guide::action_start(const std::string & reply) const {
+    if (!settings.reasoning_open || settings.reasoning_end.empty()) {
+        return 0;
+    }
+    size_t end = std::string::npos;
+    for (const auto & tag : settings.reasoning_end) {
+        const size_t at = tag.empty() ? std::string::npos : reply.find(tag);
+        if (at != std::string::npos && (end == std::string::npos || at + tag.size() < end)) {
+            end = at + tag.size();
+        }
+    }
+    return end;
+}
+
+std::optional<server_guide_verdict> server_guide::check(const std::string & whole) {
+    // the reasoning is blanked rather than cut, so that every offset stays a reply offset
+    const size_t from = action_start(whole);
+    if (from == std::string::npos) {
+        return std::nullopt;
+    }
+    std::string blanked;
+    if (from > 0) {
+        blanked = whole;
+        for (size_t i = 0; i < from; ++i) {
+            if (blanked[i] != '\n') {
+                blanked[i] = ' ';
+            }
+        }
+    }
+    const std::string & reply = from > 0 ? blanked : whole;
     auto accepted = [&](size_t at) { return checked.count({ "at", at, false }) > 0; };
 
     const bool xml = settings.call_format == "xml";

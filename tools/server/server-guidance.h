@@ -37,6 +37,10 @@ struct server_guide_settings {
     bool    syntax  = true;
     int32_t retries = 4;
     std::string call_format = "pythonic"; // "pythonic" or "xml"
+    // the generation prompt opened a reasoning block, which the first of these tags closes: reasoning is not an action,
+    // so it is neither checked nor rolled back, and it can stream while the rest of the reply is held back
+    bool reasoning_open = false;
+    std::vector<std::string> reasoning_end;
 
     // `true` or an object of settings; `offered` are the request's tool names. throws std::invalid_argument
     // `default_format` applies when the settings name no "call_format" (server_guide_call_format of the chat template)
@@ -55,6 +59,10 @@ struct server_guide {
 
     // the next verdict for `reply`, the whole reply so far; checks already passed are not repeated
     std::optional<server_guide_verdict> check(const std::string & reply);
+
+    // the reply offset where the action begins: 0 without an open reasoning block, just after its closing tag, or
+    // npos while the reply is still reasoning
+    size_t action_start(const std::string & reply) const;
 
     // the reply was cut back to `offset`: what follows is checked again
     void rewind(size_t offset);

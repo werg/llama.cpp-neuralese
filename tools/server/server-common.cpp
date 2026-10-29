@@ -1583,6 +1583,16 @@ json oaicompat_chat_params_parse(
 
     llama_params["prompt"] = out_session.prompt().str();
 
+    // guided generation leaves an open reasoning block alone (server-guidance.h)
+    if (llama_params.contains("guidance") && !out_session.thinking_start_tag().empty() && !out_session.thinking_end_tags().empty()) {
+        const std::string prompt = out_session.prompt().str();
+        const std::string & start  = out_session.thinking_start_tag();
+        const size_t last = prompt.find_last_not_of(" \t\r\n");
+        const bool open = last != std::string::npos && last + 1 >= start.size() && prompt.compare(last + 1 - start.size(), start.size(), start) == 0;
+        llama_params["guidance"]["reasoning_open"] = open;
+        llama_params["guidance"]["reasoning_end"]  = out_session.thinking_end_tags();
+    }
+
     // Reasoning budget: pass parameters through to sampling layer
     {
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
