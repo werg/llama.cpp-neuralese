@@ -300,6 +300,9 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // natlang RL capture (llama_sampler_init_dist_capture): -1 plain dist, else the backend's top-k capture width
+    int32_t rl_capture_k = -1;
+
     // print the parameters into a string
     std::string print() const;
 };

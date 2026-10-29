@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <random>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -859,6 +860,87 @@ static void test_dist_and_cpu(const test_params & params) {
     GGML_ASSERT(backend_token == cpu_token);
 
     printf("backend dist & cpu sampling test PASSED\n");
+}
+
+// The reference distribution softmax(logits / temp) of a plain (CPU-sampled) decode of the same prompt.
+static std::vector<float> reference_probs(const test_params & params, const std::string & prompt, float temp) {
+    std::vector<llama_sampler_seq_config> none;
+    test_context ref_ctx(params, none, 1);
+    GGML_ASSERT(ref_ctx.decode({{0, prompt}}));
+    const float * logits = llama_get_logits_ith(ref_ctx.ctx.get(), ref_ctx.idx_for_seq(0));
+    std::vector<float> probs(ref_ctx.n_vocab);
+    const float max = *std::max_element(logits, logits + ref_ctx.n_vocab);
+    double sum = 0.0;
+    for (int i = 0; i < ref_ctx.n_vocab; ++i) {
+        sum += probs[i] = std::exp((logits[i] - max) / temp);
+    }
+    for (auto & p : probs) {
+        p = (float) (p / sum);
+    }
+    return probs;
+}
+
+static void test_dist_capture(const test_params & params) {
+    const float temp = 0.8f;
+    const int k = 8;
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(temp));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist_capture(88, k));
+    std::vector<llama_sampler_seq_config> configs = {{ 0, chain.get() }};
+    test_context test_ctx(params, configs);
+    GGML_ASSERT(test_ctx.decode({{0, "Some"}}));
+
+    const int32_t idx = test_ctx.idx_for_seq(0);
+    const llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), idx);
+    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+    GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), idx) == 1);
+    const float p_sampled = llama_get_sampled_logits_ith(test_ctx.ctx.get(), idx)[0];
+    GGML_ASSERT(llama_get_sampled_probs_count_ith(test_ctx.ctx.get(), idx) == (uint32_t) k);
+    const float * probs = llama_get_sampled_probs_ith(test_ctx.ctx.get(), idx);
+    const llama_token * ids = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), idx);
+
+    const std::vector<float> ref = reference_probs(params, "Some", temp);
+    printf("dist capture: token %d p %.6f (reference %.6f)\n", token, p_sampled, ref[token]);
+    GGML_ASSERT(std::fabs(p_sampled - ref[token]) < 1e-3f + 1e-2f * ref[token]);
+
+    std::vector<int32_t> order(ref.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int32_t a, int32_t b) { return ref[a] > ref[b]; });
+    for (int i = 0; i < k; ++i) {
+        GGML_ASSERT(std::fabs(probs[i] - ref[ids[i]]) < 1e-3f + 1e-2f * ref[ids[i]]);
+        // the captured top-k is the reference top-k (ties at its edge aside)
+        GGML_ASSERT(ref[ids[i]] >= ref[order[k - 1]] - 1e-4f);
+    }
+    printf("backend dist capture test PASSED\n");
+}
+
+static void test_dist_capture_bans(const test_params & params) {
+    const float temp = 0.8f;
+    const std::vector<float> ref = reference_probs(params, "Some", temp);
+    const llama_token best = (llama_token) (std::max_element(ref.begin(), ref.end()) - ref.begin());
+
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(temp));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist_capture(88, 8));
+    GGML_ASSERT(llama_sampler_dist_set_bans(chain.get(), &best, 1));
+    std::vector<llama_sampler_seq_config> configs = {{ 0, chain.get() }};
+    test_context test_ctx(params, configs);
+    GGML_ASSERT(test_ctx.decode({{0, "Some"}}));
+
+    const int32_t idx = test_ctx.idx_for_seq(0);
+    const llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), idx);
+    const llama_token * ids = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), idx);
+    const float * probs = llama_get_sampled_probs_ith(test_ctx.ctx.get(), idx);
+    GGML_ASSERT(token != best);
+    // the banned token is gone and the rest is renormalized without it
+    for (int i = 0; i < 8; ++i) {
+        GGML_ASSERT(ids[i] != best);
+        GGML_ASSERT(std::fabs(probs[i] - ref[ids[i]] / (1.0f - ref[best])) < 1e-3f + 1e-2f * probs[i]);
+    }
+    // a plain dist sampler takes no bans
+    llama_sampler_ptr plain(llama_sampler_init_dist(1));
+    GGML_ASSERT(!llama_sampler_dist_set_bans(plain.get(), &best, 1));
+    printf("backend dist capture bans test PASSED (banned %d)\n", best);
 }
 
 static void test_logit_bias(const test_params & params) {
@@ -2076,6 +2158,8 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_temp_ext",               test_temp_ext,               true },
     { "test_top_k",                  test_top_k,                  true },
     { "test_top_p",                  test_top_p,                  true },
+    { "test_dist_capture",           test_dist_capture,           true },
+    { "test_dist_capture_bans",      test_dist_capture_bans,      true },
     { "test_min_p",                  test_min_p,                  true },
     { "test_logit_bias",             test_logit_bias,             true },
     { "test_penalties",              test_penalties,              true },
