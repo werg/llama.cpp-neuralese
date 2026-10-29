@@ -28,6 +28,10 @@ Detailed API documentation for the server additions is in `tools/server/README.m
 - **RL actor capture** (`x_natlang_rl_capture`): exact sampled-token log-probabilities, behaviour top-k, prompt and
   native-state segments, producer writes and an actor-export attestation (including mixed quantized actors, tensor
   overrides and the running executable and library hashes) for natlang's whole-graph RL learner.
+- **Backend RL capture and guidance bans** (`llama_sampler_init_dist_capture`, `llama_sampler_dist_set_bans`): on the
+  backend the draw also returns the drawn token's probability and the sampler's top-k, so RL rollouts and guided
+  generation keep sampling on the device instead of copying full logits per token (`tests/test-backend-sampler.cpp`
+  `test_dist_capture*`).
 - **Parity tools** (`tools/neuralese`): `llama-logits-dump`, which dumps all-position logits and per-layer residual
   states, and `llama-state-span-dump`, which runs a forward pass with imported state spans.
 - **CPU flash attention**: softmax(KQ)·V is accumulated in FP32 for F16 V.
@@ -63,6 +67,13 @@ Example LFM3 server:
 ```sh
 build-cuda/bin/llama-server -m LFM3-1.7B-BF16.gguf --jinja -ngl 999 -c 32768 --port 8080
 ```
+
+## natlang's runtime releases
+
+`.github/workflows/natlang-runtime.yml` builds `llama-server` and the neuralese tools for Linux x64/arm64, macOS
+arm64/x64 and Windows x64/arm64 with upstream's release flags and publishes one release with `natlang-runtime.json`
+(every archive's size and SHA-256). Start it with a `natlang-b<build>` tag or by hand; natlang then pins it with
+`node scripts/update_llama_runtime.mjs --fork natlang-b<build>` in the natlang repository.
 
 ## Updating from upstream
 
