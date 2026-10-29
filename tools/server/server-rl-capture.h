@@ -53,6 +53,10 @@ std::vector<llama_token> rl_sampling_law(const llama_vocab * vocab, common_param
 double rl_law_logp(const float * logits, int32_t n_vocab, float temp, const std::vector<llama_token> & banned,
                    llama_token tok, int k, json * top_k);
 
+// the same from the backend draw (llama_sampler_init_dist_capture): the drawn token's probability and the device top-k
+// (probabilities and IDs, unordered); the receipt is sorted by decreasing probability, then ID
+double rl_backend_logp(float p_sampled, const float * probs, const llama_token * ids, uint32_t n, json * top_k);
+
 // the behaviour top-k declaration (common/sampling.py behavior_top_k_declaration)
 json rl_top_k_declaration(int k);
 

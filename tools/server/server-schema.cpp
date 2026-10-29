@@ -528,6 +528,11 @@ task_params eval_llama_cmpl_schema(
         f->eval(ctx, data);
     }
 
+    // guided draws on the device need the capture draw's bans (llama_sampler_dist_set_bans)
+    if (params.guidance && params.sampling.backend_sampling && params.sampling.rl_capture_k < 0) {
+        params.sampling.rl_capture_k = 0;
+    }
+
     // natlang RL actor capture: the request records its exact inputs and samples under the native sampling law
     rl_request_parse(data, params.rl);
     if (params.rl.trace() && params.guidance) {
@@ -547,6 +552,11 @@ task_params eval_llama_cmpl_schema(
         params.rl_banned = rl_sampling_law(vocab, params.sampling);
         if (params.sampling.temp > 0.0f) {
             params.rl.top_k = params.rl.top_k < 0 ? (params.rl.capture ? RL_DEFAULT_TOP_K : 0) : params.rl.top_k;
+            // the draw, its probability and the top-k stay on the device (opt out per request: backend_sampling false)
+            params.sampling.rl_capture_k = params.rl.top_k;
+            if (!data.contains("backend_sampling")) {
+                params.sampling.backend_sampling = true;
+            }
         } else {
             params.rl.top_k = 0;
         }

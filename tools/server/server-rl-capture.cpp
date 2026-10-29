@@ -98,7 +98,6 @@ std::vector<llama_token> rl_sampling_law(const llama_vocab * vocab, common_param
     s.reasoning_budget_end.clear();
     s.reasoning_budget_forced.clear();
     s.reasoning_control = false;
-    s.backend_sampling  = false;
     return std::vector<llama_token>(banned.begin(), banned.end());
 }
 
@@ -115,6 +114,21 @@ static std::string base64(const unsigned char * data, size_t n) {
         out += i + 2 < n ? chars[v & 63] : '=';
     }
     return out;
+}
+
+// IDs and log-probabilities, by decreasing probability, as the packed receipt
+static json encode_top_k(const std::vector<std::pair<int32_t, float>> & entries) {
+    std::vector<unsigned char> id_bytes(entries.size() * 4), lp_bytes(entries.size() * 2);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const uint32_t id = (uint32_t) entries[i].first;
+        const uint16_t h  = ggml_fp32_to_fp16(std::min(entries[i].second, 0.0f));
+        for (int b = 0; b < 4; ++b) {
+            id_bytes[i * 4 + b] = (unsigned char) ((id >> (8 * b)) & 0xff);
+        }
+        lp_bytes[i * 2]     = (unsigned char) (h & 0xff);
+        lp_bytes[i * 2 + 1] = (unsigned char) (h >> 8);
+    }
+    return { { "ids", base64(id_bytes.data(), id_bytes.size()) }, { "logps", base64(lp_bytes.data(), lp_bytes.size()) } };
 }
 
 double rl_law_logp(const float * logits, int32_t n_vocab, float temp, const std::vector<llama_token> & banned,
@@ -152,20 +166,33 @@ double rl_law_logp(const float * logits, int32_t n_vocab, float temp, const std:
         std::partial_sort(ids.begin(), ids.begin() + n, ids.end(), [&](int32_t a, int32_t b) {
             return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
         });
-        std::vector<unsigned char> id_bytes(n * 4), lp_bytes(n * 2);
+        std::vector<std::pair<int32_t, float>> entries(n);
         for (size_t i = 0; i < n; ++i) {
-            const uint32_t id = (uint32_t) ids[i];
-            const float lp = (float) ((double) (logits[ids[i]] / temp) - lse);
-            const uint16_t h = ggml_fp32_to_fp16(std::min(lp, 0.0f));
-            for (int b = 0; b < 4; ++b) {
-                id_bytes[i * 4 + b] = (unsigned char) ((id >> (8 * b)) & 0xff);
-            }
-            lp_bytes[i * 2]     = (unsigned char) (h & 0xff);
-            lp_bytes[i * 2 + 1] = (unsigned char) (h >> 8);
+            entries[i] = { ids[i], (float) ((double) (logits[ids[i]] / temp) - lse) };
         }
-        *top_k = { { "ids", base64(id_bytes.data(), id_bytes.size()) }, { "logps", base64(lp_bytes.data(), lp_bytes.size()) } };
+        *top_k = encode_top_k(entries);
     }
     return logp;
+}
+
+double rl_backend_logp(float p_sampled, const float * probs, const llama_token * ids, uint32_t n, json * top_k) {
+    if (!(p_sampled > 0.0f)) {
+        throw std::runtime_error("native-rl-capture: the drawn token's probability underflowed");
+    }
+    if (top_k != nullptr && n > 0) {
+        std::vector<std::pair<int32_t, float>> entries;
+        entries.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (probs[i] > 0.0f) {
+                entries.push_back({ ids[i], std::log(probs[i]) });
+            }
+        }
+        std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
+            return a.second > b.second || (a.second == b.second && a.first < b.first);
+        });
+        *top_k = encode_top_k(entries);
+    }
+    return std::log((double) p_sampled);
 }
 
 json rl_top_k_declaration(int k) {

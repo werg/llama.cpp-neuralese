@@ -1555,6 +1555,17 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    // The categorical draw of llama_sampler_init_dist; on the backend it also outputs the drawn token's probability
+    // (llama_get_sampled_logits_ith, one value) and, for capture_k > 0, the capture_k most probable tokens of the
+    // distribution it drew from (llama_get_sampled_candidates_ith and llama_get_sampled_probs_ith, unordered).
+    // capture_k < 0 is plain dist. On the CPU it is plain dist.
+    LLAMA_API struct llama_sampler * llama_sampler_init_dist_capture(uint32_t seed, int32_t capture_k);
+
+    // Tokens a capture sampler (capture_k >= 0) in smpl (a chain or the sampler) excludes from its next backend draws,
+    // until set again; at most LLAMA_SAMPLER_DIST_MAX_BANS. Returns false when smpl has no capture sampler.
+    #define LLAMA_SAMPLER_DIST_MAX_BANS 64
+    LLAMA_API bool llama_sampler_dist_set_bans(struct llama_sampler * smpl, const llama_token * bans, size_t n_bans);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

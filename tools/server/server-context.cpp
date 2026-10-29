@@ -447,6 +447,7 @@ struct server_slot {
     std::vector<llama_token> native_span;
     llama_pos                native_span_pos0 = -1;
     bool                     native_produced = false; // a token of this task decoded inside a producer span
+    bool                     backend_sampling = false; // the task's draws run on the device (llama_set_sampler)
     std::vector<std::string> native_block_ids;
     json                     native_blocks = json::array();
 
@@ -479,6 +480,7 @@ struct server_slot {
         native_block_ids.clear();
         native_blocks = json::array();
         rl.reset();
+        backend_sampling = false;
         has_new_line   = false;
         truncated      = false;
         stop           = STOP_TYPE_NONE;
@@ -2199,17 +2201,18 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
-            // guided generation bans tokens in the logits
-            use_backend_sampling &= !task.params.guidance;
+            // guided generation bans tokens on the device through its draw (llama_sampler_dist_set_bans)
+            use_backend_sampling &= !task.params.guidance || task.params.sampling.rl_capture_k >= 0;
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                use_backend_sampling = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+            slot.backend_sampling = use_backend_sampling;
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -2430,10 +2433,19 @@ private:
         sample["index"]    = index;
         sample["token_id"] = tok;
         if (p.sampling.temp > 0.0f) {
-            const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
             json top_k;
-            sample["logp"] = rl_law_logp(logits, llama_vocab_n_tokens(vocab), p.sampling.temp, p.rl_banned, tok, p.rl.top_k,
-                                         p.rl.top_k > 0 ? &top_k : nullptr);
+            if (llama_get_sampled_token_ith(slot.ctx_tgt, tok_idx) == tok && llama_get_sampled_logits_count_ith(slot.ctx_tgt, tok_idx) == 1) {
+                // drawn on the device: its probability and top-k came back with it
+                const float * p_sampled = llama_get_sampled_logits_ith(slot.ctx_tgt, tok_idx);
+                const float * probs     = llama_get_sampled_probs_ith(slot.ctx_tgt, tok_idx);
+                const llama_token * ids = llama_get_sampled_candidates_ith(slot.ctx_tgt, tok_idx);
+                const uint32_t n = probs ? llama_get_sampled_probs_count_ith(slot.ctx_tgt, tok_idx) : 0;
+                sample["logp"] = rl_backend_logp(p_sampled[0], probs, ids, n, p.rl.top_k > 0 ? &top_k : nullptr);
+            } else {
+                const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+                sample["logp"] = rl_law_logp(logits, llama_vocab_n_tokens(vocab), p.sampling.temp, p.rl_banned, tok, p.rl.top_k,
+                                             p.rl.top_k > 0 ? &top_k : nullptr);
+            }
             if (p.rl.top_k > 0) {
                 sample["top_k"] = top_k;
             }
@@ -2786,6 +2798,9 @@ private:
         // a fresh sampler: a reset keeps the grammar state
         common_params_sampling sampling = slot.task->params.sampling;
         slot.smpl.reset(common_sampler_init(model_tgt, sampling));
+        if (slot.backend_sampling) {
+            llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+        }
         llama_tokens tokens = slot.task->tokens.get_text_tokens();
         for (const llama_token token : tokens) {
             common_sampler_accept(slot.smpl.get(), token, false);
@@ -5359,6 +5374,21 @@ private:
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
+        // guided draws on the device: the tokens rejected before at the point each slot samples next
+        for (auto & slot : slots) {
+            if (slot.guided && slot.backend_sampling && slot.smpl) {
+                const auto it = slot.guided->bans.find(slot.guided->outputs.size());
+                std::vector<llama_token> bans;
+                if (it != slot.guided->bans.end()) {
+                    bans.assign(it->second.begin(), it->second.end());
+                }
+                if (bans.size() > LLAMA_SAMPLER_DIST_MAX_BANS) {
+                    bans.resize(LLAMA_SAMPLER_DIST_MAX_BANS);
+                }
+                llama_sampler_dist_set_bans(common_sampler_get(slot.smpl.get()), bans.data(), bans.size());
+            }
+        }
+
         metrics_pre_decode();
 
         if (batch.size() == 0) {
@@ -5626,7 +5656,13 @@ private:
             const size_t n_blocks_before = slot.native_block_ids.size();
             std::string rl_failure;
             if (slot.rl) {
-                rl_failure = rl_trace_sample(slot, id, tok_idx);
+                try {
+                    rl_failure = rl_trace_sample(slot, id, tok_idx);
+                } catch (const std::exception & e) {
+                    send_error(slot, e.what(), ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
             }
 
             const completion_token_output sampled = result;

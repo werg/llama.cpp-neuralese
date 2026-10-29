@@ -1139,6 +1139,14 @@ struct llama_sampler_dist : public llama_sampler_backend {
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
 
+    // natlang RL capture on the backend (llama_sampler_init_dist_capture): -1 off, else the top-k width
+    int32_t capture_k = -1;
+
+    // tokens excluded from the next draw (llama_sampler_dist_set_bans), at most LLAMA_SAMPLER_DIST_MAX_BANS; a
+    // capture sampler applies them on the backend as -inf logits
+    std::vector<llama_token> bans;
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> inp_bans; // (indices, values) per sampled row
+
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
         seed_cur                  = src.seed_cur;
@@ -1240,7 +1248,7 @@ static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
 
 static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const llama_sampler_dist *) smpl->ctx;
-    auto * result = llama_sampler_init_dist(ctx->seed);
+    auto * result = llama_sampler_init_dist_capture(ctx->seed, ctx->capture_k);
 
     // copy the state
     {
@@ -1295,6 +1303,21 @@ static void llama_sampler_dist_backend_apply(
     // flatten
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
 
+    if (sctx->capture_k >= 0) {
+        // the current bans as -inf: a zero row with LLAMA_SAMPLER_DIST_MAX_BANS values set (unused ones repeat a ban,
+        // or write 0 at token 0 when there is none)
+        ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, LLAMA_SAMPLER_DIST_MAX_BANS);
+        ggml_tensor * vals = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, LLAMA_SAMPLER_DIST_MAX_BANS);
+        ggml_format_name(idxs, "ban_idxs_%zu", sctx->inp_bans.size());
+        ggml_format_name(vals, "ban_vals_%zu", sctx->inp_bans.size());
+        ggml_set_input(idxs);
+        ggml_set_input(vals);
+        sctx->inp_bans.push_back({ idxs, vals });
+        ggml_tensor * mask = ggml_reshape_2d(ctx, ggml_fill(ctx, logits, 0.0f), 1, ggml_nelements(logits));
+        mask   = ggml_reshape_1d(ctx, ggml_set_rows(ctx, mask, vals, idxs), ggml_nelements(logits));
+        logits = ggml_add(ctx, logits, mask);
+    }
+
     struct ggml_tensor * probs = ggml_soft_max(ctx, logits);
     ggml_set_name(probs, "dist_probs");
 
@@ -1340,6 +1363,24 @@ static void llama_sampler_dist_backend_apply(
 
     data->sampled = sampled_token;
     data->probs = probs;
+
+    // natlang RL capture: the drawn token's probability (as logits, one value) and the top-k of the distribution it
+    // was drawn from (probs and candidates, k values in no particular order), so only k + 1 values leave the device
+    if (sctx->capture_k >= 0 && data->candidates == nullptr) {
+        struct ggml_tensor * rows = ggml_reshape_2d(ctx, probs, 1, ggml_nelements(probs));
+        data->logits = ggml_reshape_1d(ctx, ggml_get_rows(ctx, rows, sampled_token), 1);
+        ggml_set_name(data->logits, "capture_sampled_prob");
+        if (sctx->capture_k > 0) {
+            const int k = std::min<int64_t>(sctx->capture_k, ggml_nelements(probs));
+            struct ggml_tensor * top = ggml_top_k(ctx, probs, k);
+            ggml_set_name(top, "capture_top_k");
+            data->candidates = top;
+            data->probs = ggml_reshape_1d(ctx, ggml_get_rows(ctx, rows, top), k);
+            ggml_set_name(data->probs, "capture_top_k_probs");
+        } else {
+            data->probs = nullptr;
+        }
+    }
 }
 
 static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
@@ -1366,12 +1407,24 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
             ++sctx->n_backend_draws_generated;
         }
     }
+
+    if (!sctx->inp_bans.empty()) {
+        std::vector<int32_t> idxs(LLAMA_SAMPLER_DIST_MAX_BANS, sctx->bans.empty() ? 0 : sctx->bans[0]);
+        std::vector<float>   vals(LLAMA_SAMPLER_DIST_MAX_BANS, sctx->bans.empty() ? 0.0f : -INFINITY);
+        std::copy(sctx->bans.begin(), sctx->bans.end(), idxs.begin());
+        for (const auto & [inp_idxs, inp_vals] : sctx->inp_bans) {
+            ggml_backend_tensor_set(inp_idxs, idxs.data(), 0, ggml_nbytes(inp_idxs));
+            ggml_backend_tensor_set(inp_vals, vals.data(), 0, ggml_nbytes(inp_vals));
+        }
+    }
 }
 
 static void llama_sampler_dist_backend_reset(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
     sctx->inp_uniforms.clear();
+    sctx->inp_bans.clear();
 }
+
 
 static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token token) {
     GGML_UNUSED(token);
@@ -1403,9 +1456,37 @@ static struct llama_sampler_i llama_sampler_dist_i = {
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dist>,
 };
 
+bool llama_sampler_dist_set_bans(struct llama_sampler * smpl, const llama_token * bans, size_t n_bans) {
+    if (smpl == nullptr || n_bans > LLAMA_SAMPLER_DIST_MAX_BANS) {
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_chain_i) {
+        auto * chain = (llama_sampler_chain *) smpl->ctx;
+        for (auto & entry : chain->samplers) {
+            if (llama_sampler_dist_set_bans(entry.ptr, bans, n_bans)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (smpl->iface != &llama_sampler_dist_i) {
+        return false;
+    }
+    auto * sctx = (llama_sampler_dist *) smpl->ctx;
+    if (sctx->capture_k < 0) {
+        return false;
+    }
+    sctx->bans.assign(bans, bans + n_bans);
+    return true;
+}
+
 struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+    return llama_sampler_init_dist_capture(seed, -1);
+}
+
+struct llama_sampler * llama_sampler_init_dist_capture(uint32_t seed, int32_t capture_k) {
     auto seed_cur = get_rng_seed(seed);
-    return llama_sampler_init(
+    auto * result = llama_sampler_init(
         /* .iface = */ &llama_sampler_dist_i,
         /* .ctx   = */ new llama_sampler_dist {
             ("dist"),
@@ -1419,6 +1500,8 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .inp_uniforms              = */ {},
         }
     );
+    ((llama_sampler_dist *) result->ctx)->capture_k = capture_k;
+    return result;
 }
 
 void llama_sampler_backend_begin(llama_sampler * sampler) {
