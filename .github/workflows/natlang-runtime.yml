@@ -1,0 +1,137 @@
+# The natlang runtime: llama-server and the neuralese tools of this fork for every platform natlang's CLI installs
+# itself on (ts-host/src/llama-runtime-release.ts in werg/natlang), published as one GitHub release with a
+# natlang-runtime.json manifest of the archives' sizes and SHA-256 digests. Build flags follow upstream's release.yml.
+name: natlang runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (default: natlang-b<build number>)'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'natlang-b*'
+
+permissions:
+  contents: write
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON"
+
+concurrency:
+  group: natlang-runtime
+  cancel-in-progress: false
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-x64
+            os: ubuntu-22.04
+            defines: "'-DCMAKE_INSTALL_RPATH=$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON"
+          - name: ubuntu-arm64
+            os: ubuntu-24.04-arm
+            defines: "'-DCMAKE_INSTALL_RPATH=$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON"
+          - name: macos-arm64
+            os: macos-26
+            defines: "-DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+          - name: macos-x64
+            os: macos-15-intel
+            defines: "-DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Toolchain (GCC 14)
+        if: ${{ contains(matrix.os, 'ubuntu-24.04') }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-14 g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"; echo "CXX=g++-14" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.defines }} ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j "$(getconf _NPROCESSORS_ONLN)"
+      - name: Check
+        run: |
+          build/bin/llama-server --version 2>&1 | tee version.txt
+          build/bin/llama-server --help | grep -q -- '--native-state'
+      - name: Pack
+        run: |
+          cp LICENSE NATLANG_FORK.md build/bin/
+          tar -czf llama-natlang-bin-${{ matrix.name }}.tar.gz -C build bin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            llama-natlang-bin-${{ matrix.name }}.tar.gz
+            version.txt
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.arch }}-windows-llvm.cmake ^
+            -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }} ^
+            -DGGML_OPENMP=ON -DGGML_OPENMP_FETCH=ON ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+      - name: Pack
+        run: |
+          Copy-Item LICENSE, NATLANG_FORK.md build\bin\Release\
+          7z a -snl llama-natlang-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: win-cpu-${{ matrix.arch }}
+          path: llama-natlang-bin-win-cpu-${{ matrix.arch }}.zip
+
+  publish:
+    needs: [unix, windows]
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Manifest and release
+        run: |
+          set -euo pipefail
+          # "version: 0.7.0-dev (build 12345, commit abcdef012)"
+          line=$(grep -m1 '^version:' artifacts/ubuntu-x64/version.txt)
+          version=$(sed -E 's/^version: ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' <<< "$line")
+          build=$(sed -E 's/.*\(build ([0-9]+),.*/\1/' <<< "$line")
+          commit=$(sed -E 's/.*commit ([0-9a-f]+)\).*/\1/' <<< "$line")
+          tag="${{ inputs.tag }}"; [ -n "$tag" ] || tag="${GITHUB_REF_NAME#refs/tags/}"
+          case "$tag" in natlang-b*) ;; *) tag="natlang-b$build";; esac
+          mkdir release; find artifacts -name 'llama-natlang-bin-*' -exec cp {} release/ \;
+          python3 - "$version" "$build" "$commit" "$tag" "$GITHUB_SHA" <<'PY'
+          import hashlib, json, os, sys
+          version, build, commit, tag, sha = sys.argv[1:]
+          rows = []
+          for name in sorted(os.listdir('release')):
+              data = open(os.path.join('release', name), 'rb').read()
+              rows.append({'file': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+          json.dump({'schema': 'natlang.llama-runtime-release/1', 'repository': os.environ['GITHUB_REPOSITORY'], 'tag': tag,
+                     'version': version, 'build': int(build), 'commit': commit, 'git_sha': sha, 'artifacts': rows},
+                    open('release/natlang-runtime.json', 'w'), indent=2)
+          PY
+          cat release/natlang-runtime.json
+          gh release create "$tag" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "natlang runtime $tag" --notes "llama-server and neuralese tools of the natlang fork at $GITHUB_SHA (llama.cpp $version, build $build). See NATLANG_FORK.md; natlang-runtime.json lists every archive's size and SHA-256."
