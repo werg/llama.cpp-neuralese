@@ -72,10 +72,18 @@ build-cuda/bin/llama-server -m LFM3-1.7B-BF16.gguf --jinja -ngl 999 -c 32768 --p
 
 ## natlang's runtime releases
 
-`.github/workflows/natlang-runtime.yml` builds `llama-server` and the neuralese tools for Linux x64/arm64, macOS
-arm64/x64 and Windows x64/arm64 with upstream's release flags and publishes one release with `natlang-runtime.json`
-(every archive's size and SHA-256). Start it with a `natlang-b<build>` tag or by hand; natlang then pins it with
-`node scripts/update_llama_runtime.mjs --fork natlang-b<build>` in the natlang repository.
+`.github/workflows/natlang-runtime.yml` builds `llama-server` and the neuralese tools with upstream's release flags and
+publishes one release with `natlang-runtime.json`. Backends: CPU (Linux x64/arm64, Windows x64/arm64, macOS x64), Metal
+and CPU together (macOS arm64), Vulkan (Linux x64/arm64, Windows x64), ROCm 10.0 (Linux x64) and CUDA 12.4 and 13.4
+(Windows x64, with a `cudart` archive each). The Windows backend archives carry the Windows CPU archive's binaries, so
+each is self-contained; NVIDIA GPUs on Linux use the Vulkan archive.
+
+The manifest (`natlang.llama-runtime-release/2`) lists, per archive, `file`, `os` (`linux`, `darwin`, `win32`), `arch`,
+`backends` (`cpu`, `metal`, `vulkan`, `rocm`, `cuda-12.4`, `cuda-13.4`), `role` (`server`, or `cudart` for the CUDA
+runtime DLLs to extract next to it), `bytes` and `sha256`. Consumers select by these fields, never by file name, and
+check size and digest before extracting. Start the workflow with a `natlang-b<build>` tag or by hand. natlang pins the
+release with `node scripts/update_llama_runtime.mjs --fork natlang-b<build>`; Vibestudio's local-models engine pins the
+tag and the manifest's SHA-256.
 
 ## Updating from upstream
 

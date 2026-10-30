@@ -1,6 +1,9 @@
-# The natlang runtime: llama-server and the neuralese tools of this fork for every platform natlang's CLI installs
-# itself on (ts-host/src/llama-runtime-release.ts in werg/natlang), published as one GitHub release with a
-# natlang-runtime.json manifest of the archives' sizes and SHA-256 digests. Build flags follow upstream's release.yml.
+# The natlang runtime: llama-server and the neuralese tools of this fork for every platform and backend that natlang's
+# CLI (ts-host/src/llama-runtime-release.ts in werg/natlang) and Vibestudio's local-models engine install themselves on,
+# published as one GitHub release with a natlang-runtime.json manifest. The manifest lists each archive's os, arch,
+# backends, role, size and SHA-256; consumers select by those fields, never by file name. Each job writes the
+# manifest row of its archive (<archive>.row.json), so the build matrix is the single description of what is published.
+# Build flags and toolchain setup follow upstream's release.yml.
 name: natlang runtime
 
 on:
@@ -32,15 +35,28 @@ jobs:
         include:
           - name: ubuntu-x64
             os: ubuntu-22.04
+            target: linux
+            arch: x64
+            backends: '["cpu"]'
             defines: "'-DCMAKE_INSTALL_RPATH=$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON"
           - name: ubuntu-arm64
             os: ubuntu-24.04-arm
+            target: linux
+            arch: arm64
+            backends: '["cpu"]'
             defines: "'-DCMAKE_INSTALL_RPATH=$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON"
+          # Metal and the CPU backend are in one archive, which serves both.
           - name: macos-arm64
             os: macos-26
+            target: darwin
+            arch: arm64
+            backends: '["metal", "cpu"]'
             defines: "-DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
           - name: macos-x64
             os: macos-15-intel
+            target: darwin
+            arch: x64
+            backends: '["cpu"]'
             defines: "-DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
     runs-on: ${{ matrix.os }}
     steps:
@@ -64,11 +80,14 @@ jobs:
         run: |
           cp LICENSE NATLANG_FORK.md build/bin/
           tar -czf llama-natlang-bin-${{ matrix.name }}.tar.gz -C build bin
+          printf '{"file": "llama-natlang-bin-%s.tar.gz", "os": "%s", "arch": "%s", "backends": %s, "role": "server"}\n' \
+            '${{ matrix.name }}' '${{ matrix.target }}' '${{ matrix.arch }}' '${{ matrix.backends }}' > llama-natlang-bin-${{ matrix.name }}.row.json
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: |
             llama-natlang-bin-${{ matrix.name }}.tar.gz
+            llama-natlang-bin-${{ matrix.name }}.row.json
             version.txt
 
   windows:
@@ -96,13 +115,188 @@ jobs:
         run: |
           Copy-Item LICENSE, NATLANG_FORK.md build\bin\Release\
           7z a -snl llama-natlang-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
+          '{"file": "llama-natlang-bin-win-cpu-${{ matrix.arch }}.zip", "os": "win32", "arch": "${{ matrix.arch }}", "backends": ["cpu"], "role": "server"}' | Set-Content llama-natlang-bin-win-cpu-${{ matrix.arch }}.row.json
       - uses: actions/upload-artifact@v7
         with:
           name: win-cpu-${{ matrix.arch }}
-          path: llama-natlang-bin-win-cpu-${{ matrix.arch }}.zip
+          path: |
+            llama-natlang-bin-win-cpu-${{ matrix.arch }}.zip
+            llama-natlang-bin-win-cpu-${{ matrix.arch }}.row.json
+
+  # Linux GPU backends. Vulkan on x64 and arm64, ROCm on x64. Vibestudio's engine runs NVIDIA GPUs on Linux with the
+  # Vulkan archive, so there is no Linux CUDA archive.
+  ubuntu-gpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-vulkan-x64
+            os: ubuntu-22.04
+            arch: x64
+            backend: vulkan
+            defines: "-DGGML_VULKAN=ON"
+          - name: ubuntu-vulkan-arm64
+            os: ubuntu-24.04-arm
+            arch: arm64
+            backend: vulkan
+            defines: "-DGGML_VULKAN=ON"
+          - name: ubuntu-rocm-10.0-x64
+            os: ubuntu-24.04
+            arch: x64
+            backend: rocm
+            rocm_version: "10.0.0"
+            gpu_targets: "gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Dependencies (Vulkan, Ubuntu 22.04)
+        if: ${{ matrix.backend == 'vulkan' && matrix.os == 'ubuntu-22.04' }}
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
+      - name: Dependencies (Vulkan, Ubuntu 24.04 arm64)
+        if: ${{ matrix.backend == 'vulkan' && matrix.os != 'ubuntu-22.04' }}
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-14 g++-14 build-essential glslc libvulkan-dev spirv-headers libssl-dev ninja-build
+          echo "CC=gcc-14" >> "$GITHUB_ENV"; echo "CXX=g++-14" >> "$GITHUB_ENV"
+      - name: Free up disk space (ROCm)
+        if: ${{ matrix.backend == 'rocm' }}
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+      - name: Dependencies (ROCm)
+        if: ${{ matrix.backend == 'rocm' }}
+        run: sudo apt install -y build-essential git cmake wget
+      - name: Setup TheRock with wheels (ROCm)
+        if: ${{ matrix.backend == 'rocm' }}
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel]==${{ matrix.rocm_version }}"
+          ROCM_PATH=$(rocm-sdk path --root)
+          CMAKE_PATH=$(rocm-sdk path --cmake)
+          BIN_PATH=$(rocm-sdk path --bin)
+          echo "ROCM_PATH=$ROCM_PATH" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$CMAKE_PATH" >> "$GITHUB_ENV"
+          echo "HIP_PATH=$ROCM_PATH" >> "$GITHUB_ENV"
+          echo "PATH=$BIN_PATH:${PATH}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$ROCM_PATH/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+      - name: Build (Vulkan)
+        if: ${{ matrix.backend == 'vulkan' }}
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON ${{ matrix.defines }} ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j "$(nproc)"
+      - name: Build (ROCm)
+        if: ${{ matrix.backend == 'rocm' }}
+        run: |
+          cmake -B build -S . -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGPU_TARGETS="${{ matrix.gpu_targets }}" -DGGML_HIP=ON -DHIP_PLATFORM=amd ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j "$(nproc)"
+      - name: Check
+        run: |
+          build/bin/llama-server --version
+          build/bin/llama-server --help | grep -q -- '--native-state'
+      - name: Pack
+        run: |
+          cp LICENSE NATLANG_FORK.md build/bin/
+          tar -czf llama-natlang-bin-${{ matrix.name }}.tar.gz -C build bin
+          printf '{"file": "llama-natlang-bin-%s.tar.gz", "os": "linux", "arch": "%s", "backends": ["%s"], "role": "server"}\n' \
+            '${{ matrix.name }}' '${{ matrix.arch }}' '${{ matrix.backend }}' > llama-natlang-bin-${{ matrix.name }}.row.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            llama-natlang-bin-${{ matrix.name }}.tar.gz
+            llama-natlang-bin-${{ matrix.name }}.row.json
+
+  # Windows GPU backends build only the backend library; the publish job injects the windows-cpu archive of the same
+  # arch (llama-server and the CPU backends), as upstream's release does, so every archive carries the same binaries.
+  windows-vulkan:
+    runs-on: windows-2025
+    env:
+      VULKAN_VERSION: 1.4.357.0
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: Build
+        run: |
+          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF -DGGML_BACKEND_DL=ON -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release --target ggml-vulkan
+      - name: Pack
+        run: |
+          7z a -snl llama-natlang-bin-win-vulkan-x64.zip .\build\bin\Release\ggml-vulkan.dll
+          '{"file": "llama-natlang-bin-win-vulkan-x64.zip", "os": "win32", "arch": "x64", "backends": ["vulkan"], "role": "server"}' | Set-Content llama-natlang-bin-win-vulkan-x64.row.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: win-vulkan-x64
+          path: |
+            llama-natlang-bin-win-vulkan-x64.zip
+            llama-natlang-bin-win-vulkan-x64.row.json
+
+  windows-cuda:
+    strategy:
+      fail-fast: false
+      matrix:
+        # CTK >= 13.5 bundles CCCL >= 3.5; omit GGML_CUDA_CCCL_VERSION for those versions.
+        cuda: ['12.4', '13.4']
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install CUDA toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: x64
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+      - name: Pack
+        run: |
+          7z a -snl llama-natlang-bin-win-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\ggml-cuda.dll
+          $dst='.\build\bin\cudart\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          7z a llama-natlang-cudart-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
+          '{"file": "llama-natlang-bin-win-cuda-${{ matrix.cuda }}-x64.zip", "os": "win32", "arch": "x64", "backends": ["cuda-${{ matrix.cuda }}"], "role": "server"}' | Set-Content llama-natlang-bin-win-cuda-${{ matrix.cuda }}-x64.row.json
+          '{"file": "llama-natlang-cudart-win-cuda-${{ matrix.cuda }}-x64.zip", "os": "win32", "arch": "x64", "backends": ["cuda-${{ matrix.cuda }}"], "role": "cudart"}' | Set-Content llama-natlang-cudart-win-cuda-${{ matrix.cuda }}-x64.row.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: win-cuda-${{ matrix.cuda }}-x64
+          path: |
+            llama-natlang-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+            llama-natlang-bin-win-cuda-${{ matrix.cuda }}-x64.row.json
+            llama-natlang-cudart-win-cuda-${{ matrix.cuda }}-x64.zip
+            llama-natlang-cudart-win-cuda-${{ matrix.cuda }}-x64.row.json
 
   publish:
-    needs: [unix, windows]
+    needs: [unix, ubuntu-gpu, windows, windows-vulkan, windows-cuda]
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -120,16 +314,32 @@ jobs:
           commit=$(sed -E 's/.*commit ([0-9a-f]+)\).*/\1/' <<< "$line")
           tag="${{ inputs.tag }}"; [ -n "$tag" ] || tag="${GITHUB_REF_NAME#refs/tags/}"
           case "$tag" in natlang-b*) ;; *) tag="natlang-b$build";; esac
-          mkdir release; find artifacts -name 'llama-natlang-bin-*' -exec cp {} release/ \;
+          mkdir release rows; find artifacts -name 'llama-natlang-*' ! -name '*.row.json' -exec cp {} release/ \;
+          find artifacts -name '*.row.json' -exec cp {} rows/ \;
+          # The Windows backend archives hold only the backend library: add the CPU archive's binaries of the same arch.
+          python3 - <<'PY'
+          import glob, json, os, subprocess, tempfile
+          rows = [json.load(open(path)) for path in glob.glob('rows/*.row.json')]
+          for row in rows:
+              if row['os'] != 'win32' or row['role'] != 'server' or row['backends'] == ['cpu']:
+                  continue
+              cpu = next(r for r in rows if r['os'] == 'win32' and r['arch'] == row['arch'] and r['backends'] == ['cpu'])
+              with tempfile.TemporaryDirectory() as base:
+                  subprocess.run(['unzip', '-q', os.path.join('release', cpu['file']), '-d', base], check=True)
+                  subprocess.run(['zip', '-qr', os.path.abspath(os.path.join('release', row['file'])), '.'], cwd=base, check=True)
+          PY
           python3 - "$version" "$build" "$commit" "$tag" "$GITHUB_SHA" <<'PY'
-          import hashlib, json, os, sys
+          import glob, hashlib, json, os, sys
           version, build, commit, tag, sha = sys.argv[1:]
           rows = []
-          for name in sorted(os.listdir('release')):
-              data = open(os.path.join('release', name), 'rb').read()
-              rows.append({'file': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
-          json.dump({'schema': 'natlang.llama-runtime-release/1', 'repository': os.environ['GITHUB_REPOSITORY'], 'tag': tag,
-                     'version': version, 'build': int(build), 'commit': commit, 'git_sha': sha, 'artifacts': rows},
+          for path in glob.glob('rows/*.row.json'):
+              row = json.load(open(path))
+              data = open(os.path.join('release', row['file']), 'rb').read()
+              rows.append({**row, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+          rows.sort(key=lambda row: (row['os'], row['arch'], row['role'], row['backends']))
+          assert sorted(os.listdir('release')) == sorted(row['file'] for row in rows), 'release archives and manifest rows differ'
+          json.dump({'schema': 'natlang.llama-runtime-release/2', 'repository': os.environ['GITHUB_REPOSITORY'], 'tag': tag,
+                     'version': version, 'build': int(build), 'commit': commit, 'git_sha': sha, 'archives': rows},
                     open('release/natlang-runtime.json', 'w'), indent=2)
           PY
           cat release/natlang-runtime.json
