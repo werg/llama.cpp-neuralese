@@ -5114,7 +5114,11 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                        // A score never evaluates its prefix again (n_past stops before the first scored token), so it
+                                        // continues after the checkpoint: a recurrent state cannot step back to re-evaluate its last token.
+                                        const llama_pos pos_cont = slot.task->type == SERVER_TASK_TYPE_SCORE ? it->pos_max + 1
+                                                                                                             : std::max(it->pos_min + 1, it->pos_max);
+                                        pos_next = std::min(pos_next, pos_cont);
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
@@ -5190,6 +5194,21 @@ private:
                     bool wait_shared = false;
                     if (slot.task->n_tokens_shared > 0) {
                         const bool is_shared_done = slot.prompt.n_tokens() == slot.task->n_tokens_shared;
+                        // A memory that cannot be rolled back (recurrent state, SWA) is continued from a checkpoint
+                        // of the shared prefix: the children copy it with the prompt, and the slot keeps it for the
+                        // requests that follow (the next group of replies of the same item).
+                        if (is_shared_done && params_base.n_ctx_checkpoints > 0 && (
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                                n_swa > 0)) {
+                            // The memory's pos_min of a recurrent or hybrid cache is the position of its single state, but the
+                            // checkpoint covers the sliding window that ends there: a request is continued from it when the
+                            // window it needs starts after the checkpoint's.
+                            const llama_pos ckpt_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            const llama_pos ckpt_min = n_swa > 0 ? std::max<llama_pos>(0, ckpt_max - n_swa + 1)
+                                                                 : llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            create_checkpoint(slot, 0, ckpt_min, ckpt_max);
+                        }
                         for (auto & other : slots) {
                             if (other.state != SLOT_STATE_WAIT_OTHER || other.task->id_parent != slot.task->id) {
                                 continue;
@@ -8320,6 +8339,7 @@ std::vector<server_task> server_score_tasks(
     out.errors.assign(items.size(), "");
     out.results.assign(items.size(), {});
     out.imports.assign(items.size(), json::array());
+    out.n_prompt.assign(items.size(), 0);
     out.captures.assign(items.size(), json());
     for (size_t i_item = 0; i_item < items.size(); i_item++) {
         const json & item = items[i_item];
@@ -8363,6 +8383,9 @@ std::vector<server_task> server_score_tasks(
                 full_chat["continue_final_message"] = false;
                 full.push_back(render(full_chat));
                 n_from = std::min(n_from, prompt.get_common_prefix(full.back()));
+            }
+            for (const auto & tokens : full) {
+                out.n_prompt[i_item] += (int64_t) tokens.size();
             }
             // the reply starts where the rendered reply leaves the prompt (a tokenizer may merge across the boundary)
             if (n_from == 0) {
@@ -8463,7 +8486,8 @@ json server_score_response(const server_score_batch & batch) {
             log_probs.push_back(batch.log_probs.at(idx));
             tokens.push_back(batch.n_scored.at(idx));
         }
-        json result = { { "log_probs", log_probs }, { "tokens", tokens }, { "native_state_imports", batch.imports.at(i) } };
+        json result = { { "log_probs", log_probs }, { "tokens", tokens }, { "prompt_tokens", batch.n_prompt.at(i) },
+                        { "native_state_imports", batch.imports.at(i) } };
         if (!batch.captures.at(i).is_null()) {
             result["native_decision_capture"] = batch.captures.at(i);
         }

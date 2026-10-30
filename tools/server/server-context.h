@@ -107,6 +107,7 @@ struct server_score_batch {
     std::vector<double>              log_probs; // per result index, filled by the caller
     std::vector<int32_t>             n_scored;  // per result index, filled by the caller
     std::vector<json>                imports;   // per item, the native-state import receipts of its prompt
+    std::vector<int64_t>             n_prompt;  // per item, the tokens its replies evaluate in full (prompt and reply, each reply)
     std::vector<json>                captures;  // per item, natlang.native-decision-capture/1 when it asked for
                                                 // native_recording, else null
 };

@@ -2041,10 +2041,10 @@ Scores candidate replies to a conversation. For each item, each continuation is 
 *Result:*
 
 ```json
-{ "results": [ { "log_probs": [-0.21, -3.4], "tokens": [3, 3] }, { "error": "each item needs \"messages\"" } ] }
+{ "results": [ { "log_probs": [-0.21, -3.4], "tokens": [3, 3], "prompt_tokens": 412 }, { "error": "each item needs \"messages\"" } ] }
 ```
 
-One entry per item: `log_probs[k]` and `tokens[k]` for its `k`-th continuation, or the `error` of an item that could not be rendered (the other items are still scored). The continuations of an item share its prompt prefix: it is computed once and continued in several slots.
+One entry per item: `log_probs[k]` and `tokens[k]` for its `k`-th continuation, and `prompt_tokens`, the tokens its continuations evaluate in full (the prompt and the reply, for each continuation: what a stateless scorer would process, whatever the server reused), or the `error` of an item that could not be rendered (the other items are still scored). The continuations of an item share its prompt prefix: it is computed once and continued in several slots. A model whose memory cannot be rolled back (the recurrent state of LFM, sliding-window attention) continues from a context checkpoint of that prefix, which the slot keeps for the next group of continuations of the same item and for repeated requests, so every continuation costs only its own tokens.
 
 ### `guidance` in `/v1/chat/completions` and `/completion`: guided generation
 
