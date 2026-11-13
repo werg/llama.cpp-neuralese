@@ -604,15 +604,8 @@ struct server_slot {
             return false;
         }
 
-        // A score reads the logits of its own prompt positions and samples nothing, so it shares a batch with generating
-        // slots like any prompt does. Requiring the same task type would keep a score out of every batch while any
-        // other slot generates: it would wait for the whole generation, however long, on a server another client uses.
-        const auto batch_kind = [](const server_task & t) {
-            return t.type == SERVER_TASK_TYPE_SCORE ? SERVER_TASK_TYPE_COMPLETION : t.type;
-        };
-
         // with per-sequence adapters, each slot's tokens use its own adapter scales
-        return batch_kind(*task) == batch_kind(*other_slot.task)
+        return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
             && (lora_per_seq || are_lora_equal(lora, other_slot.lora));
     }
@@ -1135,6 +1128,8 @@ public:
 
     // scored positions in the current batch, at most SERVER_N_SCORE_OUTPUTS
     int32_t n_score_outputs = 0;
+    // alternates the iterations between generating slots and waiting score prompts (update_slots)
+    bool score_turn = false;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -4668,9 +4663,37 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // A score does not share a batch with generating slots (a different task type), and the generating slots were
+        // batched first in every iteration: a score would wait for every generation on the server to end, however long.
+        // (Mixing them would not help either: a recurrent or hybrid memory evaluates a mixed batch one token per sequence at
+        // a time, so the score's prompt would advance at the speed of the other slots' generation.) While a score is
+        // waiting beside generating slots, the iterations alternate: one batches the generating slots, the next the score
+        // prompts, which then take whole batches.
+        bool skip_generation = false;
+        {
+            bool score_waiting = false, generating_any = false;
+            for (auto & other : slots) {
+                if (!other.is_processing()) {
+                    continue;
+                }
+                if (other.state == SLOT_STATE_GENERATING) {
+                    generating_any = true;
+                } else if (other.task->type == SERVER_TASK_TYPE_SCORE &&
+                        (other.state == SLOT_STATE_STARTED || other.state == SLOT_STATE_PROCESSING_PROMPT)) {
+                    score_waiting = true;
+                }
+            }
+            if (score_waiting && generating_any) {
+                skip_generation = score_turn;
+                score_turn = !score_turn;
+            } else {
+                score_turn = false;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+            if (skip_generation || slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
                 return;
             }
 
@@ -4839,6 +4862,11 @@ private:
                 }
 
                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                    return;
+                }
+
+                // a slot generating this iteration is not in the batch; it must not decide what the batch is made of either
+                if (skip_generation && slot.state == SLOT_STATE_GENERATING) {
                     return;
                 }
 
