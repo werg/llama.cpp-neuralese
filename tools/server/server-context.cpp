@@ -604,8 +604,15 @@ struct server_slot {
             return false;
         }
 
+        // A score reads the logits of its own prompt positions and samples nothing, so it shares a batch with generating
+        // slots like any prompt does. Requiring the same task type would keep a score out of every batch while any
+        // other slot generates: it would wait for the whole generation, however long, on a server another client uses.
+        const auto batch_kind = [](const server_task & t) {
+            return t.type == SERVER_TASK_TYPE_SCORE ? SERVER_TASK_TYPE_COMPLETION : t.type;
+        };
+
         // with per-sequence adapters, each slot's tokens use its own adapter scales
-        return task->type == other_slot.task->type
+        return batch_kind(*task) == batch_kind(*other_slot.task)
             && inp_embd.size() == other_slot.inp_embd.size()
             && (lora_per_seq || are_lora_equal(lora, other_slot.lora));
     }
@@ -3816,12 +3823,34 @@ private:
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        if (child_slots.size() < n_child_tasks && task.type == SERVER_TASK_TYPE_SCORE) {
+                            // The replies of a score each have their own prompt and share only its prefix, so none of them
+                            // needs the others' slots to run. Waiting until a parent and all its replies find a slot at once
+                            // would never end on a server whose other requests keep a slot busy at every moment: the group
+                            // would wait behind a stream of single-slot requests, each of which takes the slot it was
+                            // deferred for. The parent starts with the replies that fit and the rest are ordinary tasks,
+                            // which continue from the checkpoint it leaves in its slot (or evaluate their own prompt).
+                            for (size_t i = child_slots.size(); i < n_child_tasks; i++) {
+                                task.child_tasks[i].id_parent = -1;
+                                queue_tasks.defer(std::move(task.child_tasks[i]));
+                            }
+                            while (task.child_tasks.size() > child_slots.size()) {
+                                task.child_tasks.pop_back();
+                            }
+                            SRV_DBG("%zu of %zu replies start with the score parent, the rest are queued, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            n_child_tasks = child_slots.size();
+                        }
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
+                        if (!task.is_parent()) {
+                            if (!launch_slot_with_task(*slot, std::move(task))) {
+                                SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                                break; // drop the task
+                            }
+                        } else if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
