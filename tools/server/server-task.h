@@ -199,6 +199,11 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SCORE: the log-probability of the prompt tokens from this position on is summed
     int32_t n_score_from = -1;
 
+    // used by SERVER_TASK_TYPE_SCORE: the first n_tokens_reuse prompt tokens recur in later requests (the messages a score
+    // item names in "cache_messages"); prompt processing checkpoints the memory there, so a later prompt that shares them
+    // continues from that checkpoint even when the memory cannot be rolled back (recurrent state, sliding window)
+    int32_t n_tokens_reuse = 0;
+
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;

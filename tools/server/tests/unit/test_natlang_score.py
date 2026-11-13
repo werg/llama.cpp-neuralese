@@ -79,6 +79,20 @@ def test_score_group_of_replies():
         assert alone["log_probs"][0] == pytest.approx(together, abs=1e-3)
 
 
+
+def test_cache_messages_is_a_hint_that_never_changes_scores():
+    global server
+    server.start()
+    item = {"messages": [{"role": "system", "content": "You tell stories."}, {"role": "user", "content": "Tell a story."}],
+            "continuations": CONTINUATIONS}
+    plain = score(item)["log_probs"]
+    for count in (0, 1, 2):
+        hinted = score({**item, "cache_messages": count})["log_probs"]
+        assert hinted == pytest.approx(plain, abs=1e-3)
+    for bad in (-1, 3, "1"):
+        res = server.make_request("POST", "/v1/natlang/score", data={"items": [{**item, "cache_messages": bad}]})
+        assert res.status_code == 200 and "cache_messages" in res.body["results"][0]["error"]
+
 def test_score_group_is_not_starved_by_single_slot_requests():
     global server
     server.start()

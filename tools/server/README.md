@@ -2034,7 +2034,7 @@ Scores candidate replies to a conversation. For each item, each continuation is 
 
 *Options:*
 
-`items`: Array of `{ messages, continuations, tools?, lora? }`. `messages` and `tools` are as in `/v1/chat/completions`, including `{"type": "native_state", "id": ...}` content parts for states loaded with `--native-state`; `continuations` is a nonempty array of strings; `lora` selects adapter scales for the item as in a completion request.
+`items`: Array of `{ messages, continuations, tools?, lora?, cache_messages? }`. `messages` and `tools` are as in `/v1/chat/completions`, including `{"type": "native_state", "id": ...}` content parts for states loaded with `--native-state`; `continuations` is a nonempty array of strings; `lora` selects adapter scales for the item as in a completion request. `cache_messages`: the count of leading messages that later requests repeat (a function's opening before its argument values); prompt processing checkpoints the memory where they end, so a later prompt sharing them continues from that checkpoint even when the memory cannot be rolled back. Only the tokens the rendered messages share with the prompt count, so a wrong count costs speed, never correctness.
 
 `lora`: Default adapter scales for items without their own.
 

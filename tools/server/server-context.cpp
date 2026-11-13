@@ -5247,6 +5247,20 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+                    // the prefix later requests share (a score's "cache_messages"): checkpoint the memory once it is processed
+                    if (slot.task->n_tokens_reuse > 0 && slot.prompt.n_tokens() == slot.task->n_tokens_reuse &&
+                            params_base.n_ctx_checkpoints > 0 && (
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                                n_swa > 0) &&
+                            std::none_of(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), [&](const auto & cur) {
+                                return cur.n_tokens == slot.task->n_tokens_reuse; })) {
+                        const llama_pos ckpt_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                        const llama_pos ckpt_min = n_swa > 0 ? std::max<llama_pos>(0, ckpt_max - n_swa + 1)
+                                                             : llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                        create_checkpoint(slot, 0, ckpt_min, ckpt_max);
+                    }
+
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
                     if (slot.task->n_tokens_shared > 0) {
@@ -5376,6 +5390,11 @@ private:
 
                         // stop at the end of the shared prefix, the children are started from this state
                         if (wait_shared && slot.prompt.n_tokens() == slot.task->n_tokens_shared) {
+                            break;
+                        }
+
+                        // stop where the reused prefix ends, so that its checkpoint is made before the rest is processed
+                        if (slot.task->n_tokens_reuse > 0 && slot.prompt.n_tokens() == slot.task->n_tokens_reuse && batch.size() > n_tokens_prev) {
                             break;
                         }
 
@@ -8428,6 +8447,32 @@ std::vector<server_task> server_score_tasks(
                 throw std::invalid_argument("native_recording must be boolean");
             }
 
+            // "cache_messages": k, the first k messages recur in later requests (a function's opening before its arguments):
+            // the prompt is checkpointed where they end, so the next prompt that shares them continues from there
+            size_t n_reuse = 0;
+            if (item.contains("cache_messages")) {
+                const json & k = item.at("cache_messages");
+                if (!k.is_number_integer() || k.get<int64_t>() < 0 || (size_t) k.get<int64_t>() > item.at("messages").size()) {
+                    throw std::invalid_argument("cache_messages must be a count of the item's messages");
+                }
+                const size_t n_messages = (size_t) k.get<int64_t>();
+                if (n_messages > 0) {
+                    json prefix_chat = chat;
+                    json prefix_messages = json::array();
+                    for (size_t i = 0; i < n_messages; i++) {
+                        prefix_messages.push_back(item.at("messages")[i]);
+                    }
+                    // a placeholder message after them, so the last one renders as a closed message (a template refuses to
+                    // end on an assistant message with tool calls); only the tokens shared with the prompt are used
+                    prefix_messages.push_back({ { "role", "user" }, { "content", "." } });
+                    prefix_chat["messages"] = prefix_messages;
+                    prefix_chat["add_generation_prompt"] = false;
+                    // the last shared token may merge differently inside the whole prompt
+                    n_reuse = prompt.get_common_prefix(render(prefix_chat));
+                    n_reuse = n_reuse > 0 ? n_reuse - 1 : 0;
+                }
+            }
+
             std::vector<server_tokens> full;
             size_t n_from = prompt.size();
             for (const auto & reply : replies) {
@@ -8492,6 +8537,8 @@ std::vector<server_task> server_score_tasks(
                 task.index        = n_results + own.size();
                 task.params       = task_params;
                 task.n_score_from = (int32_t) n_from;
+                // a boundary at or past the shared prefix adds nothing: the shared prefix is checkpointed anyway
+                task.n_tokens_reuse = n_reuse > 0 && n_reuse + 1 < n_from ? (int32_t) n_reuse : 0;
                 task.tokens       = std::move(tokens);
                 own.push_back(std::move(task));
             }
