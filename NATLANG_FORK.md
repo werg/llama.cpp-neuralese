@@ -76,11 +76,14 @@ build-cuda/bin/llama-server -m LFM3-1.7B-BF16.gguf --jinja -ngl 999 -c 32768 --p
 publishes one release with `natlang-runtime.json`. Backends: CPU (Linux x64/arm64, Windows x64/arm64, macOS x64), Metal
 and CPU together (macOS arm64), Vulkan (Linux x64/arm64, Windows x64), ROCm 10.0 (Linux x64) and CUDA 12.4 and 13.4
 (Windows x64, with a `cudart` archive each). The Windows backend archives carry the Windows CPU archive's binaries, so
-each is self-contained; NVIDIA GPUs on Linux use the Vulkan archive.
+each is self-contained; NVIDIA GPUs on Linux use the Vulkan archive. The same run compiles werg/wllama (the commit in
+`.github/natlang-wllama.json`) with this tree as its llama.cpp to WebAssembly, so natlang's in-page engine is always the
+same server code as its managed `llama-server`; a fork change that breaks the WebAssembly build fails the release.
 
 The manifest (`natlang.llama-runtime-release/2`) lists, per archive, `file`, `os` (`linux`, `darwin`, `win32`), `arch`,
-`backends` (`cpu`, `metal`, `vulkan`, `rocm`, `cuda-12.4`, `cuda-13.4`), `role` (`server`, or `cudart` for the CUDA
-runtime DLLs to extract next to it), `bytes` and `sha256`. Consumers select by these fields, never by file name, and
+`backends` (`cpu`, `metal`, `vulkan`, `rocm`, `cuda-12.4`, `cuda-13.4`), `role` (`server`, `cudart` for the CUDA
+runtime DLLs to extract next to it, or `wllama` for the in-page engine: `os` `browser`, `arch` `wasm`, with the wllama
+commit it was built from), `bytes` and `sha256`. Consumers select by these fields, never by file name, and
 check size and digest before extracting. Start the workflow with a `natlang-b<build>` tag or by hand. natlang pins the
 release with `node scripts/update_llama_runtime.mjs --fork natlang-b<build>`; Vibestudio's local-models engine pins the
 tag and the manifest's SHA-256.

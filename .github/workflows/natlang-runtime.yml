@@ -295,8 +295,55 @@ jobs:
             llama-natlang-cudart-win-cuda-${{ matrix.cuda }}-x64.zip
             llama-natlang-cudart-win-cuda-${{ matrix.cuda }}-x64.row.json
 
+  # The in-page engine: werg/wllama (pinned in .github/natlang-wllama.json) compiled to WebAssembly with this commit as its
+  # llama.cpp, so natlang's browser runtime is always the same server code as its managed llama-server
+  # (scripts/update_llama_runtime.mjs in werg/natlang vendors both from one release, and a test there checks the pair).
+  wllama:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: fork
+          fetch-depth: 0
+      - name: Checkout pinned wllama
+        run: |
+          set -euo pipefail
+          repo=$(python3 -c "import json; print(json.load(open('fork/.github/natlang-wllama.json'))['repository'])")
+          commit=$(python3 -c "import json; print(json.load(open('fork/.github/natlang-wllama.json'))['commit'])")
+          git init -q wllama && git -C wllama fetch -q --depth 1 "https://github.com/$repo" "$commit" && git -C wllama checkout -q FETCH_HEAD
+          rm -rf wllama/llama.cpp && mv fork wllama/llama.cpp
+          echo "WLLAMA_REPO=$repo" >> "$GITHUB_ENV"; echo "WLLAMA_COMMIT=$commit" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Build
+        working-directory: wllama
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build:wasm
+          npm run build
+      - name: Pack
+        run: |
+          set -euo pipefail
+          file=llama-natlang-wllama.tar.gz
+          tar -czf "$file" -C wllama --exclude='*.map' --exclude='index.min.js' esm compat/index.js compat/wasm/wllama.js compat/wasm/wllama.wasm
+          python3 - "$file" <<'PY'
+          import json, os, sys
+          file = sys.argv[1]
+          json.dump({'file': file, 'os': 'browser', 'arch': 'wasm', 'backends': ['cpu', 'webgpu'], 'role': 'wllama',
+                     'wllama': {'repository': os.environ['WLLAMA_REPO'], 'commit': os.environ['WLLAMA_COMMIT'], 'dirty': False}},
+                    open(file.replace('.tar.gz', '.row.json'), 'w'))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wllama
+          path: |
+            llama-natlang-wllama.tar.gz
+            llama-natlang-wllama.row.json
+
   publish:
-    needs: [unix, ubuntu-gpu, windows, windows-vulkan, windows-cuda]
+    needs: [unix, ubuntu-gpu, windows, windows-vulkan, windows-cuda, wllama]
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
