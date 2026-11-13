@@ -2616,12 +2616,7 @@ private:
             { "writes", rl.writes },
             { "finish_reason", finish },
             { "sample_range_convention", "half-open" },
-            { "sampling_law", {
-                { "temperature", greedy ? 0.0 : (double) p.sampling.temp },
-                { "seed", p.sampling.seed },
-                { "guidance", false },
-                { "probabilities", greedy ? "greedy-argmax" : "post-processing-normalized" },
-            } },
+            { "sampling_law", rl_sampling_law_record(greedy, p.sampling.temp, p.sampling.top_p, p.sampling.seed) },
             { "actor_export", rl_export.to_json() },
         };
         if (!greedy && p.rl.top_k > 0) {

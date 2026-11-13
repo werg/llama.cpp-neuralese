@@ -61,6 +61,10 @@ double rl_backend_logp(float p_sampled, const float * probs, const llama_token *
 // the behaviour top-k declaration (common/sampling.py behavior_top_k_declaration)
 json rl_top_k_declaration(int k);
 
+// The capture's sampling_law as the native engine records it (serve/engine.py): under top-p each sample's logp is the
+// untruncated post-temperature log-probability and the draw came from its renormalized nucleus.
+json rl_sampling_law_record(bool greedy, float temp, float top_p, uint32_t seed);
+
 // Insert a privileged block's tokens at own-token index insert_at (virtual native-state tokens, at or above n_vocab,
 // are not own tokens). Returns the index of the first inserted token. Throws std::invalid_argument when the point is
 // outside the prompt or on a native-state import boundary (rl/privileged_context.py insert_into_prompt_segments).

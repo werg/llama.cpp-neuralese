@@ -89,8 +89,18 @@ std::vector<llama_token> rl_sampling_law(const llama_vocab * vocab, common_param
     for (int32_t i = 0; i < n_suppress; ++i) {
         banned.insert(suppress[i]);
     }
-    // the native engine's law: temperature only, then the categorical draw (common_sampler_init adds dist)
+    if (!std::isfinite(s.top_p) || !(s.top_p > 0.0f) || s.top_p > 1.0f) {
+        throw std::invalid_argument("native-rl-sampling-law: top_p must be a number in (0, 1]");
+    }
+    // the native engine's law (natlang common/sampling.py): temperature, then the top-p nucleus when top_p < 1, then the
+    // categorical draw (common_sampler_init adds dist). A sample's logp stays the untruncated post-temperature one
+    // (rl_law_logp), so a nucleus draw runs on the host, where the logits are at hand.
     s.samplers       = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+    if (s.top_p < 1.0f) {
+        s.samplers.push_back(COMMON_SAMPLER_TYPE_TOP_P);
+        s.min_keep         = 1;
+        s.backend_sampling = false;
+    }
     s.dynatemp_range = 0.0f;
     s.grammar        = {};
     s.grammar_lazy   = false;
@@ -203,6 +213,20 @@ double rl_backend_logp(float p_sampled, const float * probs, const llama_token *
         *top_k = encode_top_k(entries);
     }
     return std::log((double) p_sampled);
+}
+
+json rl_sampling_law_record(bool greedy, float temp, float top_p, uint32_t seed) {
+    const bool nucleus = !greedy && top_p < 1.0f;
+    json law = {
+        { "temperature", greedy ? 0.0 : (double) temp },
+        { "seed", seed },
+        { "guidance", false },
+        { "probabilities", greedy ? "greedy-argmax" : nucleus ? "post-temperature-untruncated" : "post-processing-normalized" },
+    };
+    if (nucleus) {
+        law["top_p"] = std::round((double) top_p * 1e6) / 1e6;  // the request's decimal, not its float32 neighbour
+    }
+    return law;
 }
 
 json rl_top_k_declaration(int k) {
