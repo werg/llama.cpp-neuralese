@@ -1,4 +1,8 @@
+import base64
 import os
+import struct
+
+import numpy as np
 
 import pytest
 from utils import *
@@ -48,12 +52,19 @@ def test_capture_without_top_p_keeps_the_normalized_law():
 
 
 def test_a_tiny_nucleus_draws_the_most_likely_token():
+    # a capture needs a positive temperature, so the argmax is the head of each sample's untruncated top-k receipt
     server.start()
-    res = capture(top_p=1e-6, max_tokens=4)
-    assert res.status_code == 200, res.body
-    for sample in res.body["x_natlang_rl_capture"]["samples"]:
-        # the untruncated logp of the argmax token: the nucleus held only it
-        assert sample["logp"] <= 0
-    greedy = capture(temperature=0.0, max_tokens=4)
-    assert [s["token_id"] for s in res.body["x_natlang_rl_capture"]["samples"]] == \
-           [s["token_id"] for s in greedy.body["x_natlang_rl_capture"]["samples"]]
+    drawn = []
+    for seed in (7, 8):
+        res = capture(top_p=1e-6, max_tokens=4, seed=seed)
+        assert res.status_code == 200, res.body
+        samples = res.body["x_natlang_rl_capture"]["samples"]
+        assert samples
+        for sample in samples:
+            ids = struct.unpack(f"<{len(base64.b64decode(sample['top_k']['ids'])) // 4}i", base64.b64decode(sample["top_k"]["ids"]))
+            logps = np.frombuffer(base64.b64decode(sample["top_k"]["logps"]), dtype="<f2")
+            assert sample["token_id"] == ids[0]
+            # the untruncated logp of the argmax token, not the nucleus's 0
+            assert sample["logp"] < 0 and abs(sample["logp"] - float(logps[0])) < 1e-2
+        drawn.append([s["token_id"] for s in samples])
+    assert drawn[0] == drawn[1]

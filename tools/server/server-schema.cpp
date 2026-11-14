@@ -549,12 +549,17 @@ task_params eval_llama_cmpl_schema(
         if (params.n_cmpl > 1) {
             throw std::invalid_argument("native-rl-capture: request one completion per captured rollout");
         }
+        // an omitted top_p is no nucleus (the law natlang's clients name explicitly), not the server's default
+        if (!data.contains("top_p")) {
+            params.sampling.top_p = 1.0f;
+        }
         params.rl_banned = rl_sampling_law(vocab, params.sampling);
         if (params.sampling.temp > 0.0f) {
             params.rl.top_k = params.rl.top_k < 0 ? (params.rl.capture ? RL_DEFAULT_TOP_K : 0) : params.rl.top_k;
-            // the draw, its probability and the top-k stay on the device (opt out per request: backend_sampling false)
+            // the draw, its probability and the top-k stay on the device (opt out per request: backend_sampling false);
+            // a top-p nucleus draws on the host, which records the untruncated logp (rl_sampling_law)
             params.sampling.rl_capture_k = params.rl.top_k;
-            if (!data.contains("backend_sampling")) {
+            if (!data.contains("backend_sampling") && params.sampling.top_p >= 1.0f) {
                 params.sampling.backend_sampling = true;
             }
         } else {
