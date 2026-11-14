@@ -5153,11 +5153,11 @@ private:
                                         // restore the context checkpoint
                                         if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
                                             !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-                                            if (it->id_task != -1) {
-                                                GGML_ABORT("failed to restore context checkpoint\n");
-                                            }
-                                            // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
-                                            SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
+                                            // a checkpoint is not guaranteed to load: one restored from a slot file may not match, and a
+                                            // unified cache shared by busy slots may have no room for its cells. Fall back to full prompt
+                                            // re-processing (the sequence is cleared from position 0 below).
+                                            SLT_WRN(slot, "failed to load context checkpoint (%s), re-processing the prompt\n",
+                                                    it->id_task != -1 ? "taken by this server" : "restored from a slot file");
                                             do_reset = true;
                                         }
                                     }
