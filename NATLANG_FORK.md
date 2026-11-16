@@ -24,7 +24,9 @@ Detailed API documentation for the server additions is in `tools/server/README.m
   content ID) and decoded once for its span registration, the only computation on it. Every put after startup is one
   main-loop task (`SERVER_TASK_TYPE_NATIVE_STATE_REGISTER` carrying the bytes: verify, store, register), used by the
   HTTP PUT and by embedders; `server_context::get_native_state` reads a stored state for embedders as GET does (the
-  in-page engine's `putNativeState` / `getNativeState`). A model that declares its native
+  in-page engine's `putNativeState` / `getNativeState`). The RL actor binding (the GGUF's type and hash, the process executable and
+  libraries) is computed on first use (an RL capture or `/v1/neuralese/info`), not at load: a natlang GGUF loads in the
+  page, which has no executable to hash, and a load no longer reads the whole model file to hash it. A model that declares its native
   identity (`natlang.identity.*`) loads only states of that identity at startup; `--native-state` needs a model with
   `natlang.consume_open/close`. The GGUF state-span format (`common/native-state.*`) is gone;
   `llama-state-span-dump` reads store files with the server's codec (`--consume OPEN CLOSE` for a stock conversion).

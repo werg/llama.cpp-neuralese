@@ -34,6 +34,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <optional>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1120,8 +1121,21 @@ public:
     struct { llama_token produce_open = LLAMA_TOKEN_NULL, produce_close = LLAMA_TOKEN_NULL; } native_markers;
 
     // natlang RL actor: how this GGUF relates to the checkpoint its identity names, and the stop tokens (EOG)
-    rl_actor_export rl_export;
-    json rl_runtime;
+    // The RL actor binding: the exported GGUF's type and hash and this process's executable and libraries. Computed on
+    // first use (an RL capture or GET /v1/neuralese/info), not at load: it reads the whole model file, and an embedder
+    // (the page's wllama) has no process executable to hash and serves no RL capture, so a load must not need it.
+    mutable std::mutex rl_binding_mutex;
+    mutable std::optional<std::pair<rl_actor_export, json>> rl_binding_value;
+    const std::pair<rl_actor_export, json> & rl_binding() const {
+        std::lock_guard<std::mutex> lock(rl_binding_mutex);
+        if (!rl_binding_value) {
+            rl_actor_export exported = rl_actor_export_from_model(model_tgt, params_base.model.path);
+            rl_binding_value.emplace(std::move(exported), rl_actor_runtime_from_process());
+            SRV_INF("RL actor: %s export %s, sha256 %s\n", rl_binding_value->first.kind.c_str(),
+                    rl_binding_value->first.format.c_str(), rl_binding_value->first.sha256.substr(0, 12).c_str());
+        }
+        return *rl_binding_value;
+    }
     std::vector<llama_token> rl_stop_tokens;
 
     // scored positions in the current batch, at most SERVER_N_SCORE_OUTPUTS
@@ -1452,16 +1466,12 @@ private:
             if (!native_registry->identity.empty()) {
                 SRV_INF("native states: identity %s, production %s\n", native_registry->identity.checkpoint_sha256.substr(0, 12).c_str(),
                         native_produces ? "on" : "off");
-                rl_export = rl_actor_export_from_model(model_tgt, params_base.model.path);
-                rl_runtime = rl_actor_runtime_from_process();
                 rl_stop_tokens.clear();
                 for (llama_token t = 0; t < llama_vocab_n_tokens(vocab); ++t) {
                     if (llama_vocab_is_eog(vocab, t)) {
                         rl_stop_tokens.push_back(t);
                     }
                 }
-                SRV_INF("RL actor: %s export %s, sha256 %s\n", rl_export.kind.c_str(), rl_export.format.c_str(),
-                        rl_export.sha256.substr(0, 12).c_str());
             }
         }
 
@@ -2629,7 +2639,7 @@ private:
             { "finish_reason", finish },
             { "sample_range_convention", "half-open" },
             { "sampling_law", rl_sampling_law_record(greedy, p.sampling.temp, p.sampling.top_p, p.sampling.seed) },
-            { "actor_export", rl_export.to_json() },
+            { "actor_export", rl_binding().first.to_json() },
         };
         if (!greedy && p.rl.top_k > 0) {
             capture["behavior_top_k"] = rl_top_k_declaration(p.rl.top_k);
@@ -7852,8 +7862,8 @@ void server_routes::init_routes() {
                 { "checkpoint_sha256", reg.identity.checkpoint_sha256 },
                 { "communication", "native-state" },
                 { "native_identity", json::parse(reg.identity.to_json().dump()) },
-                { "actor_export", ctx_server.rl_export.to_json() },
-                { "actor_runtime", ctx_server.rl_runtime },
+                { "actor_export", ctx_server.rl_binding().first.to_json() },
+                { "actor_runtime", ctx_server.rl_binding().second },
             };
         }
         info["dialects"]     = json::array({ "native-state/" + (reg.identity.empty() ? std::string("none") : reg.identity.architecture) });
