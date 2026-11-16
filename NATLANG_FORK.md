@@ -21,7 +21,10 @@ Detailed API documentation for the server additions is in `tools/server/README.m
   the server's store as received and is answered by GET as stored: a PUT body, a PUT of `{"path": FILE}` naming a store
   file on this host, a `--native-state FILE` at startup (a tuned release's `states/<id>.nzs`; the in-page engine's
   `native_states` blobs take the same path) or a produce span. Each is verified once on entry (layout, finite values,
-  content ID) and decoded once for its span registration, the only computation on it. A model that declares its native
+  content ID) and decoded once for its span registration, the only computation on it. Every put after startup is one
+  main-loop task (`SERVER_TASK_TYPE_NATIVE_STATE_REGISTER` carrying the bytes: verify, store, register), used by the
+  HTTP PUT and by embedders; `server_context::get_native_state` reads a stored state for embedders as GET does (the
+  in-page engine's `putNativeState` / `getNativeState`). A model that declares its native
   identity (`natlang.identity.*`) loads only states of that identity at startup; `--native-state` needs a model with
   `natlang.consume_open/close`. The GGUF state-span format (`common/native-state.*`) is gone;
   `llama-state-span-dump` reads store files with the server's codec (`--consume OPEN CLOSE` for a stock conversion).

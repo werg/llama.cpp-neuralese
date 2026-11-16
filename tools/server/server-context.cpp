@@ -4191,18 +4191,32 @@ private:
                 {
                     auto res = std::make_unique<server_task_result_native_register>();
                     res->id = task.id;
-                    const auto found = native_registry->store.get(task.native_state_id);
                     try {
+                        std::string id = task.native_state_id;
+                        if (!task.native_state_body.empty()) {
+                            // verified once (layout, finite values, content ID) and stored as received
+                            std::string decoded;
+                            native_state_block block = native_state_decode(task.native_state_body, decoded);
+                            if (!id.empty() && decoded != id) {
+                                throw std::invalid_argument("neuralese-id-mismatch: content hashes to " + decoded);
+                            }
+                            id = decoded;
+                            native_registry->store.put(id, std::move(task.native_state_body), std::move(block));
+                        }
+                        const auto found = native_registry->store.get(id);
                         if (!found) {
-                            throw std::invalid_argument("neuralese-unknown-native-state: " + task.native_state_id);
+                            throw std::invalid_argument("neuralese-unknown-native-state: " + id);
                         }
                         if (found->block.identity() == native_registry->identity) {
-                            native_register(task.native_state_id, found->block);
+                            native_register(id, found->block);
                         }
-                        res->mode = native_registry->resolve(task.native_state_id).mode;
+                        res->mode = native_registry->resolve(id).mode;
+                        res->meta = json::parse(native_state_meta(id, found->block).dump());
                         queue_results.send(std::move(res));
                     } catch (const std::exception & e) {
-                        send_error(task, std::string("neuralese-bad-native-state: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                        const std::string what = e.what();
+                        send_error(task, what.rfind("neuralese-", 0) == 0 ? what : "neuralese-bad-native-state: " + what,
+                                   ERROR_TYPE_INVALID_REQUEST);
                     }
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
@@ -6231,6 +6245,10 @@ server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
 }
 
+std::shared_ptr<const native_state_store::entry> server_context::get_native_state(const std::string & id) const {
+    return impl->native_registry->store.get(id);
+}
+
 server_context_meta server_context::get_meta() const {
     auto bos_id = llama_vocab_bos(impl->vocab);
     auto eos_id = llama_vocab_eos(impl->vocab);
@@ -7871,44 +7889,36 @@ void server_routes::init_routes() {
 
     this->put_native_state = [this](const server_http_req & req) {
         auto res = create_response();
-        const std::string expected = req.get_param("id");
-        std::string id;
-        native_state_block block;
-        // the body is the state's bytes, or {"path": FILE} naming a store file on this host (handed over by path)
-        std::string read;
+        // the body is the state's bytes, or {"path": FILE} naming a store file on this host (handed over by path); the
+        // main loop verifies, stores and registers it (SERVER_TASK_TYPE_NATIVE_STATE_REGISTER with its body)
         bool by_path = false;
         for (const auto & [key, value] : req.headers) {
             std::string lower = key;
             std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char) std::tolower(c); });
             by_path |= lower == "content-type" && value.rfind("application/json", 0) == 0;
         }
+        server_task task(SERVER_TASK_TYPE_NATIVE_STATE_REGISTER);
         try {
             if (by_path) {
                 const json named = json::parse(req.body);
                 if (!named.is_object() || !named.contains("path") || !named.at("path").is_string()) {
                     throw std::invalid_argument("a JSON body names a local store file: {\"path\": FILE}");
                 }
-                read = native_state_read_file(named.at("path").get<std::string>());
+                task.native_state_body = native_state_read_file(named.at("path").get<std::string>());
+            } else {
+                task.native_state_body = req.body;
             }
-            block = native_state_decode(by_path ? read : req.body, id);
+            if (task.native_state_body.empty()) {
+                throw std::invalid_argument("empty native state");
+            }
         } catch (const std::exception & e) {
             res->error(format_error_response(std::string("neuralese-bad-native-state: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (id != expected) {
-            res->error(format_error_response("neuralese-id-mismatch: content hashes to " + id, ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
-        const json meta = json::parse(native_state_meta(id, block).dump());
-        ctx_server.native_registry->store.put(id, by_path ? std::move(read) : req.body, std::move(block));
-        // a state of this server's identity becomes a virtual span (on the main loop, which owns the context)
+        task.native_state_id = req.get_param("id");
         auto & rd = res->rd;
-        {
-            server_task task(SERVER_TASK_TYPE_NATIVE_STATE_REGISTER);
-            task.id = rd.get_new_id();
-            task.native_state_id = id;
-            rd.post_task(std::move(task));
-        }
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
         auto result = rd.next(req.should_stop);
         if (!result) {
             return res;
@@ -7917,7 +7927,7 @@ void server_routes::init_routes() {
             res->error(result->to_json());
             return res;
         }
-        res->ok(meta);
+        res->ok(result->to_json().at("meta"));
         res->status = 201;
         return res;
     };

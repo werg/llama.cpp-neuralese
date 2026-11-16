@@ -266,8 +266,11 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
-    // used by SERVER_TASK_TYPE_NATIVE_STATE_REGISTER
+    // used by SERVER_TASK_TYPE_NATIVE_STATE_REGISTER: a stored state's ID, or with native_state_body a state's bytes (a
+    // natlang store file) to verify and store first, as received (native_state_id is then the ID it must have, if set).
+    // The one native-state put of the HTTP route (PUT /v1/neuralese/native-states/:id) and embedders (wllama).
     std::string native_state_id;
+    std::string native_state_body;
 
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
@@ -739,6 +742,7 @@ struct server_task_result_apply_lora : server_task_result {
 
 struct server_task_result_native_register : server_task_result {
     std::string mode; // the consumption mode the state now has
+    json        meta; // GET .../meta of the state: {"id": ..., **metadata}
     virtual json to_json() override;
 };
 

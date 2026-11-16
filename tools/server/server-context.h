@@ -92,6 +92,11 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // a stored native state (its bytes as stored, natlang's store-file format, and the decoded block), or null when
+    // unknown; thread-safe. Embedders (wllama) read produced states with it, as GET /v1/neuralese/native-states/:id
+    // does; they put states with SERVER_TASK_TYPE_NATIVE_STATE_REGISTER carrying the bytes.
+    std::shared_ptr<const native_state_store::entry> get_native_state(const std::string & id) const;
 };
 
 

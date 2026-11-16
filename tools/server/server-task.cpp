@@ -2093,5 +2093,6 @@ void server_prompt_cache::update() {
 json server_task_result_native_register::to_json() {
     json out = json::object();
     out["mode"] = mode;
+    out["meta"] = meta;
     return out;
 }
