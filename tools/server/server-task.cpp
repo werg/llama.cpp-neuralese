@@ -630,6 +630,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     if (!rl_capture.is_null()) {
         deltas.back()["x_natlang_rl_capture"] = rl_capture;
     }
+    // produced native states: the streamed text carries their placeholders, so the last chunk carries what the final
+    // reply does (the blocks and imports, and the whole message with each state as a native_state part)
+    if (!native_state.is_null()) {
+        deltas.back()["native_state"] = native_state;
+    }
+    if (!native_block_ids.empty()) {
+        deltas.back()["x_natlang_message"] = native_message(oaicompat_msg.to_json_oaicompat(), native_block_ids);
+    }
     if (!native_failure.is_null()) {
         deltas.back()["x_natlang_native_failure"] = native_failure;
         deltas.back()["x_natlang_message"] = { { "role", "assistant" }, { "content", native_failure_text } };

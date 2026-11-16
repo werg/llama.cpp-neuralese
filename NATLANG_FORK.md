@@ -31,7 +31,10 @@ Detailed API documentation for the server additions is in `tools/server/README.m
   `natlang.consume_open/close`. The GGUF state-span format (`common/native-state.*`) is gone;
   `llama-state-span-dump` reads store files with the server's codec (`--consume OPEN CLOSE` for a stock conversion).
 - **Native state production**: the producer adapter and per-sequence capture of exported state, and the native-state
-  protocol in llama-server (`/v1/neuralese/info`, `/v1/neuralese/native-states`, consumption receipts).
+  protocol in llama-server (`/v1/neuralese/info`, `/v1/neuralese/native-states`, consumption receipts). A streamed reply's
+  text carries a produced state's placeholder; its last chunk carries `native_state` (blocks, imports) and
+  `x_natlang_message`, the whole message with each state as a `native_state` part, as the final non-streamed reply does
+  (before, a stream lost which state a placeholder named).
 - **Per-sequence LoRA** (`--lora-per-sequence`): each request's adapter scales affect only its own tokens, so requests
   with different adapters batch together. A prompt state computed with other adapters is never reused.
 - **Decision readout** (`POST /v1/natlang/score`): scores continuations of chat prompts.
