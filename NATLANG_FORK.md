@@ -13,10 +13,18 @@ merged with upstream regularly rather than rebased, so the history of our change
 Detailed API documentation for the server additions is in `tools/server/README.md` (sections "Native state spans" and
 "natlang API Endpoints").
 
-- **Native state spans** (`src/llama-state-span.h`, `common/native-state.{h,cpp}`, `llama_state_span_register`): exact
-  imported per-layer state (positional KV plus LFM short-convolution state) for runs of virtual positions. A GGUF span
-  is loaded with `llama-server --native-state FILE`, and a chat content part `{"type": "native_state", "id": ID}`
-  consumes it between its consume markers.
+- **Native state spans** (`src/llama-state-span.h`, `llama_state_span_register`): exact imported per-layer state
+  (positional KV plus LFM short-convolution state) for runs of virtual positions. A chat content part
+  `{"type": "native_state", "id": ID}` consumes a stored state between its consume markers.
+- **Native state files** (`tools/server/server-native-state.{h,cpp}`): one format for every engine, natlang's block
+  store file (`serve/store.py`: safetensors with the `natlang.native_state` metadata and the content ID). A state enters
+  the server's store as received and is answered by GET as stored: a PUT body, a PUT of `{"path": FILE}` naming a store
+  file on this host, a `--native-state FILE` at startup (a tuned release's `states/<id>.nzs`; the in-page engine's
+  `native_states` blobs take the same path) or a produce span. Each is verified once on entry (layout, finite values,
+  content ID) and decoded once for its span registration, the only computation on it. A model that declares its native
+  identity (`natlang.identity.*`) loads only states of that identity at startup; `--native-state` needs a model with
+  `natlang.consume_open/close`. The GGUF state-span format (`common/native-state.*`) is gone;
+  `llama-state-span-dump` reads store files with the server's codec (`--consume OPEN CLOSE` for a stock conversion).
 - **Native state production**: the producer adapter and per-sequence capture of exported state, and the native-state
   protocol in llama-server (`/v1/neuralese/info`, `/v1/neuralese/native-states`, consumption receipts).
 - **Per-sequence LoRA** (`--lora-per-sequence`): each request's adapter scales affect only its own tokens, so requests

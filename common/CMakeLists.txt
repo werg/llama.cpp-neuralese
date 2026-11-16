@@ -78,8 +78,6 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
-    native-state.cpp
-    native-state.h
     file-lock.cpp
     file-lock.h
     hf-cache.cpp

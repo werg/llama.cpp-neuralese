@@ -14,7 +14,6 @@
 #include "server-stream.h"
 
 #include "build-info.h"
-#include "native-state.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -1100,7 +1099,6 @@ public:
     const llama_vocab * vocab = nullptr;
 
     // natlang native state spans (--native-state), registered with ctx_tgt, by ID: the tokens that consume each
-    std::vector<common_native_state> native_states;
     std::shared_ptr<native_state_registry> native_registry = std::make_shared<native_state_registry>();
 
     // prompt of the "asr" chat template, for live ASR
@@ -1410,19 +1408,28 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
-        native_states.clear();
         native_registry = std::make_shared<native_state_registry>();
         native_registry->identity = native_identity_from_model(model_tgt);
         native_registry->vocab    = vocab;
+        // --native-state files: store files (natlang serve/store.py's format, a release's states/<id>.nzs), verified and
+        // stored as read, exactly as a PUT; each is consumed through its registered span. A model that declares its
+        // native identity only loads states of that identity.
         for (const auto & path : params_base.native_states) {
-            common_native_state st;
-            if (!common_native_state_load(path, llama_model_n_layer(model_tgt), st) || !common_native_state_register(ctx_tgt, st)) {
-                SRV_ERR("failed to load native state '%s'\n", path.c_str());
+            try {
+                std::string body = native_state_read_file(path);
+                std::string id;
+                native_state_block block = native_state_decode(body, id);
+                if (!native_registry->identity.empty() && !(block.identity() == native_registry->identity)) {
+                    throw std::invalid_argument("its native identity differs from this model's");
+                }
+                const int64_t n = block.n_tokens();
+                native_register(id, block);
+                native_registry->store.put(id, body, std::move(block));
+                SRV_INF("native state %s: %lld positions\n", id.c_str(), (long long) n);
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to load native state '%s': %s\n", path.c_str(), e.what());
                 return false;
             }
-            native_registry->add_static(st.id, common_native_state_tokens(st));
-            SRV_INF("native state %s: %d positions\n", st.id.c_str(), st.n_tokens);
-            native_states.push_back(std::move(st));
         }
 
         {
@@ -1434,6 +1441,11 @@ private:
             native_markers.produce_close   = marker("natlang.produce_close");
             native_registry->consume_open  = marker("natlang.consume_open");
             native_registry->consume_close = marker("natlang.consume_close");
+            if (!params_base.native_states.empty() &&
+                    (native_registry->consume_open == LLAMA_TOKEN_NULL || native_registry->consume_close == LLAMA_TOKEN_NULL)) {
+                SRV_ERR("%s", "native states (--native-state) need a model that declares natlang.consume_open/close (a natlang GGUF export)\n");
+                return false;
+            }
             native_produces = llama_model_has_producer_adapter(model_tgt) && !native_registry->identity.empty() &&
                 native_markers.produce_open != LLAMA_TOKEN_NULL && native_markers.produce_close != LLAMA_TOKEN_NULL &&
                 !has_spec;
@@ -1485,7 +1497,7 @@ private:
                     return false;
                 }
 
-                if (!native_states.empty()) {
+                if (!params_base.native_states.empty()) {
                     // a draft model cannot import the target's native state spans
                     SRV_ERR("%s", "native states (--native-state) cannot be combined with speculative decoding\n");
                     return false;
@@ -7862,8 +7874,23 @@ void server_routes::init_routes() {
         const std::string expected = req.get_param("id");
         std::string id;
         native_state_block block;
+        // the body is the state's bytes, or {"path": FILE} naming a store file on this host (handed over by path)
+        std::string read;
+        bool by_path = false;
+        for (const auto & [key, value] : req.headers) {
+            std::string lower = key;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+            by_path |= lower == "content-type" && value.rfind("application/json", 0) == 0;
+        }
         try {
-            block = native_state_decode(req.body, id);
+            if (by_path) {
+                const json named = json::parse(req.body);
+                if (!named.is_object() || !named.contains("path") || !named.at("path").is_string()) {
+                    throw std::invalid_argument("a JSON body names a local store file: {\"path\": FILE}");
+                }
+                read = native_state_read_file(named.at("path").get<std::string>());
+            }
+            block = native_state_decode(by_path ? read : req.body, id);
         } catch (const std::exception & e) {
             res->error(format_error_response(std::string("neuralese-bad-native-state: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
             return res;
@@ -7873,7 +7900,7 @@ void server_routes::init_routes() {
             return res;
         }
         const json meta = json::parse(native_state_meta(id, block).dump());
-        ctx_server.native_registry->store.put(id, req.body, std::move(block));
+        ctx_server.native_registry->store.put(id, by_path ? std::move(read) : req.body, std::move(block));
         // a state of this server's identity becomes a virtual span (on the main loop, which owns the context)
         auto & rd = res->rd;
         {

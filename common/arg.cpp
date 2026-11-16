@@ -3874,8 +3874,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--native-state"}, "FNAME",
-        "load a natlang native state span (GGUF, common/native-state.h; can be repeated); a chat content part "
-        "{\"type\": \"native_state\", \"id\": ID} consumes it exactly, between its consume markers",
+        "load a natlang native state file (natlang's store format, e.g. a release's states/<id>.nzs; can be repeated); "
+        "a chat content part {\"type\": \"native_state\", \"id\": ID} consumes it exactly, between its consume markers",
         [](common_params & params, const std::string & value) {
             params.native_states.push_back(value);
         }

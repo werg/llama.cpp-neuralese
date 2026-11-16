@@ -108,9 +108,11 @@ struct native_state_use {
     std::string              mode; // exact-native-state | best-effort-text-retokenization
 };
 
-// every native state a server can consume: --native-state files (registered at startup) and stored artifacts. A stored
-// state of this server's identity is consumed exactly through its registered span; another model's state is consumed
-// best effort, by re-encoding its text (as the reference server does until semantic adaptation is trained).
+// every native state a server can consume: stored artifacts, from PUT (a body, or a local file named by
+// {"path": ...}), from --native-state files at startup (the same store files, natlang serve/store.py's format) and from
+// produce spans. A stored state of this server's identity, or one loaded at startup, is consumed exactly through its
+// registered span; another model's state is consumed best effort, by re-encoding its text (as the reference server
+// does until semantic adaptation is trained).
 class native_state_registry {
 public:
     native_state_store store;
@@ -120,12 +122,10 @@ public:
     const llama_vocab * vocab = nullptr;
     int32_t            context = 0; // tokens per slot
 
-    void add_static(const std::string & id, std::vector<llama_token> tokens);
     bool known(const std::string & id) const;
     // throws std::invalid_argument("neuralese-unknown-native-state: <id>")
     native_state_use resolve(const std::string & id) const;
-
-private:
-    mutable std::mutex m;
-    std::map<std::string, std::vector<llama_token>> statics;
 };
+
+// the bytes of a local native-state file (a store file); throws std::invalid_argument when it cannot be read
+std::string native_state_read_file(const std::string & path);

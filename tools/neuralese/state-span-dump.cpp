@@ -1,16 +1,16 @@
 // llama-state-span-dump: logits of a token sequence that consumes natlang native state spans (forward-parity checks
 // against the reference engine). The input JSON is a list whose numbers are token IDs and whose strings are native
-// state GGUF files (common/native-state.h); each state expands to its consume-open marker, its virtual span and its
+// state files (natlang's store format, tools/server/server-native-state.h); each state expands to its consume-open marker, its virtual span and its
 // consume-close marker. An object {"produce": [ids]} decodes its tokens as a producer span (llama_set_seq_producing: the
 // producer adapter applies and their state is captured). Writes F32 logits [n_out, n_vocab] for expanded positions
 // >= --from to --out, and with --capture PREFIX the captured state: PREFIX.json (token count and per-kind widths) and
 // PREFIX.f32 (the embeddings, then per layer key, value and gated input where present, each [n][width]).
 //
 //   llama-state-span-dump -m model.gguf --input seq.json --from N --out logits.f32 [--chunk K] [--f32-cache] [--fa on|off|auto]
-//                         [--capture PREFIX] [-ngl N]
+//                         [--capture PREFIX] [-ngl N] [--consume OPEN CLOSE]
 
 #include "llama.h"
-#include "native-state.h"
+#include "server-native-state.h"
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +24,7 @@ int main(int argc, char ** argv) {
     std::string model_path, input_path, out_path, capture_prefix;
     int32_t from = 0, chunk = 0, threads = 8, n_gpu_layers = 0;
     bool f32_cache = false;
+    int32_t consume_open_arg = -1, consume_close_arg = -1; // a model without natlang marker metadata (a stock conversion)
     std::string fa = "auto";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -38,6 +39,7 @@ int main(int argc, char ** argv) {
         else if (a == "--fa") fa = next();
         else if (a == "--capture") capture_prefix = next();
         else if (a == "-ngl") n_gpu_layers = std::stoi(next());
+        else if (a == "--consume") { consume_open_arg = std::stoi(next()); consume_close_arg = std::stoi(next()); }
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     llama_backend_init();
@@ -55,7 +57,13 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) return 1;
 
-    std::vector<common_native_state> states;
+    auto marker = [&](const char * key) {
+        char buf[32];
+        return llama_model_meta_val_str(model, key, buf, sizeof(buf)) > 0 ? (llama_token) std::atoi(buf) : LLAMA_TOKEN_NULL;
+    };
+    const llama_token consume_open  = consume_open_arg  >= 0 ? consume_open_arg  : marker("natlang.consume_open");
+    const llama_token consume_close = consume_close_arg >= 0 ? consume_close_arg : marker("natlang.consume_close");
+    std::vector<native_state_rows> states; // the registered rows stay alive with the context
     states.reserve(64);
     std::vector<llama_token> tokens;
     std::vector<bool> producing; // per token
@@ -66,11 +74,30 @@ int main(int argc, char ** argv) {
             for (const auto & t : item.at("produce")) { tokens.push_back(t.get<int>()); producing.push_back(true); }
             continue;
         }
-        states.emplace_back();
-        auto & st = states.back();
-        if (!common_native_state_load(item.get<std::string>(), llama_model_n_layer(model), st)) return 1;
-        if (!common_native_state_register(ctx, st)) return 1;
-        for (auto t : common_native_state_tokens(st)) { tokens.push_back(t); producing.push_back(false); }
+        if (consume_open == LLAMA_TOKEN_NULL || consume_close == LLAMA_TOKEN_NULL) {
+            fprintf(stderr, "the model declares no natlang consume markers\n"); return 1;
+        }
+        const int32_t n_layer = llama_model_n_layer(model);
+        try {
+            std::string id;
+            const native_state_block block = native_state_decode(native_state_read_file(item.get<std::string>()), id);
+            states.push_back(native_state_to_rows(block, n_layer));
+        } catch (const std::exception & e) { fprintf(stderr, "%s: %s\n", item.get<std::string>().c_str(), e.what()); return 1; }
+        auto & rows = states.back();
+        llama_token first = LLAMA_TOKEN_NULL;
+        if (rows.n_tokens > 0) {
+            std::vector<llama_state_span_layer> layers(n_layer);
+            for (int32_t il = 0; il < n_layer; ++il) {
+                layers[il].k    = rows.k[il].empty()    ? nullptr : rows.k[il].data();
+                layers[il].v    = rows.v[il].empty()    ? nullptr : rows.v[il].data();
+                layers[il].conv = rows.conv[il].empty() ? nullptr : rows.conv[il].data();
+            }
+            first = llama_state_span_register(ctx, rows.n_tokens, layers.data(), n_layer);
+            if (first == LLAMA_TOKEN_NULL) return 1;
+        }
+        tokens.push_back(consume_open); producing.push_back(false);
+        for (int32_t i = 0; i < rows.n_tokens; ++i) { tokens.push_back(first + i); producing.push_back(false); }
+        tokens.push_back(consume_close); producing.push_back(false);
     }
     const int32_t n = (int32_t) tokens.size();
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));

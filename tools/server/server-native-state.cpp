@@ -7,6 +7,8 @@ extern "C" {
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 using ojson = nlohmann::json; // std::map objects: sorted keys, as json.dumps(sort_keys=True)
@@ -235,6 +237,21 @@ static void validate(const native_state_block & block) {
             }
         }
     }
+    // every float finite (state_block.py validate; serve/store.py read_native_state_file): a float is non-finite iff
+    // all its exponent bits are set
+    for (const auto & [name, t] : block.tensors) {
+        const size_t size = itemsize(t.dtype);
+        if (!is_float(t.dtype)) continue;
+        const uint64_t mask = t.dtype == "F32" ? 0x7f800000ull : t.dtype == "BF16" ? 0x7f80ull : t.dtype == "F16" ? 0x7c00ull
+                                                                                                : 0x7ff0000000000000ull;
+        for (size_t at = 0; at + size <= t.data.size(); at += size) {
+            uint64_t bits = 0;
+            std::memcpy(&bits, t.data.data() + at, size);
+            if ((bits & mask) == mask) {
+                throw std::invalid_argument("native state " + name + " contains non-finite values");
+            }
+        }
+    }
 }
 
 native_state_block native_state_decode(const std::string & body, std::string & id) {
@@ -386,29 +403,11 @@ size_t native_state_store::size() const {
     return entries.size();
 }
 
-void native_state_registry::add_static(const std::string & id, std::vector<llama_token> tokens) {
-    std::lock_guard<std::mutex> lock(m);
-    statics[id] = std::move(tokens);
-}
-
 bool native_state_registry::known(const std::string & id) const {
-    {
-        std::lock_guard<std::mutex> lock(m);
-        if (statics.count(id)) {
-            return true;
-        }
-    }
     return store.has(id);
 }
 
 native_state_use native_state_registry::resolve(const std::string & id) const {
-    {
-        std::lock_guard<std::mutex> lock(m);
-        auto it = statics.find(id);
-        if (it != statics.end()) {
-            return { it->second, "exact-native-state" };
-        }
-    }
     const auto found = store.get(id);
     if (!found) {
         throw std::invalid_argument("neuralese-unknown-native-state: " + id);
@@ -437,4 +436,14 @@ native_state_use native_state_registry::resolve(const std::string & id) const {
     }
     use.tokens.push_back(consume_close);
     return use;
+}
+
+std::string native_state_read_file(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::invalid_argument("cannot read native state file " + path);
+    }
+    std::ostringstream body;
+    body << in.rdbuf();
+    return body.str();
 }
