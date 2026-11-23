@@ -13,6 +13,11 @@ on:
         description: 'Release tag (default: natlang-b<build number>)'
         required: false
         type: string
+      full:
+        description: 'Also build the Windows CUDA and Linux ROCm archives (1.5-2 h each; a tag push always does)'
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - 'natlang-b*'
@@ -132,27 +137,16 @@ jobs:
 
   # Linux GPU backends. Vulkan on x64 and arm64, ROCm on x64. Vibestudio's engine runs NVIDIA GPUs on Linux with the
   # Vulkan archive, so there is no Linux CUDA archive.
+  # A dispatched (dev) release builds what natlang installs (each platform's CPU archive, Metal, the page's wllama) and
+  # the quick GPU archives; ROCm and the Windows CUDA archives (Vibestudio's local-models engine) take 1.5-2 h each and
+  # run on a tag push or with the `full` input. scripts/update_llama_runtime.mjs --fork pins only CPU/Metal and wllama.
   ubuntu-gpu:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: ubuntu-vulkan-x64
-            os: ubuntu-22.04
-            arch: x64
-            backend: vulkan
-            defines: "-DGGML_VULKAN=ON"
-          - name: ubuntu-vulkan-arm64
-            os: ubuntu-24.04-arm
-            arch: arm64
-            backend: vulkan
-            defines: "-DGGML_VULKAN=ON"
-          - name: ubuntu-rocm-10.0-x64
-            os: ubuntu-24.04
-            arch: x64
-            backend: rocm
-            rocm_version: "10.0.0"
-            gpu_targets: "gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
+        include: ${{ fromJSON(format('[{0}{1}]',
+          '{"name":"ubuntu-vulkan-x64","os":"ubuntu-22.04","arch":"x64","backend":"vulkan","defines":"-DGGML_VULKAN=ON"},{"name":"ubuntu-vulkan-arm64","os":"ubuntu-24.04-arm","arch":"arm64","backend":"vulkan","defines":"-DGGML_VULKAN=ON"}',
+          (github.event_name == 'push' || inputs.full) && ',{"name":"ubuntu-rocm-10.0-x64","os":"ubuntu-24.04","arch":"x64","backend":"rocm","rocm_version":"10.0.0","gpu_targets":"gfx908;gfx90a;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"}' || '')) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -256,6 +250,7 @@ jobs:
             llama-natlang-bin-win-vulkan-x64.row.json
 
   windows-cuda:
+    if: ${{ github.event_name == 'push' || inputs.full }}
     strategy:
       fail-fast: false
       matrix:
@@ -351,6 +346,8 @@ jobs:
 
   publish:
     needs: [unix, ubuntu-gpu, windows, windows-vulkan, windows-cuda, wllama]
+    # windows-cuda is skipped in a dev release; any failure or cancellation still stops the release
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
