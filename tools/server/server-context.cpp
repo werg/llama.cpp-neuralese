@@ -8437,14 +8437,31 @@ std::vector<server_task> server_score_tasks(
     const size_t n_slots = std::max(params.n_parallel, 1);
 
     // the rendered chat prompt, tokenized as the chat completions endpoint does
-    auto render = [&](json chat, json * imports = nullptr) {
+    // `reply`: the chat ends in that assistant message, rendered closed; the text is cut right after its content and,
+    // unless `open`, the end-of-turn token that closes it, so neither what the template writes after the turn (a
+    // newline) nor, for an open reply, the end of message is scored. natlang's reference (serve/native_learning.py
+    // decision_items) scores the same tokens.
+    const std::string eot_piece = llama_vocab_eot(vocab) == LLAMA_TOKEN_NULL ? std::string()
+                                                                             : common_token_to_piece(vocab, llama_vocab_eot(vocab), true);
+    auto render = [&](json chat, json * imports = nullptr, const std::string * reply = nullptr, bool open = false) {
         std::vector<raw_buffer> files;
         common_chat_session session;
         const json parsed = oaicompat_chat_params_parse(vocab, chat, meta.chat_params, files, session);
         if (!files.empty()) {
             throw std::invalid_argument("a scored item cannot carry media");
         }
-        const std::string prompt = parsed.at("prompt").get<std::string>();
+        std::string prompt = parsed.at("prompt").get<std::string>();
+        if (reply != nullptr) {
+            const size_t at = prompt.rfind(*reply);
+            if (at == std::string::npos) {
+                throw std::invalid_argument("the rendered prompt does not hold the continuation's text");
+            }
+            size_t end = at + reply->size();
+            if (!open && !eot_piece.empty() && prompt.compare(end, eot_piece.size(), eot_piece) == 0) {
+                end += eot_piece.size();
+            }
+            prompt.resize(end);
+        }
         if (prompt.find("<__natlang_native_state:") != std::string::npos) {
             return server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_states, imports), false);
         }
@@ -8489,9 +8506,9 @@ std::vector<server_task> server_score_tasks(
             if (!recording.is_boolean()) {
                 throw std::invalid_argument("native_recording must be boolean");
             }
-            // "open_reply": each continuation is the start of the reply, scored without the end of message: the final
-            // assistant message is rendered continued (continue_final_message "content"), so nothing after its content
-            // is scored (natlang's field-by-field decisions; serve/native_learning.py decision_items does the same)
+            // "open_reply": each continuation is the start of the reply, scored without the end of message: the closed
+            // rendering is cut right after its content (render above), so nothing after the content is scored
+            // (natlang's field-by-field decisions; serve/native_learning.py decision_items does the same)
             const json open_reply = json_value(item, "open_reply", json(false));
             if (!open_reply.is_boolean()) {
                 throw std::invalid_argument("open_reply must be boolean");
@@ -8533,8 +8550,9 @@ std::vector<server_task> server_score_tasks(
                 json full_chat = chat;
                 full_chat["messages"].push_back({ { "role", "assistant" }, { "content", reply } });
                 full_chat["add_generation_prompt"]  = false;
-                full_chat["continue_final_message"] = out.open[i_item] ? json("content") : json(false);
-                full.push_back(render(full_chat));
+                full_chat["continue_final_message"] = false;
+                const std::string text = reply.get<std::string>();
+                full.push_back(render(full_chat, nullptr, &text, out.open[i_item]));
                 n_from = std::min(n_from, prompt.get_common_prefix(full.back()));
             }
             for (const auto & tokens : full) {

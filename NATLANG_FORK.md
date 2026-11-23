@@ -38,7 +38,8 @@ Detailed API documentation for the server additions is in `tools/server/README.m
 - **Per-sequence LoRA** (`--lora-per-sequence`): each request's adapter scales affect only its own tokens, so requests
   with different adapters batch together. A prompt state computed with other adapters is never reused.
 - **Decision readout** (`POST /v1/natlang/score`): scores continuations of chat prompts, closed (the whole reply) or with
-  `open_reply` as the start of the reply (natlang's field-by-field record decisions), echoed in the result.
+  `open_reply` as the start of the reply (natlang's field-by-field record decisions), echoed in the result; either is
+  cut from the closed rendering (after the content, or after its end-of-turn token), as natlang's reference engine scores.
 - **Guided generation** (`guidance` request field, `POST /v1/neuralese/guidance/check`): checks natlang `eval` tool
   calls while they are generated (repetition, redeclaration, TypeScript syntax via vendored tree-sitter in `vendor/`)
   and rolls back and resamples on a rejection. It supports pythonic (LFM2) and XML (LFM3) tool-call formats. Reasoning
