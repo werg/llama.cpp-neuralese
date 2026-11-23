@@ -8602,7 +8602,9 @@ std::vector<server_task> server_score_tasks(
                 n_from = std::min(n_from, prompt.get_common_prefix(full.back()));
             }
             // the split forms: [P, M_i, S], P and S the longest common character prefix and suffix of the contents (whole
-            // UTF-8 characters, not overlapping); a form whose tokens equal the canonical ones is not scored again
+            // UTF-8 characters, not overlapping), each shrunk to a word boundary (a cut never splits a word: "spam" vs "ham"
+            // share `am"`, which stays with the word); a byte is "word" when it is ASCII [A-Za-z0-9_] or >= 0x80, the rule
+            // natlang's engines share. A form whose tokens equal the canonical ones is not scored again
             std::vector<server_tokens> alt;
             std::vector<size_t> alt_owner;
             if (out.split[i_item]) {
@@ -8621,12 +8623,24 @@ std::vector<server_task> server_score_tasks(
                 while (n_pre > 0 && n_pre < shortest && (texts[0][n_pre] & 0xC0) == 0x80) {
                     n_pre--;
                 }
+                auto word = [](char c) {
+                    const unsigned char b = (unsigned char) c;
+                    return b >= 0x80 || b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z');
+                };
+                while (n_pre > 0 && word(texts[0][n_pre - 1]) && std::any_of(texts.begin(), texts.end(), [&](const std::string & t) {
+                           return n_pre < t.size() && word(t[n_pre]); })) {
+                    n_pre--;
+                }
                 size_t n_suf = 0;
                 while (n_suf < shortest - n_pre && std::all_of(texts.begin(), texts.end(), [&](const std::string & t) {
                            return t[t.size() - 1 - n_suf] == texts[0][texts[0].size() - 1 - n_suf]; })) {
                     n_suf++;
                 }
                 while (n_suf > 0 && (texts[0][texts[0].size() - n_suf] & 0xC0) == 0x80) {
+                    n_suf--;
+                }
+                while (n_suf > 0 && word(texts[0][texts[0].size() - n_suf]) && std::any_of(texts.begin(), texts.end(), [&](const std::string & t) {
+                           return t.size() > n_suf + n_pre && word(t[t.size() - n_suf - 1]); })) {
                     n_suf--;
                 }
                 out.alternatives[i_item].assign(texts.size(), {});
