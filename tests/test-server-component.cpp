@@ -2,6 +2,8 @@
 
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../tools/server/server-native-state.h"
+#include "../tools/server/server-rl-capture.h"
 #include "../tools/server/server-schema.h"
 
 #include <algorithm>
@@ -665,6 +667,158 @@ static void test_glob_match(testing & t) {
     });
 }
 
+//
+// natlang native states: producer_kind, in-context-text consumption
+//
+
+// a minimal valid native state (one attention layer) of `identity`, token ids `ids`
+static native_state_block native_test_block(const std::vector<int64_t> & ids, const nlohmann::json & extra) {
+    native_state_block block;
+    const int64_t n = (int64_t) ids.size();
+    auto put = [&](const std::string & name, const std::string & dtype, std::vector<int64_t> shape, const void * data, size_t bytes) {
+        native_state_tensor t;
+        t.dtype = dtype;
+        t.shape = std::move(shape);
+        t.data.assign((const char *) data, bytes);
+        block.tensors[name] = std::move(t);
+    };
+    std::vector<int64_t> pos(n);
+    for (int64_t i = 0; i < n; ++i) pos[i] = 3 + i;
+    std::vector<float> rows((size_t) n * 2, 0.25f);
+    put("token_ids", "I64", { n }, ids.data(), ids.size() * sizeof(int64_t));
+    put("positions", "I64", { n }, pos.data(), pos.size() * sizeof(int64_t));
+    put("embeddings", "F32", { n, 2 }, rows.data(), rows.size() * sizeof(float));
+    put("layers.0.raw_k", "F32", { n, 1, 2 }, rows.data(), rows.size() * sizeof(float));
+    put("layers.0.v", "F32", { n, 1, 2 }, rows.data(), rows.size() * sizeof(float));
+    block.metadata = { { "schema", "neuralese.native-state/1" }, { "text", "hi" }, { "architecture", "lfm3" },
+        { "tokenizer_fingerprint", std::string(64, 'a') }, { "checkpoint_sha256", std::string(64, 'b') },
+        { "embedding_weight_sha256", std::string(64, 'c') }, { "layer_kinds", nlohmann::json::array({ "attention" }) } };
+    for (const auto & item : extra.items()) {
+        block.metadata[item.key()] = item.value();
+    }
+    return block;
+}
+
+// encode and decode (decode validates the layout and metadata); returns the error, empty when accepted
+static std::string native_test_roundtrip(const native_state_block & block) {
+    try {
+        std::string id;
+        native_state_decode(native_state_encode(block, native_state_id(block)), id);
+        return "";
+    } catch (const std::exception & e) {
+        return e.what();
+    }
+}
+
+static void test_native_state_producer_kind(testing & t) {
+    t.test("validation", [](testing & t) {
+        t.assert_equal("no kind", std::string(), native_test_roundtrip(native_test_block({ 5, 6 }, nlohmann::json::object())));
+        t.assert_equal("span", std::string(), native_test_roundtrip(native_test_block({ 5, 6 }, { { "producer_kind", "span" } })));
+        t.assert_equal("text", std::string(), native_test_roundtrip(native_test_block({ 5, 6 }, { { "producer_kind", "text" } })));
+        t.assert_true("other value refused", native_test_roundtrip(native_test_block({ 5, 6 }, { { "producer_kind", "body" } }))
+                                                 .find("producer_kind") != std::string::npos);
+        t.assert_true("non-string refused", !native_test_roundtrip(native_test_block({ 5, 6 }, { { "producer_kind", 1 } })).empty());
+        t.assert_true("with a derivation refused", native_test_roundtrip(native_test_block({ 5, 6 },
+                          { { "producer_kind", "span" }, { "derivation", { { "kind", "x" } } } })).find("derived") != std::string::npos);
+        // the kind is part of the content id
+        t.assert_true("kind changes the id", native_state_id(native_test_block({ 5, 6 }, nlohmann::json::object())) !=
+                                             native_state_id(native_test_block({ 5, 6 }, { { "producer_kind", "span" } })));
+    });
+
+    t.test("resolve", [](testing & t) {
+        llama_backend_init();
+        const char * vocab_path = NATLANG_TEST_VOCAB;
+        llama_model_params mparams = llama_model_default_params();
+        mparams.vocab_only = true;
+        llama_model * model = llama_model_load_from_file(vocab_path, mparams);
+        if (!model) {
+            t.assert_true(std::string("vocab ") + vocab_path, false);
+            return;
+        }
+        native_state_registry registry;
+        registry.vocab = llama_model_get_vocab(model);
+        const int32_t n_vocab = llama_vocab_n_tokens(registry.vocab);
+        registry.consume_open = 11;
+        registry.consume_close = 12;
+        auto add = [&](const nlohmann::json & extra, bool registered, const std::vector<int64_t> & ids = { 40, 41, 42 }) {
+            native_state_block block = native_test_block(ids, extra);
+            registry.identity = block.identity();
+            const std::string id = native_state_id(block);
+            registry.store.put(id, native_state_encode(block, id), std::move(block));
+            if (registered) registry.store.set_span(id, n_vocab + 100);
+            return id;
+        };
+        const std::string span = add({ { "producer_kind", "span" } }, true);
+        const std::string text = add({ { "producer_kind", "text" } }, true);
+        const std::string plain = add(nlohmann::json::object(), true);
+        const std::string adapted = add({ { "producer_kind", "span" }, { "adapter_binding", { { "adapters", nlohmann::json::array() } } } }, true);
+        const std::string other = add({ { "producer_kind", "span" } }, false, { 40, 41, 43 }); // not exact here
+        const std::string empty = add({ { "producer_kind", "span" } }, false, {});
+
+        const std::vector<llama_token> inline_ids = { 40, 41, 42 };
+        const std::vector<llama_token> spliced = { 11, n_vocab + 100, n_vocab + 101, n_vocab + 102, 12 };
+        for (const auto & id : { span, text }) {
+            const auto use = registry.resolve(id);
+            t.assert_equal("in-context mode", std::string("in-context-text"), use.mode);
+            t.assert_true("own tokens, no markers", use.tokens == inline_ids);
+        }
+        t.assert_true("empty span: nothing", registry.resolve(empty).tokens.empty() && registry.resolve(empty).mode == "in-context-text");
+        for (const auto & id : { plain, adapted }) {
+            const auto use = registry.resolve(id);
+            t.assert_equal("spliced mode", std::string("exact-native-state"), use.mode);
+            t.assert_true("markers and span", use.tokens == spliced);
+        }
+        t.assert_equal("not exact: re-encoded", std::string("best-effort-text-retokenization"), registry.resolve(other).mode);
+
+        setenv("NATLANG_NEURALESE_SPAN_IN_CONTEXT", "0", 1);
+        t.assert_equal("span opt-out", std::string("exact-native-state"), registry.resolve(span).mode);
+        t.assert_true("span opt-out splices", registry.resolve(span).tokens == spliced);
+        t.assert_equal("span opt-out keeps text", std::string("in-context-text"), registry.resolve(text).mode);
+        unsetenv("NATLANG_NEURALESE_SPAN_IN_CONTEXT");
+        setenv("NATLANG_NEURALESE_TEXT_IN_CONTEXT", "0", 1);
+        t.assert_equal("text opt-out", std::string("exact-native-state"), registry.resolve(text).mode);
+        t.assert_equal("text opt-out keeps span", std::string("in-context-text"), registry.resolve(span).mode);
+        unsetenv("NATLANG_NEURALESE_TEXT_IN_CONTEXT");
+
+        // the prompt and its receipts: the in-context read is tokens with an in-context-text receipt; the spliced state
+        // keeps its markers and an exact receipt
+        json imports = json::array();
+        const llama_tokens tokens = tokenize_native_states(registry.vocab,
+            "a" + native_state_marker(span) + "b" + native_state_marker(plain), false, false, registry, &imports);
+        t.assert_equal("two receipts", (size_t) 2, imports.size());
+        t.assert_equal("in-context receipt id", span, imports[0].at("id").get<std::string>());
+        t.assert_equal("in-context receipt mode", std::string("in-context-text"), imports[0].at("mode").get<std::string>());
+        t.assert_equal("in-context receipt observed", span, imports[0].at("observed_native_state_id").get<std::string>());
+        t.assert_equal("exact receipt", std::string("exact-native-state"), imports[1].at("mode").get<std::string>());
+        const auto a = common_tokenize(registry.vocab, "a", false, false), b = common_tokenize(registry.vocab, "b", false, false);
+        llama_tokens want(a);
+        want.insert(want.end(), inline_ids.begin(), inline_ids.end());
+        want.insert(want.end(), b.begin(), b.end());
+        want.insert(want.end(), spliced.begin(), spliced.end());
+        t.assert_true("prompt tokens", tokens == want);
+
+        // the RL capture: the in-context tokens are an ordinary tokens segment; only the spliced state is native_state
+        int32_t n_own = 0;
+        const json segments = rl_prompt_segments(tokens, imports, registry, n_vocab, 0, 0, n_own);
+        int natives = 0;
+        llama_tokens recorded;
+        for (const auto & segment : segments) {
+            if (segment.at("kind").get<std::string>() == "native_state") {
+                natives++;
+                t.assert_equal("the spliced state", plain, segment.at("id").get<std::string>());
+            } else {
+                for (const auto & tok : segment.at("token_ids")) recorded.push_back((llama_token) tok.get<int64_t>());
+            }
+        }
+        t.assert_equal("one native_state segment", 1, natives);
+        llama_tokens own(want.begin(), want.end() - 4); // all but the virtual span and its close marker
+        own.push_back(12);
+        t.assert_true("in-context tokens recorded as tokens", recorded == own);
+        t.assert_equal("own tokens", (int32_t) own.size(), n_own);
+        llama_model_free(model);
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -690,6 +844,7 @@ int main(int argc, char ** argv) {
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
+    t.test("native_state_producer_kind", test_native_state_producer_kind);
 
     return t.summary();
 }

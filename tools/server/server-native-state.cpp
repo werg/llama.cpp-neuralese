@@ -6,6 +6,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -164,7 +165,7 @@ static int64_t read_i64(const std::string & data, size_t i) {
 static void validate(const native_state_block & block) {
     const ojson & m = block.metadata;
     static const std::vector<std::string> allowed = { "schema", "text", "architecture", "tokenizer_fingerprint",
-        "checkpoint_sha256", "embedding_weight_sha256", "layer_kinds", "adapter_binding", "derivation" };
+        "checkpoint_sha256", "embedding_weight_sha256", "layer_kinds", "adapter_binding", "derivation", "producer_kind" };
     for (const auto & item : m.items()) {
         if (std::find(allowed.begin(), allowed.end(), item.key()) == allowed.end()) {
             throw std::invalid_argument("unknown native state metadata field " + item.key());
@@ -172,6 +173,17 @@ static void validate(const native_state_block & block) {
     }
     if (m.value("schema", std::string()) != NATIVE_SCHEMA) {
         throw std::invalid_argument("unsupported native state schema");
+    }
+    // producer_kind (state_block.py PRODUCER_KINDS): how the tensors came about when they are the plain forward of the
+    // state's own tokens; a derived state's tensors are not
+    if (m.contains("producer_kind")) {
+        const ojson & kind = m.at("producer_kind");
+        if (!kind.is_string() || (kind.get<std::string>() != "text" && kind.get<std::string>() != "span")) {
+            throw std::invalid_argument("native state producer_kind must be one of ('text', 'span')");
+        }
+        if (m.contains("derivation") && !m.at("derivation").is_null()) {
+            throw std::invalid_argument("a derived native state has no producer kind: its tensors are not its tokens' forward");
+        }
     }
     if (!m.contains("text") || !m["text"].is_string() || !m.contains("architecture") || !m["architecture"].is_string() ||
             m["architecture"].get<std::string>().empty()) {
@@ -407,14 +419,50 @@ bool native_state_registry::known(const std::string & id) const {
     return store.has(id);
 }
 
+static bool env_on(const char * name) {
+    const char * value = std::getenv(name);
+    return value == nullptr || std::string(value) != "0";
+}
+
+bool native_state_reads_in_context(const native_state_block & block) {
+    const ojson & m = block.metadata;
+    auto present = [&](const char * key) { return m.contains(key) && !m.at(key).is_null(); };
+    if (present("adapter_binding") || present("derivation") || !m.contains("producer_kind") || !m.at("producer_kind").is_string()) {
+        return false;
+    }
+    const std::string kind = m.at("producer_kind").get<std::string>();
+    if (kind == "span") {
+        return env_on("NATLANG_NEURALESE_SPAN_IN_CONTEXT");
+    }
+    return kind == "text" && env_on("NATLANG_NEURALESE_TEXT_IN_CONTEXT");
+}
+
 native_state_use native_state_registry::resolve(const std::string & id) const {
     const auto found = store.get(id);
     if (!found) {
         throw std::invalid_argument("neuralese-unknown-native-state: " + id);
     }
     native_state_use use;
-    use.tokens.push_back(consume_open);
     const llama_token first = store.span(id);
+    // exact for this server exactly when the exact path below would splice it: an empty state of this identity, or a
+    // state registered as a span (native_register: this identity at PUT, every --native-state file at startup)
+    const bool exact = (found->block.n_tokens() == 0 && found->block.identity() == identity) || first != LLAMA_TOKEN_NULL;
+    if (exact && native_state_reads_in_context(found->block)) {
+        // in-context-text (natlang serve/engine.py _native_consume_text_in_context): the state's own token ids inline
+        // where the reader reads them, no consume markers; a reader cannot use KV computed in a context it never saw
+        const auto & ids = found->block.tensors.at("token_ids").data;
+        const int32_t n_vocab = vocab ? llama_vocab_n_tokens(vocab) : 0;
+        for (int64_t i = 0; i < found->block.n_tokens(); ++i) {
+            const int64_t t = read_i64(ids, (size_t) i);
+            if (vocab && t >= n_vocab) {
+                throw std::invalid_argument("neuralese-bad-native-state: " + id + " has a token outside this vocabulary");
+            }
+            use.tokens.push_back((llama_token) t);
+        }
+        use.mode = "in-context-text";
+        return use;
+    }
+    use.tokens.push_back(consume_open);
     if (found->block.n_tokens() == 0 && found->block.identity() == identity) {
         use.mode = "exact-native-state"; // an empty state of this model: nothing between its markers
     } else if (first != LLAMA_TOKEN_NULL) {

@@ -105,14 +105,22 @@ private:
 // how a request's native_state part is consumed: the tokens it expands to and the receipt mode
 struct native_state_use {
     std::vector<llama_token> tokens;
-    std::string              mode; // exact-native-state | best-effort-text-retokenization
+    std::string              mode; // exact-native-state | in-context-text | best-effort-text-retokenization
 };
+
+// whether a state is read as its own token ids inline in the reader's context (`in-context-text`) when it is exact for
+// the reading server: it carries producer_kind "text" (a text write: its text forced as a produce span from position 0,
+// nothing before it) or "span" (a produce span in its producer's call), and neither an adapter_binding nor a derivation
+// (natlang serve/engine.py reads_in_context). Opt-outs, read at request time: NATLANG_NEURALESE_TEXT_IN_CONTEXT=0 splices
+// text writes, NATLANG_NEURALESE_SPAN_IN_CONTEXT=0 produce spans, as stored.
+bool native_state_reads_in_context(const native_state_block & block);
 
 // every native state a server can consume: stored artifacts, from PUT (a body, or a local file named by
 // {"path": ...}), from --native-state files at startup (the same store files, natlang serve/store.py's format) and from
 // produce spans. A stored state of this server's identity, or one loaded at startup, is consumed exactly through its
-// registered span; another model's state is consumed best effort, by re-encoding its text (as the reference server
-// does until semantic adaptation is trained).
+// registered span, except that a text write or produce span (native_state_reads_in_context) is consumed as its own
+// token ids with no consume markers (`in-context-text`); another model's state is consumed best effort, by re-encoding
+// its text (as the reference server does until semantic adaptation is trained).
 class native_state_registry {
 public:
     native_state_store store;

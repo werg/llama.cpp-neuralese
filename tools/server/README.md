@@ -1311,6 +1311,15 @@ on CPU with an F32 cache, logits match natlang's reference engine as closely as 
 is bitwise unchanged, and the prompt cache reuses spans like other tokens. An unloaded ID is a 400 error. Supported:
 LFM2; not combinable with speculative decoding or media in the same request.
 
+A state whose metadata says it is the plain forward of its own tokens (`producer_kind`: `"text"`, a text write, or
+`"span"`, a produce span in its producer's call; every span this server produces carries `"span"`), and that has no
+`adapter_binding` or `derivation`, is read differently when it is exact for this server: its own token IDs are
+tokenized inline where the part stands, with no consume markers, and the receipt mode is `in-context-text` (natlang's
+`serve/engine.py` `reads_in_context`). A reader cannot use KV computed in a context it never saw; the same text inline
+reads back. The RL capture records those tokens as an ordinary `tokens` segment. `NATLANG_NEURALESE_TEXT_IN_CONTEXT=0`
+and `NATLANG_NEURALESE_SPAN_IN_CONTEXT=0` (read per request) splice text writes and produce spans as stored.
+`producer_kind` with any other value, or together with a `derivation`, is refused.
+
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
 This endpoint returns the loaded LoRA adapters. You can add adapters using `--lora` when starting the server, for example: `--lora my_adapter_1.gguf --lora my_adapter_2.gguf ...`

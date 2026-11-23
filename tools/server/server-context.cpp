@@ -2462,7 +2462,7 @@ private:
         block.metadata = { { "schema", "neuralese.native-state/1" }, { "text", text },
             { "architecture", identity.architecture }, { "tokenizer_fingerprint", identity.tokenizer_fingerprint },
             { "checkpoint_sha256", identity.checkpoint_sha256 }, { "embedding_weight_sha256", identity.embedding_weight_sha256 },
-            { "layer_kinds", kinds } };
+            { "layer_kinds", kinds }, { "producer_kind", "span" } }; // a produce span in its producer's call (state_block.py)
         const std::string id = native_state_id(block);
         const std::string body = native_state_encode(block, id);
         const nlohmann::json meta = native_state_meta(id, block);
@@ -3415,7 +3415,10 @@ private:
                 if (!task.cli_files.empty()) {
                     throw std::invalid_argument("native states cannot be combined with media in one request");
                 }
-                task.tokens = server_tokens(tokenize_native_states(vocab, prompt, true, true, *native_registry), false);
+                // the reply carries the import receipts (native_state.imports), as an HTTP request's does
+                json imports = json::array();
+                task.tokens = server_tokens(tokenize_native_states(vocab, prompt, true, true, *native_registry, &imports), false);
+                task.params.native_imports = imports;
             } else if (mctx != nullptr) {
                 task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files, init_opt);
             } else {
@@ -7843,7 +7846,7 @@ void server_routes::init_routes() {
         native["enabled"] = !reg.identity.empty();
         if (!reg.identity.empty()) {
             native["format"]            = "neuralese.native-state/1";
-            native["consumption_modes"] = json::array({ "exact-native-state", "best-effort-text-retokenization" });
+            native["consumption_modes"] = json::array({ "exact-native-state", "best-effort-text-retokenization", "in-context-text" });
             native["architecture"]            = reg.identity.architecture;
             native["checkpoint_sha256"]       = reg.identity.checkpoint_sha256;
             native["tokenizer_fingerprint"]   = reg.identity.tokenizer_fingerprint;

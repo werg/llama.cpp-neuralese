@@ -370,7 +370,8 @@ std::string native_state_marker(const std::string & id);
 
 // tokenize a prompt whose text may hold native state markers: text runs are tokenized separately (as the reference
 // engine tokenizes the segments around a state) and each marker becomes the state's consume-open marker, virtual
-// span (or its re-encoded text, for another model's state) and consume-close marker. A marker naming an unknown state
+// span (or its re-encoded text, for another model's state) and consume-close marker, or, for a text write or produce
+// span of this server (native_state_reads_in_context), the state's own token ids with no markers. A marker naming an unknown state
 // is an error. With `imports`, each consumed state appends its receipt {id, mode, observed_native_state_id} in order.
 llama_tokens tokenize_native_states(const llama_vocab * vocab, const std::string & prompt, bool add_special, bool parse_special,
                                     const native_state_registry & states, json * imports = nullptr);
