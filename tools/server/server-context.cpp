@@ -8562,12 +8562,25 @@ std::vector<server_task> server_score_tasks(
             if (n_from == 0) {
                 throw std::invalid_argument("the reply does not continue the rendered prompt");
             }
+            // the tokens every reply begins with (LFM3's </think> closing the empty think block, a field step's chosen
+            // fields) are prompt, not choice: each reply scores only its own tokens, at least its last one, as natlang's
+            // reference does (serve/native_learning.py decision_items, _shared_into_prompt; NATLANG_DECISION_SHARED_PREFIX
+            // =option there keeps them in every reply, and here the environment variable of the same name)
+            const char * shared_env = getenv("NATLANG_DECISION_SHARED_PREFIX");
+            if (full.size() >= 2 && !(shared_env != nullptr && std::string(shared_env) == "option")) {
+                size_t n_shared = full[0].size() - 1;
+                for (const auto & tokens : full) {
+                    n_shared = std::min(n_shared, tokens.size() - 1);
+                    n_shared = std::min(n_shared, full[0].get_common_prefix(tokens));
+                }
+                n_from = std::max(n_from, n_shared);
+            }
             // the decision capture (serve/native_learning.py): the exact scored prompt, imports and continuations
             if (recording.get<bool>()) {
                 if (meta.native_states.identity.empty()) {
                     throw std::invalid_argument("native-rl-policy-unavailable: native recording needs a natlang GGUF with its native identity");
                 }
-                const llama_tokens all = prompt.get_text_tokens();
+                const llama_tokens all = full[0].get_text_tokens();   // the prompt and the replies' shared tokens
                 const llama_tokens scored(all.begin(), all.begin() + n_from);
                 int32_t n_own = 0;
                 json segments = rl_prompt_segments(scored, imports, meta.native_states, n_vocab, 0, 0, n_own);
