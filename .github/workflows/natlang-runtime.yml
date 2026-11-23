@@ -100,6 +100,8 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x64, arm64]
+    # The image's MSVC STL (14.52) refuses the bundled Clang older than 22 (STL1000); the define is MSVC's documented
+    # escape for that check, as nothing here depends on the newer compiler.
     runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@v6
@@ -114,7 +116,7 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -D CMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.arch }}-windows-llvm.cmake ^
             -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }} ^
-            -DGGML_OPENMP=ON -DGGML_OPENMP_FETCH=ON ${{ env.CMAKE_ARGS }}
+            -DGGML_OPENMP=ON -DGGML_OPENMP_FETCH=ON -DCMAKE_CXX_FLAGS=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release
       - name: Pack
         run: |
