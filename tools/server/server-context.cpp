@@ -8477,6 +8477,7 @@ std::vector<server_task> server_score_tasks(
     out.n_prompt.assign(items.size(), 0);
     out.captures.assign(items.size(), json());
     out.open.assign(items.size(), false);
+    out.reasoned.assign(items.size(), false);
     for (size_t i_item = 0; i_item < items.size(); i_item++) {
         const json & item = items[i_item];
         std::vector<server_task> own;
@@ -8514,6 +8515,15 @@ std::vector<server_task> server_score_tasks(
                 throw std::invalid_argument("open_reply must be boolean");
             }
             out.open[i_item] = open_reply.get<bool>();
+            // "reasoning": the reply's reasoning, sampled before the options are scored (natlang's reasoned readout); each
+            // continuation is the content of an assistant message with that reasoning_content, rendered by the model's own
+            // template (LFM3: <think>R</think>option), so the reasoning is shared by every reply and so is prompt (the
+            // shared-prefix rule below). natlang's reference: serve/native_learning.py decision_items reasoning
+            const json reasoning = json_value(item, "reasoning", json());
+            if (!reasoning.is_null() && !reasoning.is_string()) {
+                throw std::invalid_argument("reasoning must be a string");
+            }
+            out.reasoned[i_item] = reasoning.is_string();
 
             // "cache_messages": k, the first k messages recur in later requests (a function's opening before its arguments):
             // the prompt is checkpointed where they end, so the next prompt that shares them continues from there
@@ -8548,7 +8558,11 @@ std::vector<server_task> server_score_tasks(
                     throw std::invalid_argument("each continuation must be a string");
                 }
                 json full_chat = chat;
-                full_chat["messages"].push_back({ { "role", "assistant" }, { "content", reply } });
+                json message = { { "role", "assistant" }, { "content", reply } };
+                if (out.reasoned[i_item]) {
+                    message["reasoning_content"] = reasoning;
+                }
+                full_chat["messages"].push_back(message);
                 full_chat["add_generation_prompt"]  = false;
                 full_chat["continue_final_message"] = false;
                 const std::string text = reply.get<std::string>();
@@ -8602,6 +8616,9 @@ std::vector<server_task> server_score_tasks(
                 };
                 if (out.open[i_item]) {
                     out.captures[i_item]["open_reply"] = true;
+                }
+                if (out.reasoned[i_item]) {
+                    out.captures[i_item]["reasoning"] = reasoning;
                 }
             }
 
@@ -8683,6 +8700,9 @@ json server_score_response(const server_score_batch & batch) {
         // echoed so that a client can tell an engine that scored the replies open from one that ignored the field
         if (batch.open.at(i)) {
             result["open_reply"] = true;
+        }
+        if (batch.reasoned.at(i)) {
+            result["reasoning"] = true;
         }
         results.push_back(result);
     }

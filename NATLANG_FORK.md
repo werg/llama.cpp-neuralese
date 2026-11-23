@@ -40,6 +40,9 @@ Detailed API documentation for the server additions is in `tools/server/README.m
 - **Decision readout** (`POST /v1/natlang/score`): scores continuations of chat prompts, closed (the whole reply) or with
   `open_reply` as the start of the reply (natlang's field-by-field record decisions), echoed in the result; either is
   cut from the closed rendering (after the content, or after its end-of-turn token), as natlang's reference engine scores.
+  An item's `reasoning` (a string) renders each continuation as the content after that reasoning (`reasoning_content`;
+  LFM3 `<think>R</think>option`), so the reasoning is prompt; results echo `reasoning: true` and the decision capture
+  records it.
 - **Guided generation** (`guidance` request field, `POST /v1/neuralese/guidance/check`): checks natlang `eval` tool
   calls while they are generated (repetition, redeclaration, TypeScript syntax via vendored tree-sitter in `vendor/`)
   and rolls back and resamples on a rejection. It supports pythonic (LFM2) and XML (LFM3) tool-call formats. Reasoning
