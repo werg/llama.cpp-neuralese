@@ -25,6 +25,7 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
@@ -8443,7 +8444,10 @@ std::vector<server_task> server_score_tasks(
     // decision_items) scores the same tokens.
     const std::string eot_piece = llama_vocab_eot(vocab) == LLAMA_TOKEN_NULL ? std::string()
                                                                              : common_token_to_piece(vocab, llama_vocab_eot(vocab), true);
-    auto render = [&](json chat, json * imports = nullptr, const std::string * reply = nullptr, bool open = false) {
+    // `pieces` (with `reply`): the reply's content tokenized piece by piece (each piece on its own, concatenated) instead
+    // of as one text; everything before and after the content is tokenized as in the whole rendering
+    auto render = [&](json chat, json * imports = nullptr, const std::string * reply = nullptr, bool open = false,
+                      const std::vector<std::string> * pieces = nullptr) {
         std::vector<raw_buffer> files;
         common_chat_session session;
         const json parsed = oaicompat_chat_params_parse(vocab, chat, meta.chat_params, files, session);
@@ -8461,6 +8465,22 @@ std::vector<server_task> server_score_tasks(
                 end += eot_piece.size();
             }
             prompt.resize(end);
+            if (pieces != nullptr) {
+                const std::string after = prompt.substr(at + reply->size());
+                prompt.resize(at);
+                server_tokens tokens = prompt.find("<__natlang_native_state:") != std::string::npos
+                    ? server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_states, imports), false)
+                    : std::move(tokenize_input_prompts(vocab, nullptr, prompt, true, true, mtmd_helper_init_opt_default())[0]);
+                for (const auto & piece : *pieces) {
+                    for (const llama_token token : common_tokenize(vocab, piece, false, true)) {
+                        tokens.push_back(token);
+                    }
+                }
+                for (const llama_token token : common_tokenize(vocab, after, false, true)) {
+                    tokens.push_back(token);
+                }
+                return tokens;
+            }
         }
         if (prompt.find("<__natlang_native_state:") != std::string::npos) {
             return server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_states, imports), false);
@@ -8477,6 +8497,8 @@ std::vector<server_task> server_score_tasks(
     out.n_prompt.assign(items.size(), 0);
     out.captures.assign(items.size(), json());
     out.open.assign(items.size(), false);
+    out.split.assign(items.size(), false);
+    out.alternatives.assign(items.size(), {});
     out.reasoned.assign(items.size(), false);
     for (size_t i_item = 0; i_item < items.size(); i_item++) {
         const json & item = items[i_item];
@@ -8524,6 +8546,16 @@ std::vector<server_task> server_score_tasks(
                 throw std::invalid_argument("reasoning must be a string");
             }
             out.reasoned[i_item] = reasoning.is_string();
+            // "split_tokenization": an option's probability sums its canonical tokenization and its split one, the
+            // options' shared leading and trailing characters tokenized apart from the rest ("spam" as `"`,`spam`,`"`
+            // where the canonical BPE writes `"sp`,`am"`): the model may write either, and the canonical one alone
+            // decided readouts by how each option's first characters merge. natlang's reference:
+            // serve/native_learning.py decision_items split_tokenization
+            const json split = json_value(item, "split_tokenization", json(false));
+            if (!split.is_boolean()) {
+                throw std::invalid_argument("split_tokenization must be boolean");
+            }
+            out.split[i_item] = split.get<bool>() && replies.size() >= 2;
 
             // "cache_messages": k, the first k messages recur in later requests (a function's opening before its arguments):
             // the prompt is checkpointed where they end, so the next prompt that shares them continues from there
@@ -8569,7 +8601,64 @@ std::vector<server_task> server_score_tasks(
                 full.push_back(render(full_chat, nullptr, &text, out.open[i_item]));
                 n_from = std::min(n_from, prompt.get_common_prefix(full.back()));
             }
+            // the split forms: [P, M_i, S], P and S the longest common character prefix and suffix of the contents (whole
+            // UTF-8 characters, not overlapping); a form whose tokens equal the canonical ones is not scored again
+            std::vector<server_tokens> alt;
+            std::vector<size_t> alt_owner;
+            if (out.split[i_item]) {
+                std::vector<std::string> texts;
+                for (const auto & reply : replies) {
+                    texts.push_back(reply.get<std::string>());
+                }
+                size_t shortest = texts[0].size();
+                for (const auto & text : texts) {
+                    shortest = std::min(shortest, text.size());
+                }
+                size_t n_pre = 0;
+                while (n_pre < shortest && std::all_of(texts.begin(), texts.end(), [&](const std::string & t) { return t[n_pre] == texts[0][n_pre]; })) {
+                    n_pre++;
+                }
+                while (n_pre > 0 && n_pre < shortest && (texts[0][n_pre] & 0xC0) == 0x80) {
+                    n_pre--;
+                }
+                size_t n_suf = 0;
+                while (n_suf < shortest - n_pre && std::all_of(texts.begin(), texts.end(), [&](const std::string & t) {
+                           return t[t.size() - 1 - n_suf] == texts[0][texts[0].size() - 1 - n_suf]; })) {
+                    n_suf++;
+                }
+                while (n_suf > 0 && (texts[0][texts[0].size() - n_suf] & 0xC0) == 0x80) {
+                    n_suf--;
+                }
+                out.alternatives[i_item].assign(texts.size(), {});
+                for (size_t i = 0; i < texts.size(); i++) {
+                    std::vector<std::string> pieces;
+                    for (const std::string & piece : { texts[i].substr(0, n_pre), texts[i].substr(n_pre, texts[i].size() - n_pre - n_suf),
+                                                       texts[i].substr(texts[i].size() - n_suf) }) {
+                        if (!piece.empty()) {
+                            pieces.push_back(piece);
+                        }
+                    }
+                    json full_chat = chat;
+                    json message = { { "role", "assistant" }, { "content", replies[i] } };
+                    if (out.reasoned[i_item]) {
+                        message["reasoning_content"] = reasoning;
+                    }
+                    full_chat["messages"].push_back(message);
+                    full_chat["add_generation_prompt"]  = false;
+                    full_chat["continue_final_message"] = false;
+                    server_tokens tokens = render(full_chat, nullptr, &texts[i], out.open[i_item], &pieces);
+                    if (tokens.get_text_tokens() == full[i].get_text_tokens()) {
+                        continue;
+                    }
+                    n_from = std::min(n_from, prompt.get_common_prefix(tokens));
+                    alt.push_back(std::move(tokens));
+                    alt_owner.push_back(i);
+                }
+            }
             for (const auto & tokens : full) {
+                out.n_prompt[i_item] += (int64_t) tokens.size();
+            }
+            for (const auto & tokens : alt) {
                 out.n_prompt[i_item] += (int64_t) tokens.size();
             }
             // the reply starts where the rendered reply leaves the prompt (a tokenizer may merge across the boundary)
@@ -8583,9 +8672,11 @@ std::vector<server_task> server_score_tasks(
             const char * shared_env = getenv("NATLANG_DECISION_SHARED_PREFIX");
             if (full.size() >= 2 && !(shared_env != nullptr && std::string(shared_env) == "option")) {
                 size_t n_shared = full[0].size() - 1;
-                for (const auto & tokens : full) {
-                    n_shared = std::min(n_shared, tokens.size() - 1);
-                    n_shared = std::min(n_shared, full[0].get_common_prefix(tokens));
+                for (const auto * group : { &full, &alt }) {
+                    for (const auto & tokens : *group) {
+                        n_shared = std::min(n_shared, tokens.size() - 1);
+                        n_shared = std::min(n_shared, full[0].get_common_prefix(tokens));
+                    }
                 }
                 n_from = std::max(n_from, n_shared);
             }
@@ -8617,6 +8708,18 @@ std::vector<server_task> server_score_tasks(
                 if (out.open[i_item]) {
                     out.captures[i_item]["open_reply"] = true;
                 }
+                if (out.split[i_item]) {
+                    json alternatives = json::array();
+                    for (size_t i = 0; i < full.size(); i++) {
+                        alternatives.push_back(json::array());
+                    }
+                    for (size_t k = 0; k < alt.size(); k++) {
+                        const llama_tokens own = alt[k].get_text_tokens();
+                        alternatives[alt_owner[k]].push_back(llama_tokens(own.begin() + n_from, own.end()));
+                    }
+                    out.captures[i_item]["split_tokenization"]        = true;
+                    out.captures[i_item]["continuation_alternatives"] = alternatives;
+                }
                 if (out.reasoned[i_item]) {
                     out.captures[i_item]["reasoning"] = reasoning;
                 }
@@ -8630,6 +8733,11 @@ std::vector<server_task> server_score_tasks(
             }
             const task_params task_params = server_schema::eval_llama_cmpl_schema(vocab, params, meta.logit_bias_eog, params_json);
 
+            const size_t n_options = full.size();
+            for (size_t k = 0; k < alt.size(); k++) {
+                out.alternatives[i_item][alt_owner[k]].push_back(n_results + n_options + k);
+                full.push_back(std::move(alt[k]));
+            }
             for (auto & tokens : full) {
                 if (tokens.size() <= n_from) {
                     throw std::invalid_argument("a continuation rendered no tokens of its own");
@@ -8649,7 +8757,9 @@ std::vector<server_task> server_score_tasks(
             continue;
         }
 
-        for (size_t k = 0; k < own.size(); k++) {
+        // one result per option (its canonical tokenization); the split forms follow, listed in alternatives
+        const size_t n_canonical = out.alternatives[i_item].empty() ? own.size() : out.alternatives[i_item].size();
+        for (size_t k = 0; k < n_canonical; k++) {
             out.results[i_item].push_back(n_results + k);
         }
         n_results += own.size();
@@ -8688,9 +8798,21 @@ json server_score_response(const server_score_batch & batch) {
         }
         json log_probs = json::array();
         json tokens    = json::array();
-        for (const size_t idx : batch.results[i]) {
-            log_probs.push_back(batch.log_probs.at(idx));
+        json counts    = json::array();
+        for (size_t k = 0; k < batch.results[i].size(); k++) {
+            const size_t idx = batch.results[i][k];
+            double lp = batch.log_probs.at(idx);
+            size_t n  = 1;
+            if (!batch.alternatives.at(i).empty()) {
+                for (const size_t other : batch.alternatives.at(i).at(k)) {
+                    const double b = batch.log_probs.at(other), m = std::max(lp, b);
+                    lp = m + std::log(std::exp(lp - m) + std::exp(b - m));
+                    n++;
+                }
+            }
+            log_probs.push_back(lp);
             tokens.push_back(batch.n_scored.at(idx));
+            counts.push_back(n);
         }
         json result = { { "log_probs", log_probs }, { "tokens", tokens }, { "prompt_tokens", batch.n_prompt.at(i) },
                         { "native_state_imports", batch.imports.at(i) } };
@@ -8703,6 +8825,10 @@ json server_score_response(const server_score_batch & batch) {
         }
         if (batch.reasoned.at(i)) {
             result["reasoning"] = true;
+        }
+        if (batch.split.at(i)) {
+            result["split_tokenization"] = true;
+            result["tokenizations"]      = counts;
         }
         results.push_back(result);
     }

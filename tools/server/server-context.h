@@ -116,6 +116,9 @@ struct server_score_batch {
     std::vector<json>                captures;  // per item, natlang.native-decision-capture/1 when it asked for
                                                 // native_recording, else null
     std::vector<bool>                open;      // per item, its continuations are open replies ("open_reply")
+    std::vector<bool>                split;     // per item, "split_tokenization": each option also scored split
+    std::vector<std::vector<std::vector<size_t>>> alternatives; // per item and option, the result indices of its other
+                                                                 // tokenizations (summed with the canonical one)
     std::vector<bool>                reasoned;  // per item, its continuations follow the item's "reasoning"
 };
 
