@@ -8459,6 +8459,7 @@ std::vector<server_task> server_score_tasks(
     out.imports.assign(items.size(), json::array());
     out.n_prompt.assign(items.size(), 0);
     out.captures.assign(items.size(), json());
+    out.open.assign(items.size(), false);
     for (size_t i_item = 0; i_item < items.size(); i_item++) {
         const json & item = items[i_item];
         std::vector<server_task> own;
@@ -8488,6 +8489,14 @@ std::vector<server_task> server_score_tasks(
             if (!recording.is_boolean()) {
                 throw std::invalid_argument("native_recording must be boolean");
             }
+            // "open_reply": each continuation is the start of the reply, scored without the end of message: the final
+            // assistant message is rendered continued (continue_final_message "content"), so nothing after its content
+            // is scored (natlang's field-by-field decisions; serve/native_learning.py decision_items does the same)
+            const json open_reply = json_value(item, "open_reply", json(false));
+            if (!open_reply.is_boolean()) {
+                throw std::invalid_argument("open_reply must be boolean");
+            }
+            out.open[i_item] = open_reply.get<bool>();
 
             // "cache_messages": k, the first k messages recur in later requests (a function's opening before its arguments):
             // the prompt is checkpointed where they end, so the next prompt that shares them continues from there
@@ -8524,7 +8533,7 @@ std::vector<server_task> server_score_tasks(
                 json full_chat = chat;
                 full_chat["messages"].push_back({ { "role", "assistant" }, { "content", reply } });
                 full_chat["add_generation_prompt"]  = false;
-                full_chat["continue_final_message"] = false;
+                full_chat["continue_final_message"] = out.open[i_item] ? json("content") : json(false);
                 full.push_back(render(full_chat));
                 n_from = std::min(n_from, prompt.get_common_prefix(full.back()));
             }
@@ -8560,6 +8569,9 @@ std::vector<server_task> server_score_tasks(
                     { "continuations", continuations },
                     { "native_state_imports", imports },
                 };
+                if (out.open[i_item]) {
+                    out.captures[i_item]["open_reply"] = true;
+                }
             }
 
             json params_json = json::object();
@@ -8636,6 +8648,10 @@ json server_score_response(const server_score_batch & batch) {
                         { "native_state_imports", batch.imports.at(i) } };
         if (!batch.captures.at(i).is_null()) {
             result["native_decision_capture"] = batch.captures.at(i);
+        }
+        // echoed so that a client can tell an engine that scored the replies open from one that ignored the field
+        if (batch.open.at(i)) {
+            result["open_reply"] = true;
         }
         results.push_back(result);
     }
