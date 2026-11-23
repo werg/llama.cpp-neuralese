@@ -22,6 +22,11 @@ permissions:
 
 env:
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON"
+  # The prebuilt web UI (tools/ui) is fetched by build number, b<commit count>. Fork commits raise the count past
+  # upstream's, and a bucket that does not exist falls back to upstream's latest UI, whose asset layout this tree's
+  # scripts/ui-assets.cmake may not know (natlang-b12082 failed on it). Pin the assets of the last upstream merge's
+  # release; move it with the next upstream merge.
+  HF_UI_VERSION: "b12081"
 
 concurrency:
   group: natlang-runtime
