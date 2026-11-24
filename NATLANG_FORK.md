@@ -44,7 +44,8 @@ Detailed API documentation for the server additions is in `tools/server/README.m
   `open_reply` as the start of the reply (natlang's field-by-field record decisions), echoed in the result; either is
   cut from the closed rendering (after the content, or after its end-of-turn token), as natlang's reference engine scores.
   With `split_tokenization` each option's probability sums its canonical tokenization and its split one (the options'
-  shared leading and trailing characters tokenized apart).
+  shared leading and trailing characters tokenized apart). `reasoning_ids` scores a reasoned readout after the reasoning's sampled ids
+  rather than its text re-encoded.
   An item's `reasoning` (a string) renders each continuation as the content after that reasoning (`reasoning_content`;
   LFM3 `<think>R</think>option`), so the reasoning is prompt; results echo `reasoning: true` and the decision capture
   records it.

@@ -8449,8 +8449,11 @@ std::vector<server_task> server_score_tasks(
                                                                              : common_token_to_piece(vocab, llama_vocab_eot(vocab), true);
     // `pieces` (with `reply`): the reply's content tokenized piece by piece (each piece on its own, concatenated) instead
     // of as one text; everything before and after the content is tokenized as in the whole rendering
+    // `reasoning_ids` (with `reply` and `reasoning_text`): the reasoning's sampled ids replace its re-encoded text, kept up
+    // to the first token the template writes after the reasoning (LFM3 </think>); `kept` receives their count
     auto render = [&](json chat, json * imports = nullptr, const std::string * reply = nullptr, bool open = false,
-                      const std::vector<std::string> * pieces = nullptr) {
+                      const std::vector<std::string> * pieces = nullptr, const std::string * reasoning_text = nullptr,
+                      const llama_tokens * reasoning_ids = nullptr, size_t * kept = nullptr) {
         std::vector<raw_buffer> files;
         common_chat_session session;
         const json parsed = oaicompat_chat_params_parse(vocab, chat, meta.chat_params, files, session);
@@ -8468,19 +8471,50 @@ std::vector<server_task> server_score_tasks(
                 end += eot_piece.size();
             }
             prompt.resize(end);
-            if (pieces != nullptr) {
+            if (pieces != nullptr || reasoning_ids != nullptr) {
                 const std::string after = prompt.substr(at + reply->size());
-                prompt.resize(at);
-                server_tokens tokens = prompt.find("<__natlang_native_state:") != std::string::npos
-                    ? server_tokens(tokenize_native_states(vocab, prompt, true, true, meta.native_states, imports), false)
-                    : std::move(tokenize_input_prompts(vocab, nullptr, prompt, true, true, mtmd_helper_init_opt_default())[0]);
-                for (const auto & piece : *pieces) {
-                    for (const llama_token token : common_tokenize(vocab, piece, false, true)) {
+                std::string head = prompt.substr(0, at), mid;
+                if (reasoning_ids != nullptr) {
+                    const size_t r = reasoning_text == nullptr || reasoning_text->empty() ? std::string::npos : head.rfind(*reasoning_text);
+                    if (r == std::string::npos) {
+                        throw std::invalid_argument("reasoning_ids: the rendered reply does not hold the reasoning text");
+                    }
+                    mid = head.substr(r + reasoning_text->size());
+                    head.resize(r);
+                }
+                server_tokens tokens = head.find("<__natlang_native_state:") != std::string::npos
+                    ? server_tokens(tokenize_native_states(vocab, head, true, true, meta.native_states, imports), false)
+                    : std::move(tokenize_input_prompts(vocab, nullptr, head, true, true, mtmd_helper_init_opt_default())[0]);
+                if (reasoning_ids != nullptr) {
+                    const llama_tokens mid_tokens = common_tokenize(vocab, mid, false, true);
+                    size_t n = 0;
+                    for (const llama_token token : *reasoning_ids) {
+                        if (!mid_tokens.empty() && token == mid_tokens[0]) {
+                            break;
+                        }
+                        if (token < 0 || token >= llama_vocab_n_tokens(vocab)) {
+                            throw std::invalid_argument("reasoning_ids: an id is outside the vocabulary");
+                        }
                         tokens.push_back(token);
+                        n++;
+                    }
+                    if (kept != nullptr) {
+                        *kept = n;
                     }
                 }
-                for (const llama_token token : common_tokenize(vocab, after, false, true)) {
-                    tokens.push_back(token);
+                const auto append = [&](const std::string & text) {
+                    for (const llama_token token : common_tokenize(vocab, text, false, true)) {
+                        tokens.push_back(token);
+                    }
+                };
+                if (pieces != nullptr) {
+                    append(mid);
+                    for (const auto & piece : *pieces) {
+                        append(piece);
+                    }
+                    append(after);
+                } else {
+                    append(mid + *reply + after);
                 }
                 return tokens;
             }
@@ -8501,6 +8535,7 @@ std::vector<server_task> server_score_tasks(
     out.captures.assign(items.size(), json());
     out.open.assign(items.size(), false);
     out.split.assign(items.size(), false);
+    out.with_ids.assign(items.size(), false);
     out.alternatives.assign(items.size(), {});
     out.reasoned.assign(items.size(), false);
     for (size_t i_item = 0; i_item < items.size(); i_item++) {
@@ -8549,6 +8584,25 @@ std::vector<server_task> server_score_tasks(
                 throw std::invalid_argument("reasoning must be a string");
             }
             out.reasoned[i_item] = reasoning.is_string();
+            // "reasoning_ids": the reasoning's sampled ids (the reasoning generation's whole sample sequence): they replace
+            // the reasoning text's re-encoding, which can leave the sampled tokens mid-reasoning, kept up to the first token
+            // the template writes after the reasoning. natlang's reference: serve/native_learning.py decision_items
+            llama_tokens reasoning_ids;
+            const bool with_ids = item.contains("reasoning_ids") && !item.at("reasoning_ids").is_null();
+            if (with_ids) {
+                if (!out.reasoned[i_item] || !item.at("reasoning_ids").is_array()) {
+                    throw std::invalid_argument("reasoning_ids is an array of token ids, with reasoning");
+                }
+                for (const auto & id : item.at("reasoning_ids")) {
+                    if (!id.is_number_integer()) {
+                        throw std::invalid_argument("reasoning_ids is an array of token ids, with reasoning");
+                    }
+                    reasoning_ids.push_back(id.get<llama_token>());
+                }
+            }
+            const std::string reasoning_text = out.reasoned[i_item] ? reasoning.get<std::string>() : std::string();
+            size_t kept = 0;
+            out.with_ids[i_item] = with_ids;
             // "split_tokenization": an option's probability sums its canonical tokenization and its split one, the
             // options' shared leading and trailing characters tokenized apart from the rest ("spam" as `"`,`spam`,`"`
             // where the canonical BPE writes `"sp`,`am"`): the model may write either, and the canonical one alone
@@ -8601,7 +8655,8 @@ std::vector<server_task> server_score_tasks(
                 full_chat["add_generation_prompt"]  = false;
                 full_chat["continue_final_message"] = false;
                 const std::string text = reply.get<std::string>();
-                full.push_back(render(full_chat, nullptr, &text, out.open[i_item]));
+                full.push_back(render(full_chat, nullptr, &text, out.open[i_item], nullptr, &reasoning_text,
+                                      with_ids ? &reasoning_ids : nullptr, &kept));
                 n_from = std::min(n_from, prompt.get_common_prefix(full.back()));
             }
             // the split forms: [P, M_i, S], P and S the longest common character prefix and suffix of the contents (whole
@@ -8663,7 +8718,8 @@ std::vector<server_task> server_score_tasks(
                     full_chat["messages"].push_back(message);
                     full_chat["add_generation_prompt"]  = false;
                     full_chat["continue_final_message"] = false;
-                    server_tokens tokens = render(full_chat, nullptr, &texts[i], out.open[i_item], &pieces);
+                    server_tokens tokens = render(full_chat, nullptr, &texts[i], out.open[i_item], &pieces, &reasoning_text,
+                                                  with_ids ? &reasoning_ids : nullptr);
                     if (tokens.get_text_tokens() == full[i].get_text_tokens()) {
                         continue;
                     }
@@ -8739,6 +8795,9 @@ std::vector<server_task> server_score_tasks(
                 }
                 if (out.reasoned[i_item]) {
                     out.captures[i_item]["reasoning"] = reasoning;
+                }
+                if (with_ids) {
+                    out.captures[i_item]["reasoning_ids_kept"] = kept;
                 }
             }
 
@@ -8842,6 +8901,9 @@ json server_score_response(const server_score_batch & batch) {
         }
         if (batch.reasoned.at(i)) {
             result["reasoning"] = true;
+        }
+        if (batch.with_ids.at(i)) {
+            result["reasoning_ids"] = true;
         }
         if (batch.split.at(i)) {
             result["split_tokenization"] = true;

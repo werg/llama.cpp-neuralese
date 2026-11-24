@@ -2049,6 +2049,8 @@ Scores candidate replies to a conversation. For each item, each continuation is 
 
 `split_tokenization`: `true` scores each option under two tokenizations and sums them: the canonical one (the rendered reply tokenized whole) and the split one, where the options' longest common leading and trailing characters, shrunk to word boundaries (a byte is a word byte when it is ASCII `[A-Za-z0-9_]` or >= 0x80), are tokenized apart from the rest (`"spam"` also as `"`,`spam`,`"` where the canonical tokens are `"sp`,`am"`), since a model may write either. A split form whose tokens equal the canonical ones is not counted again. The result carries `"split_tokenization": true` and `tokenizations` (1 or 2 per option); `native_decision_capture` adds `continuation_alternatives`, each option's extra token sequences. The tokens every sequence of the item shares are prompt.
 
+`reasoning_ids` (with `reasoning`): the reasoning generation's sampled token ids. They replace the reasoning text's re-encoding (which can differ from what was sampled), kept up to the first occurrence of the first token the template writes after the reasoning (LFM3 `</think>`); the reasoning text locates where they go. The result carries `"reasoning_ids": true` and the capture `reasoning_ids_kept`.
+
 `lora`: Default adapter scales for items without their own.
 
 *Result:*
