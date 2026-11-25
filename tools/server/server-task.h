@@ -111,6 +111,10 @@ struct task_params {
     rl_request rl;
     std::vector<llama_token> rl_banned;
 
+    // natlang native states: the producer_kind of the spans this request produces (x_natlang_producer_kind):
+    // "span" (a produce span in its producer's call) or "capture" (a reply captured in its own context)
+    std::string native_producer_kind = "span";
+
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 

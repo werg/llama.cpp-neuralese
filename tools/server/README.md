@@ -1318,6 +1318,13 @@ tokenized inline where the part stands, with no consume markers, and the receipt
 `serve/engine.py` `reads_in_context`). A reader cannot use KV computed in a context it never saw; the same text inline
 reads back. The RL capture records those tokens as an ordinary `tokens` segment. `NATLANG_NEURALESE_TEXT_IN_CONTEXT=0`
 and `NATLANG_NEURALESE_SPAN_IN_CONTEXT=0` (read per request) splice text writes and produce spans as stored.
+`producer_kind` `"capture"` marks a reply captured in its own context (natlang's learned compaction operators and
+`compact_history` notes: the reply summarizes the context its rows attended to, which its tokens alone lose). It is
+spliced as stored (`exact-native-state`) unless `NATLANG_NEURALESE_CAPTURE_IN_CONTEXT=1` (read per request), which reads
+it inline like a span. A chat completion request with `"x_natlang_producer_kind": "capture"` stores the spans it
+produces with that kind (`"span"`, the default, is also accepted; any other value is refused); the content ID is the
+one natlang's engines compute for the same tokens and kind. `/v1/neuralese/info` lists the capability
+`native.producer-kind.capture` on a producing server.
 `producer_kind` with any other value, or together with a `derivation`, is refused.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters

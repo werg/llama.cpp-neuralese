@@ -178,8 +178,9 @@ static void validate(const native_state_block & block) {
     // state's own tokens; a derived state's tensors are not
     if (m.contains("producer_kind")) {
         const ojson & kind = m.at("producer_kind");
-        if (!kind.is_string() || (kind.get<std::string>() != "text" && kind.get<std::string>() != "span")) {
-            throw std::invalid_argument("native state producer_kind must be one of ('text', 'span')");
+        if (!kind.is_string() || (kind.get<std::string>() != "text" && kind.get<std::string>() != "span" &&
+                                  kind.get<std::string>() != "capture")) {
+            throw std::invalid_argument("native state producer_kind must be one of ('text', 'span', 'capture')");
         }
         if (m.contains("derivation") && !m.at("derivation").is_null()) {
             throw std::invalid_argument("a derived native state has no producer kind: its tensors are not its tokens' forward");
@@ -424,6 +425,11 @@ static bool env_on(const char * name) {
     return value == nullptr || std::string(value) != "0";
 }
 
+static bool env_set(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && std::string(value) == "1";
+}
+
 bool native_state_reads_in_context(const native_state_block & block) {
     const ojson & m = block.metadata;
     auto present = [&](const char * key) { return m.contains(key) && !m.at(key).is_null(); };
@@ -433,6 +439,11 @@ bool native_state_reads_in_context(const native_state_block & block) {
     const std::string kind = m.at("producer_kind").get<std::string>();
     if (kind == "span") {
         return env_on("NATLANG_NEURALESE_SPAN_IN_CONTEXT");
+    }
+    if (kind == "capture") {
+        // a reply captured in its own context (a compaction operator's reply, a compact_history note) splices as
+        // stored: its rows carry what the context gave them, which its tokens alone lose
+        return env_set("NATLANG_NEURALESE_CAPTURE_IN_CONTEXT");
     }
     return kind == "text" && env_on("NATLANG_NEURALESE_TEXT_IN_CONTEXT");
 }

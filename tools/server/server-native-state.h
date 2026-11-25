@@ -113,6 +113,8 @@ struct native_state_use {
 // nothing before it) or "span" (a produce span in its producer's call), and neither an adapter_binding nor a derivation
 // (natlang serve/engine.py reads_in_context). Opt-outs, read at request time: NATLANG_NEURALESE_TEXT_IN_CONTEXT=0 splices
 // text writes, NATLANG_NEURALESE_SPAN_IN_CONTEXT=0 produce spans, as stored.
+// producer_kind "capture" (a reply captured in its own context: a compaction operator's reply, a compact_history note;
+// a request's x_natlang_producer_kind) splices as stored unless NATLANG_NEURALESE_CAPTURE_IN_CONTEXT=1.
 bool native_state_reads_in_context(const native_state_block & block);
 
 // every native state a server can consume: stored artifacts, from PUT (a body, or a local file named by

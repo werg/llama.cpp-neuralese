@@ -2462,7 +2462,9 @@ private:
         block.metadata = { { "schema", "neuralese.native-state/1" }, { "text", text },
             { "architecture", identity.architecture }, { "tokenizer_fingerprint", identity.tokenizer_fingerprint },
             { "checkpoint_sha256", identity.checkpoint_sha256 }, { "embedding_weight_sha256", identity.embedding_weight_sha256 },
-            { "layer_kinds", kinds }, { "producer_kind", "span" } }; // a produce span in its producer's call (state_block.py)
+            { "layer_kinds", kinds }, { "producer_kind", slot.task->params.native_producer_kind } };
+        // "span": a produce span in its producer's call; "capture": the request's x_natlang_producer_kind, a reply
+        // captured in its own context (state_block.py PRODUCER_KINDS)
         const std::string id = native_state_id(block);
         const std::string body = native_state_encode(block, id);
         const nlohmann::json meta = native_state_meta(id, block);
@@ -7861,6 +7863,7 @@ void server_routes::init_routes() {
             // an RL actor (server-rl-capture.h): captured rollouts, structural recording and marker-failure recovery
             caps.push_back("rl.capture");
             caps.push_back("native.protocol-recovery");
+            caps.push_back("native.producer-kind.capture"); // x_natlang_producer_kind: "capture"
             info["rl_policy_binding"] = {
                 { "schema", "natlang.rl-policy-binding/2" },
                 { "checkpoint_sha256", reg.identity.checkpoint_sha256 },

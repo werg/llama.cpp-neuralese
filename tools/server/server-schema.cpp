@@ -535,6 +535,13 @@ task_params eval_llama_cmpl_schema(
 
     // natlang RL actor capture: the request records its exact inputs and samples under the native sampling law
     rl_request_parse(data, params.rl);
+    if (data.contains("x_natlang_producer_kind") && !data.at("x_natlang_producer_kind").is_null()) {
+        const json & kind = data.at("x_natlang_producer_kind");
+        if (!kind.is_string() || (kind.get<std::string>() != "capture" && kind.get<std::string>() != "span")) {
+            throw std::invalid_argument("x_natlang_producer_kind must be \"capture\" (a reply captured in its own context) or \"span\"");
+        }
+        params.native_producer_kind = kind.get<std::string>();
+    }
     if (params.rl.trace() && params.guidance) {
         if (params.rl.capture) {
             throw std::invalid_argument("native-rl-guidance-unsupported: this server does not capture guided rollouts; send guidance: false");

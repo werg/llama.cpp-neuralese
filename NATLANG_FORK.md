@@ -18,7 +18,10 @@ Detailed API documentation for the server additions is in `tools/server/README.m
   `{"type": "native_state", "id": ID}` consumes a stored state between its consume markers. A text write or produce
   span (`producer_kind` "text"/"span", no adapter binding or derivation) of this server's identity is consumed as its
   own tokens inline instead, with no markers (`in-context-text`; opt-outs `NATLANG_NEURALESE_TEXT_IN_CONTEXT=0`,
-  `NATLANG_NEURALESE_SPAN_IN_CONTEXT=0`). Every span the server produces carries `producer_kind: "span"`.
+  `NATLANG_NEURALESE_SPAN_IN_CONTEXT=0`). Every span the server produces carries `producer_kind: "span"`, or
+  `"capture"` when the request sends `x_natlang_producer_kind: "capture"` (a reply captured in its own context: a
+  compaction operator's reply or a `compact_history` note), which splices as stored unless
+  `NATLANG_NEURALESE_CAPTURE_IN_CONTEXT=1`.
 - **Native state files** (`tools/server/server-native-state.{h,cpp}`): one format for every engine, natlang's block
   store file (`serve/store.py`: safetensors with the `natlang.native_state` metadata and the content ID). A state enters
   the server's store as received and is answered by GET as stored: a PUT body, a PUT of `{"path": FILE}` naming a store
