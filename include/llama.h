@@ -66,7 +66,16 @@ extern "C" {
     typedef struct llama_memory_i * llama_memory_t;
 
     typedef int32_t llama_pos;
-    // Sentinel position for Mode-W window-exempt, RoPE-free virtual memory KV slots (hindsight-kb MEMORY_BLOCK_ID = -2)
+    // Mode-W memory cells (hindsight-kb MEMORY_BLOCK_ID = -2): a token decoded at this position is stored as a KV cell
+    // that is RoPE-free (keys rotated at 0), visible to every query of its sequence and exempt from the sliding window
+    // and from SWA eviction. Memory is not on the position timeline: llama_memory_seq_pos_min/max ignore it (-1 for a
+    // sequence holding memory alone) and positioned tokens before or after it keep consecutive positions. Rules:
+    //  - a batch holds memory entries only or none (llama_decode fails otherwise); memory may come before or after
+    //    positioned tokens; on a hybrid model the recurrent (LFM short convolution) state is left as it was
+    //  - llama_memory_seq_rm keeps memory except on a whole-sequence clear (p0 < 0 && p1 < 0) or a range starting at
+    //    LLAMA_POS_MEMORY: [LLAMA_POS_MEMORY, 0) removes the memory alone
+    //  - llama_memory_seq_cp copies memory when p0 < 0 (a prefix or the whole sequence); seq_add / seq_div never move it
+    //  - supported by the positional KV caches and the LFM hybrids over them, causal contexts only
     #define LLAMA_POS_MEMORY ((llama_pos) -2)
     typedef int32_t llama_token;
     typedef int32_t llama_seq_id;

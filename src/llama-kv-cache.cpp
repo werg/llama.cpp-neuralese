@@ -396,8 +396,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
-    // Track whether the caller asked to clear the entire sequence (p0 < 0 && p1 < 0) or memory slots explicitly.
-    // Partial prefix/SWA purges (p0 >= 0 or p1 >= 0) preserve pinned Mode-W memory slots at LLAMA_POS_MEMORY (-2).
+    // Mode-W memory cells (LLAMA_POS_MEMORY) are removed by a whole-sequence clear (p0 < 0 && p1 < 0) or a range that
+    // starts at LLAMA_POS_MEMORY ([LLAMA_POS_MEMORY, 0) removes the memory alone); every other range, a prefix
+    // [-1, p1) included, keeps them
     const bool rm_mem = (p0 < 0 && p1 < 0) || p0 == LLAMA_POS_MEMORY;
 
     if (p0 < 0) {
@@ -415,7 +416,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         uint32_t new_head = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1) && !(rm_mem && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
+            if (!cells.pos_in(i, p0, p1) && !(rm_mem && !cells.is_empty(i) && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
                 continue;
             }
 
@@ -439,7 +440,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             uint32_t new_head = cells.size();
 
             for (uint32_t i = 0; i < cells.size(); ++i) {
-                if (!cells.pos_in(i, p0, p1) && !(rm_mem && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
+                if (!cells.pos_in(i, p0, p1) && !(rm_mem && !cells.is_empty(i) && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
                     continue;
                 }
 
@@ -482,7 +483,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             return;
         }
 
-        // Prefix/full-sequence copies (p0 < 0) also copy pinned Mode-W virtual memory slots (e.g. for branch@N).
+        // a copy from the start of the sequence (p0 < 0: a prefix or the whole sequence, e.g. a branch) copies its
+        // Mode-W memory cells too
         const bool cp_mem = (p0 < 0);
 
         if (p0 < 0) {
@@ -494,7 +496,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         }
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1) && !(cp_mem && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
+            if (!cells.pos_in(i, p0, p1) && !(cp_mem && !cells.is_empty(i) && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
                 continue;
             }
 

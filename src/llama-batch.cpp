@@ -339,11 +339,31 @@ bool llama_batch_allocr::init(
         LLAMA_LOG_DEBUG("%s:   ]\n", __func__);
     }
 
+    // Mode-W memory (LLAMA_POS_MEMORY): a batch carries memory entries only or none, so a ubatch is never split across
+    // memory and positioned tokens (the KQ mask reuse, the recurrent state and the position checks below rely on it);
+    // memory is not on the sequence's position timeline, so a memory batch is exempt from the position checks
+    {
+        int32_t n_memory = 0;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            n_memory += batch.pos[i] == LLAMA_POS_MEMORY;
+        }
+
+        if (n_memory > 0 && n_memory != batch.n_tokens) {
+            LLAMA_LOG_ERROR("%s: a batch with memory entries (pos LLAMA_POS_MEMORY) must hold memory entries only: "
+                    "%d of its %d entries are memory; decode the memory in a batch of its own\n", __func__, n_memory, batch.n_tokens);
+            return false;
+        }
+
+        memory = n_memory > 0;
+    }
+
     //
     // consistency checks
     //
 
-    if (n_pos_per_embd > 1) {
+    if (memory) {
+        // no positional checks: memory cells carry no position
+    } else if (n_pos_per_embd > 1) {
         // in a mixed batch, the first entry of each seq picks the rule
         std::vector<int8_t> seq_first_embd(n_seq_max, batch.token ? 0 : 1);
         if (mixed) {
@@ -481,7 +501,7 @@ bool llama_batch_allocr::init(
                     return false;
                 }
 
-                if (pos < cur_seq_pos[seq_id]) {
+                if (!memory && pos < cur_seq_pos[seq_id]) {
                     LLAMA_LOG_ERROR("%s: sequence %d positions are decreasing (not allowed)\n", __func__, seq_id);
                     return false;
                 }
@@ -832,6 +852,7 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+    memory    = false;
 
     batch = {};
 

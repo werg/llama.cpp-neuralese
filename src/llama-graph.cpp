@@ -18,6 +18,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -237,27 +238,19 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
 
+        // Mode-W memory cells (LLAMA_POS_MEMORY) are RoPE-free: they rotate at 0 (cos = 1, sin = 0) in every section,
+        // while the KV cache keeps LLAMA_POS_MEMORY for the mask, eviction and the sequence position bookkeeping
+        const llama_pos * ubatch_pos = ubatch->pos;
+        std::vector<llama_pos> rope_pos;
+        if (ubatch->is_memory()) {
+            rope_pos.assign(ubatch->pos, ubatch->pos + n_tokens*n_pos_per_embd);
+            std::replace(rope_pos.begin(), rope_pos.end(), LLAMA_POS_MEMORY, (llama_pos) 0);
+            ubatch_pos = rope_pos.data();
+        }
+
         const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
         if (rope_section_order == LLAMA_ROPE_SECTION_ORDER_TYXZ || !has_embd) {
-            const int64_t total_pos = n_tokens * n_pos_per_embd;
-            bool has_mem_pos = false;
-            for (int64_t i = 0; i < total_pos; ++i) {
-                if (ubatch->pos[i] == LLAMA_POS_MEMORY) {
-                    has_mem_pos = true;
-                    break;
-                }
-            }
-            if (!has_mem_pos) {
-                ggml_backend_tensor_set(pos, ubatch->pos, 0, total_pos * ggml_element_size(pos));
-                return;
-            }
-            // Mode-W virtual memory slots (LLAMA_POS_MEMORY == -2) are RoPE-free: map to 0 (cos=1, sin=0) for RoPE
-            // while llama_kv_cache retains LLAMA_POS_MEMORY so SWA masking and eviction exempt them.
-            std::vector<llama_pos> rope_pos(total_pos);
-            for (int64_t i = 0; i < total_pos; ++i) {
-                rope_pos[i] = (ubatch->pos[i] == LLAMA_POS_MEMORY) ? 0 : ubatch->pos[i];
-            }
-            ggml_backend_tensor_set(pos, rope_pos.data(), 0, total_pos * ggml_element_size(pos));
+            ggml_backend_tensor_set(pos, ubatch_pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
             return;
         }
 
@@ -278,7 +271,7 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
             const bool is_embd = ubatch->is_mixed() ? ubatch->type[i] != 0 : true;
             for (int64_t s = 0; s < 4; ++s) {
                 const int64_t slot = is_embd ? slot_of_section[s] : s;
-                pos_data[s*n_tokens + i] = ubatch->pos[slot*n_tokens + i];
+                pos_data[s*n_tokens + i] = ubatch_pos[slot*n_tokens + i];
             }
         }
         ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
@@ -304,13 +297,14 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
         if (attn_temp_pow) {
             // (1 + (pos + offset) / length) ^ power
             for (int i = 0; i < n_tokens; ++i) {
-                const double pos = ubatch->pos[i];
+                // a Mode-W memory query (LLAMA_POS_MEMORY) is scaled as position 0, as it is rotated
+                const double pos = ubatch->pos[i] == LLAMA_POS_MEMORY ? 0 : ubatch->pos[i];
                 attn_scale_data[i] = (float) std::exp((double) f_attn_temp_scale *
                     std::log1p((pos + f_attn_temp_offset) / (double) n_attn_temp_floor_scale));
             }
         } else {
             for (int i = 0; i < n_tokens; ++i) {
-                const float pos = ubatch->pos[i];
+                const float pos = ubatch->pos[i] == LLAMA_POS_MEMORY ? 0 : ubatch->pos[i];
                 attn_scale_data[i] = std::log(
                     std::floor((pos + f_attn_temp_offset) / n_attn_temp_floor_scale) + 1.0
                 ) * f_attn_temp_scale + 1.0;

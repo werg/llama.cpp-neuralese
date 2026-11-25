@@ -273,6 +273,15 @@ set_tests_properties(test-llama-context PROPERTIES
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
 )
 
+# Mode-W memory cells (LLAMA_POS_MEMORY) on the generated LFM3 (hybrid) and Gemma3 (iSWA) models
+llama_build(test-pos-memory.cpp)
+llama_test(
+    test-pos-memory
+    LABEL "main behavior"
+    ARGS "${MODEL_DIR}/lfm3-dense.gguf" "${MODEL_DIR}/gemma3-dense.gguf"
+)
+set_tests_properties(test-pos-memory PROPERTIES FIXTURES_REQUIRED generate-models)
+
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)

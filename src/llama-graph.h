@@ -940,6 +940,12 @@ struct llm_graph_params {
             }
         }
 
+        // a Mode-W memory ubatch builds a different graph (build_lfm_shortconv writes the recurrent state back unchanged);
+        // a ubatch that does not own its data is never a memory ubatch (ubatch_add owns every split)
+        if (can_reuse_ubatch) {
+            can_reuse_ubatch = (ubatch.data && ubatch.is_memory()) == other.ubatch.is_memory();
+        }
+
         if (!can_reuse_ubatch) {
             return false;
         }

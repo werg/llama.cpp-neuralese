@@ -216,7 +216,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 return false;
             }
             // invalidate tails which will be cleared
-            if (p0 <= cell.pos && cell.pos < p1) {
+            if (rm_all || (p0 <= cell.pos && cell.pos < p1)) {
                 tail_id = -1;
             }
         }
@@ -229,7 +229,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     }
 
     for (uint32_t i = 0; i < size; ++i) {
-        if (cells[i].pos >= p0 && cells[i].pos < p1) {
+        // a whole-sequence clear also takes a cell that holds a state but no position yet (a sequence that holds
+        // Mode-W memory alone: the memory ubatch keeps the cell's position, llama_memory_recurrent::apply)
+        if (rm_all ? !cells[i].is_empty() : (cells[i].pos >= p0 && cells[i].pos < p1)) {
             if (seq_id < 0) {
                 cells[i].seq_id.clear();
             } else if (cells[i].has_seq_id(seq_id)) {
@@ -238,10 +240,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 continue;
             }
             if (cells[i].is_empty()) {
-                // keep count of the number of used cells
-                if (cells[i].pos >= 0) {
-                    used--;
-                }
+                // keep count of the number of used cells (every cell that reaches here held a sequence)
+                used--;
                 cells[i].pos = -1;
                 cells[i].src = -1;
                 if (new_head == size) {
@@ -305,7 +305,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
         }
 
         if (!cells[i].has_seq_id(seq_id)) {
-            if (cells[i].pos >= 0) {
+            if (!cells[i].is_empty()) {
                 used--;
             }
 
@@ -665,13 +665,18 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (ubatch.is_memory()) {
+            // Mode-W memory is not on the position timeline and the state is written back unchanged
+            // (build_lfm_shortconv): the cell keeps its position, -1 for a sequence that has no positioned token yet
+        } else if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
-        cell.pos = last_pos;
+        if (!ubatch.is_memory()) {
+            cell.pos = last_pos;
+        }
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];

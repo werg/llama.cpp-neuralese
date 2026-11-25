@@ -7,6 +7,10 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -19,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <typeinfo>
 #include <string>
 #include <unordered_map>
 
@@ -1656,6 +1661,11 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    if (balloc->is_memory()) {
+        LLAMA_LOG_ERROR("%s: memory entries (pos LLAMA_POS_MEMORY) are KV cache cells; encode() keeps no cache\n", __func__);
+        return -1;
+    }
+
     const uint32_t n_tokens = balloc->get_n_tokens();
 
     // [TAG_NO_CACHE_PAD]
@@ -1875,6 +1885,28 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// Mode-W memory cells (LLAMA_POS_MEMORY) are implemented by the positional KV caches (llama_kv_cache, the iSWA pair) and
+// by the hybrids over them whose recurrent layers are LFM short convolutions (a memory ubatch leaves their state as it
+// was, build_lfm_shortconv); any other memory module, a non-causal context or another recurrent architecture would
+// mistreat them, so a memory batch is refused there
+static const char * llama_memory_batch_unsupported(const llama_memory_i * memory, const llama_model & model, const llama_cparams & cparams) {
+    if (!memory) {
+        return "the context has no memory module (memory cells only exist in a KV cache)";
+    }
+    if (!cparams.causal_attn) {
+        return "the context is not causal";
+    }
+    const auto & type = typeid(*memory);
+    const bool hybrid = type == typeid(llama_memory_hybrid) || type == typeid(llama_memory_hybrid_iswa);
+    if (type != typeid(llama_kv_cache) && type != typeid(llama_kv_cache_iswa) && !hybrid) {
+        return "the model's memory module does not implement memory cells";
+    }
+    if (hybrid && model.arch != LLM_ARCH_LFM2 && model.arch != LLM_ARCH_LFM2MOE && model.arch != LLM_ARCH_LFM3) {
+        return "the model's recurrent layers do not keep their state across a memory batch (only LFM short convolutions do)";
+    }
+    return nullptr;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1936,6 +1968,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    if (balloc->is_memory()) {
+        if (const char * why = llama_memory_batch_unsupported(memory.get(), model, cparams)) {
+            LLAMA_LOG_ERROR("%s: memory entries (pos LLAMA_POS_MEMORY) are not supported here: %s\n", __func__, why);
+            return -1;
+        }
     }
 
     // a token past the vocabulary must be a registered native state span token

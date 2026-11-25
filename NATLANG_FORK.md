@@ -22,6 +22,13 @@ Detailed API documentation for the server additions is in `tools/server/README.m
   `"capture"` when the request sends `x_natlang_producer_kind: "capture"` (a reply captured in its own context: a
   compaction operator's reply or a `compact_history` note), which splices as stored unless
   `NATLANG_NEURALESE_CAPTURE_IN_CONTEXT=1`.
+- **Mode-W memory cells** (`LLAMA_POS_MEMORY`, -2, `include/llama.h`; hindsight-kb's `MEMORY_BLOCK_ID`): a token
+  decoded at this position is a RoPE-free KV cell (keys rotated at 0) visible to every query of its sequence, exempt
+  from the sliding window and SWA eviction, kept by partial `seq_rm` and SWA purges, copied by `seq_cp` from the start,
+  saved and restored with the sequence; it is not on the position timeline (`seq_pos_min/max` ignore it). A batch holds
+  memory entries only; on LFM hybrids a memory batch leaves the short-convolution state as it was. A registered state
+  span decoded there is an exact imported memory slot. Library only: no server request places memory yet.
+  `tests/test-pos-memory.cpp` (generated LFM3 and Gemma3 models).
 - **Native state files** (`tools/server/server-native-state.{h,cpp}`): one format for every engine, natlang's block
   store file (`serve/store.py`: safetensors with the `natlang.native_state` metadata and the content ID). A state enters
   the server's store as received and is answered by GET as stored: a PUT body, a PUT of `{"path": FILE}` naming a store

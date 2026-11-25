@@ -34,6 +34,12 @@ struct llama_ubatch {
         return type != nullptr;
     }
 
+    // Mode-W memory: a batch with an entry at LLAMA_POS_MEMORY holds memory entries only (llama_batch_allocr::init),
+    // so every ubatch split from it does too
+    bool is_memory() const {
+        return pos != nullptr && n_tokens > 0 && pos[0] == LLAMA_POS_MEMORY;
+    }
+
     uint32_t b_equal_seqs; // note: this is a boolean, but we use an int32_t for alignment
                            //       otherwise address sanitizer complains
     // TODO: whole_seqs for embeddings?
@@ -165,6 +171,9 @@ public:
 
     uint32_t get_n_tokens()  const;
     uint32_t get_n_outputs() const;
+
+    // the batch holds Mode-W memory entries (LLAMA_POS_MEMORY) only
+    bool is_memory() const { return memory; }
     uint32_t get_n_used()    const;
 
     // the array of output indices in the order they were encountered during the ubatch splitting
@@ -238,6 +247,9 @@ private:
 
     // helper flag to quickly determine if there are any coupled sequences in the batch
     bool has_cpl = false;
+
+    // the batch holds Mode-W memory entries (LLAMA_POS_MEMORY) only
+    bool memory = false;
 
     std::vector<pos_set_t> seq_pos; // seq_pos[s]: the set of positions in sequence s
     std::vector<seq_cpl_t> seq_cpl; // seq_cpl[s0][s1]: if sequence s0 is coupled to sequence s1

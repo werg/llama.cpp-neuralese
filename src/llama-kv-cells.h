@@ -77,7 +77,7 @@ public:
 
     bool is_empty(uint32_t i) const {
         assert(i < pos.size());
-        assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
+        assert(pos[i] == -1 || pos[i] == LLAMA_POS_MEMORY || pos[i] >= 0);
 
         return pos[i] == -1;
     }
@@ -448,6 +448,7 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+        assert(pos[i] != LLAMA_POS_MEMORY);
 
         seq_pos_rm(i);
 
@@ -522,6 +523,8 @@ private:
     std::vector<seq_set_t> seq;
 
     // the set seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
+    // Mode-W memory cells (LLAMA_POS_MEMORY) are not on a sequence's position timeline and are not recorded here:
+    // seq_pos_min/max describe the positioned tokens only (-1 for a sequence holding memory alone)
     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
     // and upper_bound() on a position finds the nearest cell of the sequence in logarithmic time
     //
@@ -534,12 +537,18 @@ private:
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
+        if (pos[i] == LLAMA_POS_MEMORY) {
+            return;
+        }
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
+        if (pos[i] == LLAMA_POS_MEMORY) {
+            return;
+        }
         seq_pos[s].insert({ pos[i], i });
     }
 
