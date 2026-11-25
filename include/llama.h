@@ -66,6 +66,8 @@ extern "C" {
     typedef struct llama_memory_i * llama_memory_t;
 
     typedef int32_t llama_pos;
+    // Sentinel position for Mode-W window-exempt, RoPE-free virtual memory KV slots (hindsight-kb MEMORY_BLOCK_ID = -2)
+    #define LLAMA_POS_MEMORY ((llama_pos) -2)
     typedef int32_t llama_token;
     typedef int32_t llama_seq_id;
 

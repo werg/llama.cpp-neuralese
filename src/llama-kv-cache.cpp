@@ -396,6 +396,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
+    // Track whether the caller asked to clear the entire sequence (p0 < 0 && p1 < 0) or memory slots explicitly.
+    // Partial prefix/SWA purges (p0 >= 0 or p1 >= 0) preserve pinned Mode-W memory slots at LLAMA_POS_MEMORY (-2).
+    const bool rm_mem = (p0 < 0 && p1 < 0) || p0 == LLAMA_POS_MEMORY;
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -411,7 +415,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         uint32_t new_head = cells.size();
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
+            if (!cells.pos_in(i, p0, p1) && !(rm_mem && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
                 continue;
             }
 
@@ -435,7 +439,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             uint32_t new_head = cells.size();
 
             for (uint32_t i = 0; i < cells.size(); ++i) {
-                if (!cells.pos_in(i, p0, p1)) {
+                if (!cells.pos_in(i, p0, p1) && !(rm_mem && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
                     continue;
                 }
 
@@ -478,6 +482,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             return;
         }
 
+        // Prefix/full-sequence copies (p0 < 0) also copy pinned Mode-W virtual memory slots (e.g. for branch@N).
+        const bool cp_mem = (p0 < 0);
+
         if (p0 < 0) {
             p0 = 0;
         }
@@ -487,7 +494,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         }
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
+            if (!cells.pos_in(i, p0, p1) && !(cp_mem && cells.pos_get(i) == LLAMA_POS_MEMORY)) {
                 continue;
             }
 
@@ -1049,8 +1056,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     if (!can_use) {
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        // SWA mask (Mode-W virtual memory slots at LLAMA_POS_MEMORY are pinned and exempt from eviction)
+                        if (pos_cell != LLAMA_POS_MEMORY && llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
                             can_use = true;
                         }
                     }
@@ -1567,7 +1574,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
-        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+        if (ubatch->pos[i] != LLAMA_POS_MEMORY) {
+            seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+        }
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1645,8 +1654,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 if (!alibi) {
                     if (!prev) {
-                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32 (plus Mode-W memory slots)
+                        if (p0 == LLAMA_POS_MEMORY || p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
                             idxs.push_back(j);
                         }
                     }
@@ -1670,11 +1679,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
-                // apply SWA if any
+                // apply SWA if any (Mode-W virtual memory slots at LLAMA_POS_MEMORY bypass sliding window)
                 if (swa) {
                     // see llama_non_causal_type
+                    const bool is_mem_slot = (p0 == LLAMA_POS_MEMORY);
                     const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
-                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    if (!in_span && !is_mem_slot && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                         goto skip;
                     }
                 }
@@ -2076,9 +2086,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
-            // check the cell is not SWA-masked
+            // check the cell is not SWA-masked (Mode-W virtual memory slots are window-exempt)
             if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+                const llama_pos pos_i = cells.pos_get(i);
+                const bool is_masked = pos_i != LLAMA_POS_MEMORY && llama_hparams::is_masked_swa(n_swa, swa_type, pos_i, cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
             }

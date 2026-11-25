@@ -239,7 +239,25 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
 
         const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
         if (rope_section_order == LLAMA_ROPE_SECTION_ORDER_TYXZ || !has_embd) {
-            ggml_backend_tensor_set(pos, ubatch->pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(pos));
+            const int64_t total_pos = n_tokens * n_pos_per_embd;
+            bool has_mem_pos = false;
+            for (int64_t i = 0; i < total_pos; ++i) {
+                if (ubatch->pos[i] == LLAMA_POS_MEMORY) {
+                    has_mem_pos = true;
+                    break;
+                }
+            }
+            if (!has_mem_pos) {
+                ggml_backend_tensor_set(pos, ubatch->pos, 0, total_pos * ggml_element_size(pos));
+                return;
+            }
+            // Mode-W virtual memory slots (LLAMA_POS_MEMORY == -2) are RoPE-free: map to 0 (cos=1, sin=0) for RoPE
+            // while llama_kv_cache retains LLAMA_POS_MEMORY so SWA masking and eviction exempt them.
+            std::vector<llama_pos> rope_pos(total_pos);
+            for (int64_t i = 0; i < total_pos; ++i) {
+                rope_pos[i] = (ubatch->pos[i] == LLAMA_POS_MEMORY) ? 0 : ubatch->pos[i];
+            }
+            ggml_backend_tensor_set(pos, rope_pos.data(), 0, total_pos * ggml_element_size(pos));
             return;
         }
 
